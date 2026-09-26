@@ -89,6 +89,8 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_emit_vhci":                 linuxVhciInjectionSupported,
 	"syz_init_net_socket":           linuxSyzInitNetSocketSupported,
 	"syz_genetlink_get_family_id":   linuxSyzGenetlinkGetFamilyIDSupported,
+	"syz_mptcp_pair_init":           alwaysSupported,
+	"syz_mptcp_pair_close":          alwaysSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
 	"syz_read_part_table":           linuxSyzReadPartTableSupported,
 	"syz_io_uring_setup":            alwaysSupported,
