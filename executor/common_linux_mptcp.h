@@ -203,6 +203,16 @@ struct syz_mptcp_pair_slot {
 	uint32 token;
 	uint16 server_port_h; // host byte order -- see the byte-order note
 			      // on mptcp_pm_subflow_create.
+
+	// Bumped every time this slot is (re)allocated by syz_mptcp_pair_init.
+	// A subflow records the generation of its parent pair at join time
+	// (syz_mptcp_subflow_slot.pair_generation); syz_mptcp_subflow_destroy
+	// refuses to act on a pair whose generation no longer matches, so a
+	// stale subflow whose parent slot was closed and REUSED by a different
+	// pair can't issue a genl DESTROY against the new occupant's token.
+	// Preserved across syz_mptcp_pair_close (not zeroed) so reuse always
+	// yields a strictly newer value.
+	uint32 generation;
 };
 
 // A subflow produced by syz_mptcp_join_subflow(). References its parent
@@ -213,6 +223,8 @@ struct syz_mptcp_pair_slot {
 struct syz_mptcp_subflow_slot {
 	bool in_use;
 	int pair_slot;
+	uint32 pair_generation; // parent pair's generation at join time (see
+				// syz_mptcp_pair_slot.generation)
 	uint8 addr_id;
 	uint16 local_port_h;
 	uint16 remote_port_h;
@@ -644,8 +656,19 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 	int one = 1;
 	int server_listen_fd = -1, client_fd = -1, server_fd = -1;
 
+	// Claim a free slot atomically: mark in_use with a compare-exchange so
+	// two pair_init calls running on separate threads (the default
+	// -threaded execution model) can never settle on the same slot. The
+	// slot is held from here; every failure path below releases it (goto
+	// fail). Bump the generation immediately after claiming -- before any
+	// other field is written -- so a stale subflow_destroy racing against
+	// this reuse already sees a mismatched generation, never the window
+	// where the slot is claimed but still carries the old occupant's token.
 	for (slot = 0; slot < SYZ_MPTCP_PAIR_POOL_SIZE; slot++) {
-		if (!syz_mptcp_pair_pool[slot].in_use)
+		bool expected = false;
+		if (__atomic_compare_exchange_n(&syz_mptcp_pair_pool[slot].in_use,
+						&expected, true, false,
+						__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			break;
 	}
 	if (slot == SYZ_MPTCP_PAIR_POOL_SIZE) {
@@ -653,6 +676,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 		      SYZ_MPTCP_PAIR_POOL_SIZE);
 		return -1;
 	}
+	syz_mptcp_pair_pool[slot].generation++;
 
 	// Must run before either endpoint's socket(IPPROTO_MPTCP) call --
 	// see the "Userspace path-manager setup" comment above
@@ -660,7 +684,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 	// msk exists, not merely before a later join.
 	if (mptcp_pm_ensure_setup() < 0) {
 		debug("syz_mptcp_pair_init: userspace-PM setup failed\n");
-		return -1;
+		goto fail;
 	}
 
 	server_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
@@ -764,13 +788,17 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 		syz_mptcp_pair_pool[slot].token = info.mptcpi_token;
 	}
 
-	syz_mptcp_pair_pool[slot].in_use = true;
+	// in_use was already published by the atomic claim above; fill the rest
+	// of the slot before returning. The consuming calls (join/close) can
+	// only reach this slot via the resource this call returns, so no
+	// additional barrier is needed for these fields.
 	syz_mptcp_pair_pool[slot].server_fd = server_fd;
 	syz_mptcp_pair_pool[slot].client_fd = client_fd;
 	syz_mptcp_pair_pool[slot].server_listen_fd = server_listen_fd;
 	syz_mptcp_pair_pool[slot].server_port_h = ntohs(srv_addr.sin_port);
-	debug("syz_mptcp_pair_init: pair %d established, port %d, token %u\n",
-	      slot, ntohs(srv_addr.sin_port), syz_mptcp_pair_pool[slot].token);
+	debug("syz_mptcp_pair_init: pair %d established, port %d, token %u gen %u\n",
+	      slot, ntohs(srv_addr.sin_port), syz_mptcp_pair_pool[slot].token,
+	      syz_mptcp_pair_pool[slot].generation);
 	return slot;
 
 fail:
@@ -780,6 +808,9 @@ fail:
 		close(client_fd);
 	if (server_listen_fd >= 0)
 		close(server_listen_fd);
+	// Release the slot claimed above (generation stays bumped -- it only
+	// ever has to increase, and a burned number is harmless).
+	__atomic_store_n(&syz_mptcp_pair_pool[slot].in_use, false, __ATOMIC_RELEASE);
 	return -1;
 }
 #endif
@@ -803,7 +834,16 @@ static long syz_mptcp_pair_close(volatile long a0)
 		close(syz_mptcp_pair_pool[slot].server_fd);
 	if (syz_mptcp_pair_pool[slot].client_fd >= 0)
 		close(syz_mptcp_pair_pool[slot].client_fd);
-	memset(&syz_mptcp_pair_pool[slot], 0, sizeof(syz_mptcp_pair_pool[slot]));
+	// Clear the slot but PRESERVE generation (a reused slot must always get
+	// a strictly newer value -- see syz_mptcp_pair_slot.generation), then
+	// publish in_use=false LAST with a release store so a concurrent
+	// pair_init claiming this slot only observes it free once fully cleared.
+	syz_mptcp_pair_pool[slot].server_fd = 0;
+	syz_mptcp_pair_pool[slot].client_fd = 0;
+	syz_mptcp_pair_pool[slot].server_listen_fd = 0;
+	syz_mptcp_pair_pool[slot].token = 0;
+	syz_mptcp_pair_pool[slot].server_port_h = 0;
+	__atomic_store_n(&syz_mptcp_pair_pool[slot].in_use, false, __ATOMIC_RELEASE);
 	return 0;
 }
 #endif
@@ -853,8 +893,14 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	if (addr_id == 0)
 		addr_id = 1;
 
+	// Atomic claim, same rationale as the pair pool: two join calls on
+	// separate threads must not settle on the same subflow slot. Held from
+	// here; the SUBFLOW_CREATE and poll failure paths below release it.
 	for (sub_slot = 0; sub_slot < SYZ_MPTCP_SUBFLOW_POOL_SIZE; sub_slot++) {
-		if (!syz_mptcp_subflow_pool[sub_slot].in_use)
+		bool expected = false;
+		if (__atomic_compare_exchange_n(&syz_mptcp_subflow_pool[sub_slot].in_use,
+						&expected, true, false,
+						__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			break;
 	}
 	if (sub_slot == SYZ_MPTCP_SUBFLOW_POOL_SIZE) {
@@ -874,6 +920,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 				    local_addr_be, local_port_h,
 				    remote_addr_be, pair->server_port_h) < 0) {
 		debug("syz_mptcp_join_subflow: SUBFLOW_CREATE: %d\n", errno);
+		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
 	}
 
@@ -895,11 +942,14 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	if (retries == SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES) {
 		debug("syz_mptcp_join_subflow: pair=%ld subflow not established within ~1s\n",
 		      pair_slot);
+		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
 	}
 
-	syz_mptcp_subflow_pool[sub_slot].in_use = true;
+	// in_use already published by the atomic claim above. Record the
+	// parent's current generation so a later destroy can detect slot reuse.
 	syz_mptcp_subflow_pool[sub_slot].pair_slot = (int)pair_slot;
+	syz_mptcp_subflow_pool[sub_slot].pair_generation = pair->generation;
 	syz_mptcp_subflow_pool[sub_slot].addr_id = addr_id;
 	syz_mptcp_subflow_pool[sub_slot].local_port_h = local_port_h;
 	syz_mptcp_subflow_pool[sub_slot].remote_port_h = pair->server_port_h;
@@ -930,16 +980,19 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 	}
 
 	pair = &syz_mptcp_pair_pool[sub->pair_slot];
-	if (!pair->in_use) {
-		// Parent pair already gone (e.g. syz_mptcp_pair_close ran
-		// first and tore down both fds, which implicitly drops the
-		// subflow kernel-side too) -- nothing left to tell the genl
-		// layer; just free our own bookkeeping.
-		debug("syz_mptcp_subflow_destroy: slot %ld parent pair %d already closed, "
-		      "freeing bookkeeping only\n",
-		      sub_slot, sub->pair_slot);
-		memset(sub, 0, sizeof(*sub));
-		return 0;
+	if (!pair->in_use || pair->generation != sub->pair_generation) {
+		// Parent pair already gone, OR its pool slot was closed and
+		// REUSED by a different pair (generation mismatch): either way
+		// this subflow no longer maps to a live kernel object we may
+		// address. Issuing a genl DESTROY now would, in the reuse case,
+		// target the NEW occupant's token with our stale tuple -- so
+		// just free our own bookkeeping. (Closing a pair tears its
+		// subflows down kernel-side already.)
+		debug("syz_mptcp_subflow_destroy: slot %ld parent pair %d stale "
+		      "(in_use=%d gen have=%u want=%u), freeing bookkeeping only\n",
+		      sub_slot, sub->pair_slot, pair->in_use,
+		      pair->generation, sub->pair_generation);
+		goto free_slot;
 	}
 
 	if (mptcp_pm_subflow_destroy(pair->token, sub->addr_id,
@@ -949,7 +1002,15 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 		return -1;
 	}
 
-	memset(sub, 0, sizeof(*sub));
+free_slot:
+	// Clear fields, then publish in_use=false LAST (release store) so a
+	// concurrent join claiming this slot only sees it free once cleared.
+	sub->pair_slot = 0;
+	sub->pair_generation = 0;
+	sub->addr_id = 0;
+	sub->local_port_h = 0;
+	sub->remote_port_h = 0;
+	__atomic_store_n(&sub->in_use, false, __ATOMIC_RELEASE);
 	return 0;
 }
 #endif
