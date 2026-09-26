@@ -69,6 +69,7 @@ NORETURN void doexit_thread(int status)
 #if SYZ_EXECUTOR || SYZ_MULTI_PROC || SYZ_REPEAT && SYZ_CGROUPS ||                      \
     SYZ_NET_DEVICES || __NR_syz_mount_image || __NR_syz_read_part_table ||              \
     __NR_syz_usb_connect || __NR_syz_usb_connect_ath9k || __NR_syz_usbip_server_init || \
+    __NR_syz_mptcp_join_subflow ||                                                      \
     (GOOS_freebsd || GOOS_darwin || GOOS_openbsd || GOOS_netbsd) && SYZ_NET_INJECTION
 static unsigned long long procid;
 #endif
