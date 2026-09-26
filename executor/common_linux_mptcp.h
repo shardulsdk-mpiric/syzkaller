@@ -998,7 +998,13 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// ORs it in); SIGNAL is rejected outright. BACKUP is the only flag
 	// this pseudo-syscall exposes, via the syzlang `backup` parameter.
 	addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
-	local_port_h = SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE + sub_slot;
+	// Scope the local port by procid as well as slot so parallel executor
+	// procs that share a network namespace can't pick the same port (every
+	// other port/addr allocator in this tree is procid-scoped too). Stays
+	// below the ip_local_port_range floor (32768) for the proc counts
+	// syzkaller uses, keeping clear of kernel-assigned ephemeral ports.
+	local_port_h = SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE +
+		       (int)procid * SYZ_MPTCP_SUBFLOW_POOL_SIZE + sub_slot;
 
 	if (mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
 				    local_addr_be, local_port_h,
