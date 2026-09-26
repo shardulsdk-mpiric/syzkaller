@@ -75,7 +75,8 @@ static int event_timedwait(event_t* ev, uint64 timeout)
     SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID ||               \
     SYZ_FAULT || SYZ_LEAK || SYZ_BINFMT_MISC || SYZ_SYSCTL ||                           \
     ((__NR_syz_usb_connect || __NR_syz_usb_connect_ath9k) && USB_DEBUG) ||              \
-    __NR_syz_usbip_server_init
+    __NR_syz_usbip_server_init ||                                                       \
+    __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>

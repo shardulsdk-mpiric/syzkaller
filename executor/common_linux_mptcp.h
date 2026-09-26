@@ -56,7 +56,9 @@
 #ifndef SYZ_COMMON_LINUX_MPTCP_H
 #define SYZ_COMMON_LINUX_MPTCP_H
 
+#include <errno.h>
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
