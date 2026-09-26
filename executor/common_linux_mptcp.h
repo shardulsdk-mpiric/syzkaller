@@ -325,16 +325,45 @@ static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[SYZ_MPTCP_SUBFLOW_PO
 struct mptcp_nlmsg {
 	char buf[512];
 	char* pos;
+	bool overflow; // set if any attr write would exceed buf; checked by send
 };
 
 static int mptcp_pm_genl_sock = -1; // request/reply socket: GETFAMILY, SUBFLOW_CREATE/DESTROY
 static uint16 mptcp_pm_family_id;
+
+// The request/reply socket above is shared across threads under the default
+// -threaded model. Two concurrent transactions on one socket can each recv
+// the other's reply, so serialize every send+recv pair under this lock and
+// stamp each request with a unique nlmsg_seq the reply is matched against
+// (defence in depth against a stale datagram left in the socket buffer).
+static int mptcp_nlmsg_lock;
+static uint32 mptcp_nlmsg_seq_ctr;
+
+// Minimal spinlock over an int flag, used both here and by the one-time
+// userspace-PM setup below. __atomic builtins need no header and are
+// available in every reproducer build; usleep is already used in this file.
+static void mptcp_spin_lock(volatile int* lock)
+{
+	while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE))
+		usleep(50);
+}
+
+static void mptcp_spin_unlock(volatile int* lock)
+{
+	__atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+}
 
 static void mptcp_nlmsg_init(struct mptcp_nlmsg* m, int typ, const void* data, int size)
 {
 	struct nlmsghdr* hdr = (struct nlmsghdr*)m->buf;
 
 	memset(m->buf, 0, sizeof(m->buf));
+	m->overflow = false;
+	if (sizeof(struct nlmsghdr) + NLMSG_ALIGN(size) > sizeof(m->buf)) {
+		m->overflow = true;
+		m->pos = m->buf;
+		return;
+	}
 	hdr->nlmsg_type = typ;
 	hdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
 	memcpy(hdr + 1, data, size);
@@ -345,6 +374,12 @@ static void mptcp_nlmsg_attr(struct mptcp_nlmsg* m, int typ, const void* data, i
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
 
+	if (m->overflow)
+		return;
+	if (m->pos + NLMSG_ALIGN(sizeof(struct nlattr) + size) > m->buf + sizeof(m->buf)) {
+		m->overflow = true;
+		return;
+	}
 	attr->nla_len = sizeof(*attr) + size;
 	attr->nla_type = typ;
 	if (size > 0)
@@ -360,6 +395,11 @@ static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_o
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
 
+	if (m->overflow || m->pos + sizeof(struct nlattr) > m->buf + sizeof(m->buf)) {
+		m->overflow = true;
+		*nest_out = NULL;
+		return;
+	}
 	attr->nla_type = typ;
 	m->pos += sizeof(*attr);
 	*nest_out = attr;
@@ -367,6 +407,8 @@ static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_o
 
 static void mptcp_nlmsg_nest_end(struct mptcp_nlmsg* m, struct nlattr* nest)
 {
+	if (!nest)
+		return;
 	nest->nla_len = m->pos - (char*)nest;
 }
 #endif // SYZ_MPTCP_NEED_SUBFLOW_CALL
@@ -382,24 +424,53 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 	struct nlmsghdr* hdr = (struct nlmsghdr*)m->buf;
 	struct sockaddr_nl addr;
 	ssize_t n;
+	uint32 seq;
+	int attempts;
 
-	hdr->nlmsg_len = m->pos - m->buf;
-	memset(&addr, 0, sizeof(addr));
-	addr.nl_family = AF_NETLINK;
-	n = sendto(sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&addr, sizeof(addr));
-	if (n != (ssize_t)hdr->nlmsg_len) {
-		debug("mptcp_nlmsg_send: short write: %zd/%u errno=%d\n", n, hdr->nlmsg_len, errno);
+	// A message that overran buf[] was never fully built -- refuse to send
+	// a truncated request rather than let the kernel misparse it.
+	if (m->overflow) {
+		debug("mptcp_nlmsg_send: message overflowed buf\n");
+		errno = EMSGSIZE;
 		return -1;
 	}
 
-	n = recv(sock, m->buf, sizeof(m->buf), 0);
-	if (n < (ssize_t)sizeof(struct nlmsghdr)) {
-		debug("mptcp_nlmsg_send: short read: %zd errno=%d\n", n, errno);
+	seq = __atomic_add_fetch(&mptcp_nlmsg_seq_ctr, 1, __ATOMIC_RELAXED);
+	hdr->nlmsg_len = m->pos - m->buf;
+	hdr->nlmsg_seq = seq;
+	memset(&addr, 0, sizeof(addr));
+	addr.nl_family = AF_NETLINK;
+
+	// Hold the shared socket for the whole send+recv so a concurrent
+	// transaction can't steal our reply (m->buf is per-call stack, only
+	// the socket is shared).
+	mptcp_spin_lock(&mptcp_nlmsg_lock);
+	n = sendto(sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&addr, sizeof(addr));
+	if (n != (ssize_t)hdr->nlmsg_len) {
+		mptcp_spin_unlock(&mptcp_nlmsg_lock);
+		debug("mptcp_nlmsg_send: short write: %zd/%u errno=%d\n", n, hdr->nlmsg_len, errno);
+		return -1;
+	}
+	// Skip any stale/foreign datagram whose seq doesn't match ours.
+	for (attempts = 0; attempts < 8; attempts++) {
+		n = recv(sock, m->buf, sizeof(m->buf), 0);
+		if (n < (ssize_t)sizeof(struct nlmsghdr)) {
+			mptcp_spin_unlock(&mptcp_nlmsg_lock);
+			debug("mptcp_nlmsg_send: short read: %zd errno=%d\n", n, errno);
+			errno = EINVAL;
+			return -1;
+		}
+		hdr = (struct nlmsghdr*)m->buf;
+		if (hdr->nlmsg_seq == seq)
+			break;
+		debug("mptcp_nlmsg_send: skipping reply seq=%u want=%u\n", hdr->nlmsg_seq, seq);
+	}
+	mptcp_spin_unlock(&mptcp_nlmsg_lock);
+	if (attempts == 8) {
 		errno = EINVAL;
 		return -1;
 	}
 
-	hdr = (struct nlmsghdr*)m->buf;
 	if (hdr->nlmsg_type == NLMSG_ERROR) {
 		struct nlmsgerr* ne = (struct nlmsgerr*)(hdr + 1);
 
@@ -418,6 +489,7 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 // above) but never calls ensure_setup, so it doesn't need these.
 #if SYZ_MPTCP_NEED_PM_SETUP
 static int mptcp_pm_setup_done;
+static int mptcp_pm_setup_lock; // serializes the one-time setup under -threaded
 static int mptcp_pm_event_sock = -1; // held open + subscribed so mptcp_userspace_pm_active() is true
 
 // Parse a CTRL_CMD_GETFAMILY reply for the mptcp_pm family id and the id
@@ -497,12 +569,22 @@ static int mptcp_pm_ensure_setup(void)
 	uint32 event_grp_id = 0;
 	int sock = -1, event_sock = -1;
 
-	if (mptcp_pm_setup_done)
+	// Fast path once setup has been published.
+	if (__atomic_load_n(&mptcp_pm_setup_done, __ATOMIC_ACQUIRE))
 		return 0;
+
+	// Serialize first-time setup: exactly one thread does the pm_type write,
+	// family resolve and event subscription; others wait and then observe
+	// setup_done. Idempotent re-entry from either pair_init or join_subflow.
+	mptcp_spin_lock(&mptcp_pm_setup_lock);
+	if (mptcp_pm_setup_done) {
+		mptcp_spin_unlock(&mptcp_pm_setup_lock);
+		return 0;
+	}
 
 	if (!write_file("/proc/sys/net/mptcp/pm_type", "1")) {
 		debug("mptcp_pm_ensure_setup: write pm_type=1: %d\n", errno);
-		return -1;
+		goto fail;
 	}
 
 	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
@@ -537,9 +619,10 @@ static int mptcp_pm_ensure_setup(void)
 
 	mptcp_pm_genl_sock = sock;
 	mptcp_pm_event_sock = event_sock;
-	mptcp_pm_setup_done = 1;
+	__atomic_store_n(&mptcp_pm_setup_done, 1, __ATOMIC_RELEASE);
 	debug("mptcp_pm_ensure_setup: pm_type=1 family_id=%d event_grp_id=%d\n",
 	      mptcp_pm_family_id, event_grp_id);
+	mptcp_spin_unlock(&mptcp_pm_setup_lock);
 	return 0;
 
 fail:
@@ -547,6 +630,7 @@ fail:
 		close(event_sock);
 	if (sock >= 0)
 		close(sock);
+	mptcp_spin_unlock(&mptcp_pm_setup_lock);
 	return -1;
 }
 #endif // SYZ_MPTCP_NEED_PM_SETUP
