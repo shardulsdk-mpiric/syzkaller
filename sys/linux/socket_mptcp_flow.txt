@@ -12,11 +12,29 @@
 # syz_mptcp_pair_close() is the consuming edge: it closes both fds and
 # frees the pair.
 #
-# v0 scope: MP_CAPABLE only, no MP_JOIN / subflows / key-HMAC capture --
-# those need kernel-side instrumentation and land as a later increment.
-# Runs on any stock CONFIG_MPTCP kernel.
+# syz_mptcp_join_subflow() drives a real MP_JOIN handshake for a new
+# subflow on an established pair, via the kernel's userspace
+# path-manager netlink API (MPTCP_PM_CMD_SUBFLOW_CREATE) -- NORMAL mode
+# only: the kernel computes a valid nonce/HMAC end-to-end, so this needs
+# nothing beyond a stock CONFIG_MPTCP kernel. The resulting mptcp_subflow
+# resource is the producer -> consumer edge this increment adds: it
+# exists only because a join created it, and syz_mptcp_subflow_destroy()
+# (MPTCP_PM_CMD_SUBFLOW_DESTROY) is the only call that consumes it -- the
+# resource graph mirrors the real executor-side dependency, per the
+# reproducibility discussion in docs/pseudo_syscalls.md.
+#
+# v0 scope (still, for this second increment): NORMAL mode only, no
+# mutation, no nonce/HMAC capture, no kernel-side instrumentation --
+# those land as a later increment. Runs on any stock CONFIG_MPTCP kernel.
 
 resource mptcp_pair[intptr]
+resource mptcp_subflow[intptr]
 
 syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in]) mptcp_pair
 syz_mptcp_pair_close(pair mptcp_pair)
+
+# addr_id: local address id announced to the kernel for this subflow
+# (id 0 is reserved/invalid on the wire -- the executor coerces it to 1).
+# backup: sets MPTCP_PM_ADDR_FLAG_BACKUP on the new subflow when 1.
+syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1]) mptcp_subflow
+syz_mptcp_subflow_destroy(subflow mptcp_subflow)
