@@ -3380,6 +3380,11 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 }
 #endif
 
+// MPTCP MP_CAPABLE pair harness (see executor/common_linux_mptcp.h).
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close
+#include "common_linux_mptcp.h"
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mount_image || __NR_syz_read_part_table
 #include "common_zlib.h"
 #include <errno.h>

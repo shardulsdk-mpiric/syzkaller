@@ -1,0 +1,22 @@
+# Copyright 2026 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
+# MPTCP (Multipath TCP, RFC 8684) MP_CAPABLE connection pair.
+#
+# syz_mptcp_pair_init() establishes a single MP_CAPABLE-negotiated MPTCP
+# connection on loopback (client connect() + server accept(), both via
+# IPPROTO_MPTCP) and threads it through a real resource, so later calls
+# that operate on the pair have a genuine dependency edge on it -- see
+# docs/pseudo_syscalls.md and the reproducibility discussion there.
+#
+# syz_mptcp_pair_close() is the consuming edge: it closes both fds and
+# frees the pair.
+#
+# v0 scope: MP_CAPABLE only, no MP_JOIN / subflows / key-HMAC capture --
+# those need kernel-side instrumentation and land as a later increment.
+# Runs on any stock CONFIG_MPTCP kernel.
+
+resource mptcp_pair[intptr]
+
+syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in]) mptcp_pair
+syz_mptcp_pair_close(pair mptcp_pair)
