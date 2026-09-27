@@ -608,7 +608,7 @@ static int mptcp_pm_ensure_setup(void)
 	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 	if (sock < 0) {
 		debug("mptcp_pm_ensure_setup: socket(genl): %d\n", errno);
-		return -1;
+		goto fail;
 	}
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
