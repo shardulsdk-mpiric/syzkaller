@@ -61,10 +61,25 @@
 #include <stdbool.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
+#include <endian.h>
+#include <net/if.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
 
 #include <linux/genetlink.h>
 #include <linux/netlink.h>
+
+// Mutation layer (dormant until the MP_JOIN HMAC hook wires it): the no-deps
+// crypto + the stateless NFQUEUE engine. Guarded to the mutation-carrying call
+// so minimal reproducers that don't mutate don't pull in pthread/netfilter.
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+#include "common_linux_mptcp_crypto.h"
+#include "common_linux_mptcp_nfq.h"
+#endif
 
 // IPPROTO_MPTCP is provided by <netinet/in.h> on any glibc recent enough to
 // know about MPTCP (which any host running a CONFIG_MPTCP kernel will have);
@@ -187,6 +202,11 @@ enum {
 // well under a burst while leaving room for the fully_established priming.
 #define SYZ_MPTCP_CLAMP_RCVBUF (16 * 1024)
 
+// MPTCP_INIT_CAPTURE_KEYS (harness flag; mirrored in .txt + .const): sniff the
+// MP_CAPABLE handshake off loopback (AF_PACKET) and store both keys on the pair,
+// so the mutation layer can recompute MP_JOIN HMACs -- replaces MPTCP_DEBUG_KEYS.
+#define MPTCP_INIT_CAPTURE_KEYS 2
+
 struct syz_mptcp_pair_slot {
 	bool in_use;
 	int server_fd;
@@ -231,6 +251,11 @@ struct syz_mptcp_pair_slot {
 	// burst + partial-drain, leaving data on the msk send head for the
 	// softirq deferred-push path.
 	bool rwnd_clamped;
+
+	// Captured off the wire when MPTCP_INIT_CAPTURE_KEYS is set: the two
+	// MP_CAPABLE keys (client=local, server=remote), for userspace HMAC recompute.
+	uint64 local_key;
+	uint64 remote_key;
 };
 
 // A subflow produced by syz_mptcp_join_subflow(). References its parent
@@ -746,6 +771,50 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 #endif // __NR_syz_mptcp_subflow_destroy
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init
+// Parse a captured IP packet for an MP_CAPABLE option carrying both keys (the
+// third ACK). Verified against the kernel token in test_wire_key_capture.c.
+static int mptcp_parse_mpcapable(const uint8* pkt, int len, uint64* sndr, uint64* rcvr)
+{
+	if (len < (int)sizeof(struct iphdr))
+		return 0;
+	const struct iphdr* ip = (const struct iphdr*)pkt;
+	if (ip->protocol != IPPROTO_TCP)
+		return 0;
+	int ihl = ip->ihl * 4;
+	if (len < ihl + (int)sizeof(struct tcphdr))
+		return 0;
+	const struct tcphdr* th = (const struct tcphdr*)(pkt + ihl);
+	int thl = th->doff * 4;
+	if (len < ihl + thl)
+		return 0;
+	const uint8* o = pkt + ihl + sizeof(struct tcphdr);
+	const uint8* end = pkt + ihl + thl;
+	while (o < end) {
+		uint8 kind = o[0];
+		if (kind == 0)
+			break;
+		if (kind == 1) {
+			o++;
+			continue;
+		}
+		if (o + 1 >= end)
+			break;
+		uint8 olen = o[1];
+		if (olen < 2 || o + olen > end)
+			break;
+		if (kind == 30 && (o[2] >> 4) == 0 && olen >= 20) {
+			uint64 sk, rk;
+			memcpy(&sk, o + 4, 8);
+			memcpy(&rk, o + 12, 8);
+			*sndr = be64toh(sk);
+			*rcvr = be64toh(rk);
+			return 1;
+		}
+		o += olen;
+	}
+	return 0;
+}
+
 static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile long a2)
 {
 	// server_addr / client_addr: not yet consulted, see file comment.
@@ -757,7 +826,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	socklen_t alen;
 	int slot;
 	int one = 1;
-	int server_listen_fd = -1, client_fd = -1, server_fd = -1;
+	int server_listen_fd = -1, client_fd = -1, server_fd = -1, cap_fd = -1;
 
 	// Claim a free slot atomically: mark in_use with a compare-exchange so
 	// two pair_init calls running on separate threads (the default
@@ -822,6 +891,22 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		goto fail;
 	}
 
+	if (init_flags & MPTCP_INIT_CAPTURE_KEYS) {
+		// Open the loopback capture BEFORE connect() so the handshake is buffered.
+		cap_fd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+		if (cap_fd >= 0) {
+			struct sockaddr_ll sll;
+			memset(&sll, 0, sizeof(sll));
+			sll.sll_family = AF_PACKET;
+			sll.sll_protocol = htons(ETH_P_IP);
+			sll.sll_ifindex = if_nametoindex("lo");
+			if (bind(cap_fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+				close(cap_fd);
+				cap_fd = -1;
+			}
+		}
+	}
+
 	client_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
 	if (client_fd < 0) {
 		debug("syz_mptcp_pair_init: client socket: %d\n", errno);
@@ -883,6 +968,27 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		}
 	}
 
+	if (cap_fd >= 0) {
+		struct timeval tv = {0, 100000};
+		setsockopt(cap_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		char cbuf[2048];
+		for (int i = 0; i < 100; i++) {
+			ssize_t cn = recv(cap_fd, cbuf, sizeof(cbuf), 0);
+			if (cn <= 0)
+				break;
+			uint64 sk, rk;
+			if (mptcp_parse_mpcapable((const uint8*)cbuf, (int)cn, &sk, &rk)) {
+				syz_mptcp_pair_pool[slot].local_key = sk;
+				syz_mptcp_pair_pool[slot].remote_key = rk;
+			}
+		}
+		close(cap_fd);
+		cap_fd = -1;
+		debug("syz_mptcp_pair_init: captured keys local=0x%llx remote=0x%llx\n",
+		      (unsigned long long)syz_mptcp_pair_pool[slot].local_key,
+		      (unsigned long long)syz_mptcp_pair_pool[slot].remote_key);
+	}
+
 	// Capture the CLIENT msk's own token via the standard MPTCP_INFO
 	// sockopt (stock uapi, no kernel patch needed) -- this is what lets
 	// a later syz_mptcp_join_subflow() identify which msk to open a new
@@ -923,6 +1029,8 @@ fail:
 		close(client_fd);
 	if (server_listen_fd >= 0)
 		close(server_listen_fd);
+	if (cap_fd >= 0)
+		close(cap_fd);
 	// Release the slot claimed above (generation stays bumped -- it only
 	// ever has to increase, and a burned number is harmless).
 	__atomic_store_n(&syz_mptcp_pair_pool[slot].in_use, false, __ATOMIC_RELEASE);
