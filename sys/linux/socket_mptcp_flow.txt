@@ -44,7 +44,7 @@ syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->
 # __mptcp_subflow_push_pending), the deferred-send code a shallow send never
 # reaches. Harness constant (see the matching .const + executor #define).
-mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP
+mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS
 
 # syz_mptcp_drive_traffic(): push data client->server on an established pair.
 # On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains
