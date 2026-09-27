@@ -89,10 +89,10 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_emit_vhci":                 linuxVhciInjectionSupported,
 	"syz_init_net_socket":           linuxSyzInitNetSocketSupported,
 	"syz_genetlink_get_family_id":   linuxSyzGenetlinkGetFamilyIDSupported,
-	"syz_mptcp_pair_init":           alwaysSupported,
-	"syz_mptcp_pair_close":          alwaysSupported,
-	"syz_mptcp_join_subflow":        alwaysSupported,
-	"syz_mptcp_subflow_destroy":     alwaysSupported,
+	"syz_mptcp_pair_init":           linuxSyzMptcpSupported,
+	"syz_mptcp_pair_close":          linuxSyzMptcpSupported,
+	"syz_mptcp_join_subflow":        linuxSyzMptcpSupported,
+	"syz_mptcp_subflow_destroy":     linuxSyzMptcpSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
 	"syz_read_part_table":           linuxSyzReadPartTableSupported,
 	"syz_io_uring_setup":            alwaysSupported,
@@ -311,6 +311,13 @@ func linuxSyzGenetlinkGetFamilyIDSupported(ctx *checkContext, call *prog.Syscall
 	// TODO: try to obtain actual family ID here. It will disable whole sets of sendmsg syscalls.
 	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
 		ctx.val("AF_NETLINK"), ctx.val("SOCK_RAW"), ctx.val("NETLINK_GENERIC")))
+}
+
+func linuxSyzMptcpSupported(ctx *checkContext, call *prog.Syscall) string {
+	// The pseudo-syscalls create IPPROTO_MPTCP sockets, which the kernel
+	// rejects with EPROTONOSUPPORT when it is built without CONFIG_MPTCP.
+	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
+		ctx.val("AF_INET"), ctx.val("SOCK_STREAM"), ctx.val("IPPROTO_MPTCP")))
 }
 
 func linuxPkeysSupported(ctx *checkContext, call *prog.Syscall) string {
