@@ -93,6 +93,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_mptcp_pair_close":          linuxSyzMptcpSupported,
 	"syz_mptcp_join_subflow":        linuxSyzMptcpSupported,
 	"syz_mptcp_subflow_destroy":     linuxSyzMptcpSupported,
+	"syz_mptcp_drive_traffic":       linuxSyzMptcpSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
 	"syz_read_part_table":           linuxSyzReadPartTableSupported,
 	"syz_io_uring_setup":            alwaysSupported,

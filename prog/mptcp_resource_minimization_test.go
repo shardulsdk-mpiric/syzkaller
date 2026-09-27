@@ -35,7 +35,7 @@ import (
 //	syz_mptcp_subflow_destroy(r1)
 //	syz_mptcp_pair_close(r0)
 const mptcpMinimizationBaseProg = `
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback})
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
 r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0)
 syz_mptcp_subflow_destroy(r1)
 syz_mptcp_pair_close(r0)

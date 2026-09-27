@@ -30,7 +30,7 @@
 resource mptcp_pair[intptr]
 resource mptcp_subflow[intptr]
 
-syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in]) mptcp_pair
+syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags]) mptcp_pair
 syz_mptcp_pair_close(pair mptcp_pair)
 
 # addr_id: local address id announced to the kernel for this subflow
@@ -38,3 +38,16 @@ syz_mptcp_pair_close(pair mptcp_pair)
 # backup: sets MPTCP_PM_ADDR_FLAG_BACKUP on the new subflow when 1.
 syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1]) mptcp_subflow
 syz_mptcp_subflow_destroy(subflow mptcp_subflow)
+
+# MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
+# so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
+# pushed later from the ACK-driven softirq path (__mptcp_check_push ->
+# __mptcp_subflow_push_pending), the deferred-send code a shallow send never
+# reaches. Harness constant (see the matching .const + executor #define).
+mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP
+
+# syz_mptcp_drive_traffic(): push data client->server on an established pair.
+# On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains
+# only partially, leaving data on the msk send head so the kernel flushes it
+# from the softirq deferred-push path.
+syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len[data])

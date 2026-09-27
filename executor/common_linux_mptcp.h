@@ -177,6 +177,16 @@ enum {
 // well under a millisecond.
 #define SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES 20
 
+// MPTCP_INIT_RWND_CLAMP (harness flag; mirrored in socket_mptcp_flow.txt and
+// its .const): clamp the server receive window so a syz_mptcp_drive_traffic
+// burst cannot flush inline -- the backlog is pushed from the softirq
+// deferred-send path (__mptcp_check_push -> __mptcp_subflow_push_pending).
+#define MPTCP_INIT_RWND_CLAMP 1
+// SO_RCVBUF applied to the server side when clamped. The kernel doubles the
+// request and enforces SOCK_MIN_RCVBUF; 16 KiB keeps the advertised window
+// well under a burst while leaving room for the fully_established priming.
+#define SYZ_MPTCP_CLAMP_RCVBUF (16 * 1024)
+
 struct syz_mptcp_pair_slot {
 	bool in_use;
 	int server_fd;
@@ -215,6 +225,12 @@ struct syz_mptcp_pair_slot {
 	// Preserved across syz_mptcp_pair_close (not zeroed) so reuse always
 	// yields a strictly newer value.
 	uint32 generation;
+
+	// Set when the pair was created with MPTCP_INIT_RWND_CLAMP: the server
+	// receive window is pinned small so syz_mptcp_drive_traffic switches to
+	// burst + partial-drain, leaving data on the msk send head for the
+	// softirq deferred-push path.
+	bool rwnd_clamped;
 };
 
 // A subflow produced by syz_mptcp_join_subflow(). References its parent
@@ -730,11 +746,12 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 #endif // __NR_syz_mptcp_subflow_destroy
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init
-static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
+static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile long a2)
 {
 	// server_addr / client_addr: not yet consulted, see file comment.
 	(void)a0;
 	(void)a1;
+	unsigned long init_flags = (unsigned long)a2;
 
 	struct sockaddr_in srv_addr;
 	socklen_t alen;
@@ -776,7 +793,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 	server_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
 	if (server_listen_fd < 0) {
 		debug("syz_mptcp_pair_init: server socket: %d\n", errno);
-		return -1;
+		goto fail;
 	}
 	setsockopt(server_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
@@ -792,6 +809,13 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 	if (getsockname(server_listen_fd, (struct sockaddr*)&srv_addr, &alen) < 0) {
 		debug("syz_mptcp_pair_init: getsockname: %d\n", errno);
 		goto fail;
+	}
+	if (init_flags & MPTCP_INIT_RWND_CLAMP) {
+		// Pin the receiver window small on the listener BEFORE listen() so the
+		// accepted msk inherits a small window_clamp from its first
+		// advertisement; re-applied on the accepted fd post-accept below.
+		int rcvbuf = SYZ_MPTCP_CLAMP_RCVBUF;
+		setsockopt(server_listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 	}
 	if (listen(server_listen_fd, 1) < 0) {
 		debug("syz_mptcp_pair_init: listen: %d\n", errno);
@@ -811,6 +835,10 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 	if (server_fd < 0) {
 		debug("syz_mptcp_pair_init: accept: %d\n", errno);
 		goto fail;
+	}
+	if (init_flags & MPTCP_INIT_RWND_CLAMP) {
+		int rcvbuf = SYZ_MPTCP_CLAMP_RCVBUF;
+		setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 	}
 	// The listener stays open and bound for the rest of the pair's
 	// lifetime -- see the server_listen_fd comment on
@@ -882,6 +910,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1)
 	syz_mptcp_pair_pool[slot].client_fd = client_fd;
 	syz_mptcp_pair_pool[slot].server_listen_fd = server_listen_fd;
 	syz_mptcp_pair_pool[slot].server_port_h = ntohs(srv_addr.sin_port);
+	syz_mptcp_pair_pool[slot].rwnd_clamped = (init_flags & MPTCP_INIT_RWND_CLAMP) != 0;
 	debug("syz_mptcp_pair_init: pair %d established, port %d, token %u gen %u\n",
 	      slot, ntohs(srv_addr.sin_port), syz_mptcp_pair_pool[slot].token,
 	      syz_mptcp_pair_pool[slot].generation);
@@ -929,6 +958,7 @@ static long syz_mptcp_pair_close(volatile long a0)
 	syz_mptcp_pair_pool[slot].server_listen_fd = 0;
 	syz_mptcp_pair_pool[slot].token = 0;
 	syz_mptcp_pair_pool[slot].server_port_h = 0;
+	syz_mptcp_pair_pool[slot].rwnd_clamped = false;
 	__atomic_store_n(&syz_mptcp_pair_pool[slot].in_use, false, __ATOMIC_RELEASE);
 	return 0;
 }
@@ -1104,6 +1134,67 @@ free_slot:
 	sub->remote_port_h = 0;
 	__atomic_store_n(&sub->in_use, false, __ATOMIC_RELEASE);
 	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_drive_traffic
+// Push data client->server on an established pair, exercising the MPTCP data
+// path. On a pair created with MPTCP_INIT_RWND_CLAMP the single send + full
+// drain becomes a bounded burst + single partial drain: a backlog larger than
+// the clamped receiver can absorb is left on the msk send head, so the kernel
+// flushes it from the ACK-driven softirq push path (__mptcp_check_push ->
+// __mptcp_subflow_push_pending) instead of inline in mptcp_sendmsg. Bounded
+// (<=4 KiB/send, <=64 sends) so a mutated data_len can't wedge the pair.
+static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile long a2)
+{
+	long slot = a0;
+	const void* data = (const void*)a1;
+	size_t data_len = (size_t)a2;
+	struct syz_mptcp_pair_slot* pair;
+	char drain_buf[4096];
+	ssize_t sent = 0, drained;
+
+	if (slot < 0 || slot >= SYZ_MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_drive_traffic: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[slot];
+	if (!pair->in_use) {
+		debug("syz_mptcp_drive_traffic: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (pair->client_fd < 0 || pair->server_fd < 0) {
+		debug("syz_mptcp_drive_traffic: slot %ld fds not set\n", slot);
+		return -1;
+	}
+	if (data_len > sizeof(drain_buf))
+		data_len = sizeof(drain_buf);
+
+	if (pair->rwnd_clamped) {
+		// Backpressure mode: burst until the clamped window EAGAINs, building a
+		// backlog larger than the receiver can absorb, then drain only ONE
+		// bufferful. A window update goes back but the send head stays
+		// non-empty, so the remainder is flushed from the softirq deferred-push
+		// path -- the point of MPTCP_INIT_RWND_CLAMP. Bounded to 64 sends.
+		for (int i = 0; i < 64; i++) {
+			ssize_t n = send(pair->client_fd, data, data_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+			if (n <= 0)
+				break;
+			sent += n;
+		}
+		drained = recv(pair->server_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT | MSG_NOSIGNAL);
+		(void)drained;
+	} else {
+		sent = send(pair->client_fd, data, data_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+		// Bounded drain so the RX buffer doesn't fill and EAGAIN later sends.
+		for (int i = 0; i < 8; i++) {
+			drained = recv(pair->server_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT | MSG_NOSIGNAL);
+			if (drained <= 0)
+				break;
+		}
+	}
+	debug("syz_mptcp_drive_traffic: pair=%ld clamped=%d sent=%zd\n", slot, pair->rwnd_clamped, sent);
+	return sent < 0 ? 0 : (long)sent;
 }
 #endif
 
