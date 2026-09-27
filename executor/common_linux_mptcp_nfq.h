@@ -1,5 +1,5 @@
 // Copyright 2026 syzkaller project authors. All rights reserved.
-// Use of this source code is governed by Apache 2 LICENSE.
+// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 //
 // WIP (increment 1, NOT yet wired/verified): general-substrate STATELESS NFQUEUE
 // mutation engine. Subsystem-agnostic. A subsystem layer registers a single
@@ -17,16 +17,16 @@
 #define SYZ_COMMON_LINUX_MPTCP_NFQ_H
 
 #include <errno.h>
-#include <pthread.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <linux/netlink.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_queue.h>
+#include <linux/netlink.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 #define SYZ_NFQ_QUEUE_NUM 0
 
@@ -46,10 +46,10 @@ static volatile int syz_nfq_worker_stop;
 
 // ---- local netlink-attribute walkers (no libnl) ----
 #define SYZ_NLA_OK(a, len) ((len) >= (int)sizeof(struct nlattr) && \
-	(a)->nla_len >= sizeof(struct nlattr) && (int)(a)->nla_len <= (len))
+			    (a)->nla_len >= sizeof(struct nlattr) && (int)(a)->nla_len <= (len))
 #define SYZ_NLA_DATA(a) ((void*)((char*)(a) + NLA_HDRLEN))
 #define SYZ_NLA_NEXT(a, len) ((len) -= NLA_ALIGN((a)->nla_len), \
-	(struct nlattr*)((char*)(a) + NLA_ALIGN((a)->nla_len)))
+			      (struct nlattr*)((char*)(a) + NLA_ALIGN((a)->nla_len)))
 
 // ---- IPv4 TCP checksum recompute (after an in-place option rewrite) ----
 static inline uint16 syz_nfq_csum_fold(uint32 sum)
@@ -88,7 +88,7 @@ static inline void syz_nfq_tcp_csum_v4(struct tcphdr* tcph, const struct iphdr* 
 
 // ---- raw-netlink NFQUEUE plumbing ----
 static inline int syz_nfq_send_msg(int fd, uint16 msg_type, uint16 res_id,
-			    const void* attr_payload, uint16 attr_len)
+				   const void* attr_payload, uint16 attr_len)
 {
 	char buf[256], ack[256];
 	struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
@@ -153,7 +153,7 @@ static inline int syz_nfq_config_params(int fd, uint16 q, uint8 mode, uint32 ran
 }
 
 static inline int syz_nfq_send_verdict(int fd, uint16 q, uint32 id, uint32 verdict,
-				const uint8* payload, uint16 plen)
+				       const uint8* payload, uint16 plen)
 {
 	static char buf[65536 + 256];
 	struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
