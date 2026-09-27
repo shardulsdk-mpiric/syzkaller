@@ -1,6 +1,5 @@
 // Copyright 2026 syzkaller project authors. All rights reserved.
-// Use of this source code is governed by Apache 2 LICENSE that can be found
-// in the LICENSE file.
+// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 // MPTCP (Multipath TCP, RFC 8684) MP_CAPABLE pair + MP_JOIN subflow
 // pseudo-syscalls.
@@ -56,19 +55,19 @@
 #ifndef SYZ_COMMON_LINUX_MPTCP_H
 #define SYZ_COMMON_LINUX_MPTCP_H
 
+#include <endian.h>
 #include <errno.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <endian.h>
-#include <net/if.h>
-#include <linux/if_ether.h>
-#include <linux/if_packet.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
 
 #include <linux/genetlink.h>
 #include <linux/netlink.h>
