@@ -1199,11 +1199,12 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint32 saddr4_be,
  * so 0 is coerced to 1 here and any other value passes through unchanged.
  * (syzlang int8 carries no signedness; the value is just the low byte of a2.)
  */
-static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile long a2)
+static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
 	long pair_slot = a0;
 	uint8 addr_id = (uint8)a1;
 	uint8 backup = (uint8)a2; // syzlang clamps to [0:1]
+	int mut_op = (int)a3; // SYZ_MPTCP_MUT_* -- 0 (NONE) leaves the join unmutated
 	struct syz_mptcp_pair_slot* pair;
 	uint32 local_addr_be; // this subflow's distinct per-slot local address (set below)
 	const uint32 remote_addr_be = htonl(0x7f000001); // 127.0.0.1: the pair's server
@@ -1294,12 +1295,36 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		local_port_h = SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE +
 			       (int)procid * SYZ_MPTCP_SUBFLOW_POOL_SIZE + sub_slot;
 
+	// Mutation (increment 3): if requested, install the NFQUEUE interceptor and
+	// publish the instruction (keyed on this subflow's per-slot source address)
+	// BEFORE SUBFLOW_CREATE fires the SYN, so the worker catches the egress
+	// MP_JOIN ACK and applies the op. Retired on every exit path below. With a
+	// HMAC-corrupting op the kernel rejects the subflow, so the establishment
+	// poll below times out and the join returns -1 (expected -- the value is the
+	// exercised crypto-failure path, not a live subflow).
+	if (mut_op != SYZ_MPTCP_MUT_NONE) {
+		syz_nfq_hook = syz_mptcp_mut_hook; // set before setup (engine contract)
+		if (syz_nfq_setup() != 0) {
+			// A requested mutation that cannot be installed must NOT masquerade
+			// as a clean join (that would hide a broken mutation environment and
+			// silently defeat repro-by-construction). Fail the call loudly.
+			debug("syz_mptcp_join_subflow: NFQUEUE setup failed; failing the mutated join\n");
+			if (evfd >= 0)
+				close(evfd);
+			__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
+			return -1;
+		}
+		syz_mptcp_mut_publish(local_addr_be, mut_op);
+	}
+
 	if (mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
 				    local_addr_be, local_port_h,
 				    remote_addr_be, pair->server_port_h) < 0) {
 		debug("syz_mptcp_join_subflow: SUBFLOW_CREATE: %d\n", errno);
 		if (evfd >= 0)
 			close(evfd);
+		if (mut_op != SYZ_MPTCP_MUT_NONE)
+			syz_mptcp_mut_retire();
 		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
 	}
@@ -1324,6 +1349,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		      pair_slot);
 		if (evfd >= 0)
 			close(evfd);
+		if (mut_op != SYZ_MPTCP_MUT_NONE)
+			syz_mptcp_mut_retire();
 		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
 	}
@@ -1346,6 +1373,11 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		close(evfd);
 		evfd = -1;
 	}
+
+	// The egress ACK has been sent (and mutated, if requested) by now; retire the
+	// instruction so a later join reusing this per-slot address isn't corrupted.
+	if (mut_op != SYZ_MPTCP_MUT_NONE)
+		syz_mptcp_mut_retire();
 
 	// in_use already published by the atomic claim above. Record the
 	// parent's current generation so a later destroy can detect slot reuse.
