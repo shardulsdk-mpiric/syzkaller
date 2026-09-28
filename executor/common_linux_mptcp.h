@@ -538,6 +538,7 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 static int mptcp_pm_setup_done;
 static int mptcp_pm_setup_lock; // serializes the one-time setup under -threaded
 static int mptcp_pm_event_sock = -1; // held open + subscribed so mptcp_userspace_pm_active() is true
+static uint32 mptcp_pm_event_grp_id; // "mptcp_pm_events" mcast group id, for per-join event sockets
 
 // Parse a CTRL_CMD_GETFAMILY reply for the mptcp_pm family id and the id
 // of its "mptcp_pm_events" multicast group.
@@ -678,6 +679,7 @@ static int mptcp_pm_ensure_setup(void)
 
 	mptcp_pm_genl_sock = sock;
 	mptcp_pm_event_sock = event_sock;
+	mptcp_pm_event_grp_id = event_grp_id;
 	__atomic_store_n(&mptcp_pm_setup_done, 1, __ATOMIC_RELEASE);
 	debug("mptcp_pm_ensure_setup: pm_type=1 family_id=%d event_grp_id=%d\n",
 	      mptcp_pm_family_id, event_grp_id);
@@ -1107,6 +1109,75 @@ static long syz_mptcp_pair_close(volatile long a0)
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+
+// Subset of enum mptcp_event_type / mptcp_event_attr (uapi/linux/mptcp_pm.h),
+// used to read the kernel-auto-assigned subflow source port back from the
+// mptcp_pm_events SUB_ESTABLISHED notification. SPORT is host-byte-order.
+#define SYZ_MPTCP_EVENT_SUB_ESTABLISHED 10
+#define SYZ_MPTCP_EV_ATTR_TOKEN 1
+#define SYZ_MPTCP_EV_ATTR_LOC_ID 3
+#define SYZ_MPTCP_EV_ATTR_SPORT 9
+
+// Read the auto-assigned local port back from the SUB_ESTABLISHED event, so
+// syz_mptcp_subflow_destroy() can address the exact 4-tuple. Match on the
+// (client) msk token + local address id. evfd must already be bound and
+// subscribed to the events mcast group. Returns 0 and *sport_out on success,
+// -1 on timeout.
+static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint8 loc_id, uint16* sport_out)
+{
+	char ebuf[2048];
+	int attempts;
+
+	for (attempts = 0; attempts < SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES; attempts++) {
+		ssize_t n = recv(evfd, ebuf, sizeof(ebuf), 0);
+		if (n < 0)
+			continue; // SO_RCVTIMEO tick (EAGAIN) or transient; keep waiting
+		struct nlmsghdr* nlh = (struct nlmsghdr*)ebuf;
+		size_t len = (size_t)n;
+		for (; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len)) {
+			if (nlh->nlmsg_len < NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr)))
+				continue;
+			struct genlmsghdr* gh = (struct genlmsghdr*)NLMSG_DATA(nlh);
+			if (gh->cmd != SYZ_MPTCP_EVENT_SUB_ESTABLISHED)
+				continue;
+			char* a = (char*)nlh + NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr));
+			char* aend = (char*)nlh + nlh->nlmsg_len;
+			uint32 ev_token = 0;
+			uint16 ev_sport = 0;
+			uint8 ev_locid = 0;
+			int have_token = 0, have_sport = 0, have_locid = 0;
+			while (a + sizeof(struct nlattr) <= aend) {
+				struct nlattr* at = (struct nlattr*)a;
+				if (at->nla_len < sizeof(struct nlattr) || a + NLMSG_ALIGN(at->nla_len) > aend)
+					break;
+				void* d = a + NLA_HDRLEN;
+				int dlen = (int)at->nla_len - NLA_HDRLEN;
+				uint16 ty = at->nla_type & NLA_TYPE_MASK;
+				if (ty == SYZ_MPTCP_EV_ATTR_TOKEN && dlen >= (int)sizeof(uint32)) {
+					ev_token = *(uint32*)d;
+					have_token = 1;
+				} else if (ty == SYZ_MPTCP_EV_ATTR_LOC_ID && dlen >= (int)sizeof(uint8)) {
+					ev_locid = *(uint8*)d;
+					have_locid = 1;
+				} else if (ty == SYZ_MPTCP_EV_ATTR_SPORT && dlen >= (int)sizeof(uint16)) {
+					ev_sport = *(uint16*)d;
+					have_sport = 1;
+				}
+				a += NLMSG_ALIGN(at->nla_len);
+			}
+			if (have_token && have_sport && ev_token == token &&
+			    (!have_locid || ev_locid == loc_id)) {
+				// MPTCP_ATTR_SPORT is network byte order in the event
+				// (nla_put_be16 of inet_sport); DESTROY's PORT attr is
+				// host order, so convert here.
+				*sport_out = ntohs(ev_sport);
+				return 0;
+			}
+		}
+	}
+	return -1;
+}
+
 /*
  * NORMAL-mode MP_JOIN (see the file comment for the mechanism and scope).
  *
@@ -1127,6 +1198,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	uint16 local_port_h;
 	int sub_slot;
 	int retries;
+	int evfd = -1;
 
 	if (pair_slot < 0 || pair_slot >= SYZ_MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_join_subflow: pair slot %ld out of range\n", pair_slot);
@@ -1172,18 +1244,41 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// ORs it in); SIGNAL is rejected outright. BACKUP is the only flag
 	// this pseudo-syscall exposes, via the syzlang `backup` parameter.
 	addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
-	// Scope the local port by procid as well as slot so parallel executor
-	// procs that share a network namespace can't pick the same port (every
-	// other port/addr allocator in this tree is procid-scoped too). Stays
-	// below the ip_local_port_range floor (32768) for the proc counts
-	// syzkaller uses, keeping clear of kernel-assigned ephemeral ports.
-	local_port_h = SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE +
-		       (int)procid * SYZ_MPTCP_SUBFLOW_POOL_SIZE + sub_slot;
+
+	// Let the kernel auto-assign the subflow's local port (port 0): it tracks
+	// TIME_WAIT and never reuses a cooling-down port, so a repeated program
+	// (syzkaller repeat mode / a C-reproducer loop) can't hit EADDRINUSE the way
+	// a fixed port does. We read the chosen port back from the SUB_ESTABLISHED
+	// event for DESTROY. Subscribe a fresh events socket BEFORE SUBFLOW_CREATE so
+	// the notification can't be missed. If that can't be set up, fall back to a
+	// procid+slot-scoped fixed port (below the ephemeral floor; repeat-mode may
+	// then EADDRINUSE, but the common single-run case still works).
+	local_port_h = 0;
+	evfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (evfd >= 0) {
+		struct sockaddr_nl esa;
+		struct timeval rtv = {0, 100000};
+		memset(&esa, 0, sizeof(esa));
+		esa.nl_family = AF_NETLINK;
+		if (bind(evfd, (struct sockaddr*)&esa, sizeof(esa)) < 0 ||
+		    setsockopt(evfd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP,
+			       &mptcp_pm_event_grp_id, sizeof(mptcp_pm_event_grp_id)) < 0) {
+			close(evfd);
+			evfd = -1;
+		} else {
+			setsockopt(evfd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+		}
+	}
+	if (evfd < 0)
+		local_port_h = SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE +
+			       (int)procid * SYZ_MPTCP_SUBFLOW_POOL_SIZE + sub_slot;
 
 	if (mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
 				    local_addr_be, local_port_h,
 				    remote_addr_be, pair->server_port_h) < 0) {
 		debug("syz_mptcp_join_subflow: SUBFLOW_CREATE: %d\n", errno);
+		if (evfd >= 0)
+			close(evfd);
 		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
 	}
@@ -1206,8 +1301,24 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	if (retries == SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES) {
 		debug("syz_mptcp_join_subflow: pair=%ld subflow not established within ~1s\n",
 		      pair_slot);
+		if (evfd >= 0)
+			close(evfd);
 		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
+	}
+
+	// Read the kernel-assigned local port back from the SUB_ESTABLISHED event
+	// (only when we used port 0, i.e. evfd is up). On failure local_port_h stays
+	// 0; a later DESTROY then won't match and just frees the slot bookkeeping.
+	if (evfd >= 0) {
+		uint16 sport = 0;
+		if (mptcp_pm_recv_subflow_sport(evfd, pair->token, addr_id, &sport) == 0)
+			local_port_h = sport;
+		else
+			debug("syz_mptcp_join_subflow: pair=%ld no SUB_ESTABLISHED sport (DESTROY may not match)\n",
+			      pair_slot);
+		close(evfd);
+		evfd = -1;
 	}
 
 	// in_use already published by the atomic claim above. Record the
