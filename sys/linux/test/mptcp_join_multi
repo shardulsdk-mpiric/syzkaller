@@ -1,0 +1,13 @@
+# Regression test for the port-0 + per-slot-local-address fix (review F1).
+# Two concurrent subflows on ONE pair with DISTINCT addr_ids must both
+# establish. Before the fix, sending local port 0 for every join made the
+# kernel userspace PM (append_new_local_addr, which compares the local address
+# with port) see 127.0.0.2:0 for both, so the second join failed EINVAL. The
+# per-slot local address (127.0.0.2 + slot) keeps concurrent subflows distinct.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0)
+r2 = syz_mptcp_join_subflow(r0, 0x2, 0x0)
+syz_mptcp_subflow_destroy(r1)
+syz_mptcp_subflow_destroy(r2)
+syz_mptcp_pair_close(r0)

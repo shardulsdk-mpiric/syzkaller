@@ -273,6 +273,9 @@ struct syz_mptcp_subflow_slot {
 	uint32 pair_generation; // parent pair's generation at join time (see
 				// syz_mptcp_pair_slot.generation)
 	uint8 addr_id;
+	uint32 local_addr_be; // this subflow's distinct local 127/8 address (per slot),
+			      // so the kernel PM sees distinct local addrs for concurrent
+			      // subflows; DESTROY reuses it
 	uint16 local_port_h;
 	uint16 remote_port_h;
 };
@@ -1118,24 +1121,32 @@ static long syz_mptcp_pair_close(volatile long a0)
 #define SYZ_MPTCP_EVENT_SUB_ESTABLISHED 10
 #define SYZ_MPTCP_EV_ATTR_TOKEN 1
 #define SYZ_MPTCP_EV_ATTR_LOC_ID 3
+#define SYZ_MPTCP_EV_ATTR_SADDR4 5
 #define SYZ_MPTCP_EV_ATTR_SPORT 9
 
 // Read the auto-assigned local port back from the SUB_ESTABLISHED event, so
 // syz_mptcp_subflow_destroy() can address the exact 4-tuple. Match on the
-// (client) msk token + local address id. evfd must already be bound and
-// subscribed to the events mcast group. Returns 0 and *sport_out on success,
-// -1 on timeout.
-static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint8 loc_id, uint16* sport_out)
+// (client) msk token + this subflow's distinct local address (saddr4, network
+// order) -- the address pins THIS subflow even if a concurrent join reused the
+// addr_id. evfd must already be bound and subscribed to the events mcast group.
+// Bounded by a ~2s wall-clock deadline (NOT a message count) so a burst of
+// foreign events from concurrent MPTCP activity in this netns can't starve the
+// wait. Returns 0 and *sport_out on success, -1 on timeout.
+static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint32 saddr4_be, uint16* sport_out)
 {
 	char ebuf[2048];
-	int attempts;
+	struct timespec start, cur;
 
-	for (attempts = 0; attempts < SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES; attempts++) {
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (;;) {
+		clock_gettime(CLOCK_MONOTONIC, &cur);
+		if ((cur.tv_sec - start.tv_sec) * 1000 + (cur.tv_nsec - start.tv_nsec) / 1000000 > 2000)
+			return -1;
 		ssize_t n = recv(evfd, ebuf, sizeof(ebuf), 0);
 		if (n < 0)
-			continue; // SO_RCVTIMEO tick (EAGAIN) or transient; keep waiting
+			continue; // SO_RCVTIMEO tick (EAGAIN) or transient; the deadline bounds us
+		int len = (int)n; // signed: NLMSG_OK/NEXT underflow on an unaligned tail otherwise
 		struct nlmsghdr* nlh = (struct nlmsghdr*)ebuf;
-		size_t len = (size_t)n;
 		for (; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len)) {
 			if (nlh->nlmsg_len < NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr)))
 				continue;
@@ -1144,10 +1155,9 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint8 loc_id, uin
 				continue;
 			char* a = (char*)nlh + NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr));
 			char* aend = (char*)nlh + nlh->nlmsg_len;
-			uint32 ev_token = 0;
+			uint32 ev_token = 0, ev_saddr4 = 0;
 			uint16 ev_sport = 0;
-			uint8 ev_locid = 0;
-			int have_token = 0, have_sport = 0, have_locid = 0;
+			int have_token = 0, have_sport = 0, have_saddr4 = 0;
 			while (a + sizeof(struct nlattr) <= aend) {
 				struct nlattr* at = (struct nlattr*)a;
 				if (at->nla_len < sizeof(struct nlattr) || a + NLMSG_ALIGN(at->nla_len) > aend)
@@ -1158,9 +1168,9 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint8 loc_id, uin
 				if (ty == SYZ_MPTCP_EV_ATTR_TOKEN && dlen >= (int)sizeof(uint32)) {
 					ev_token = *(uint32*)d;
 					have_token = 1;
-				} else if (ty == SYZ_MPTCP_EV_ATTR_LOC_ID && dlen >= (int)sizeof(uint8)) {
-					ev_locid = *(uint8*)d;
-					have_locid = 1;
+				} else if (ty == SYZ_MPTCP_EV_ATTR_SADDR4 && dlen >= (int)sizeof(uint32)) {
+					ev_saddr4 = *(uint32*)d; // network order, as sent
+					have_saddr4 = 1;
 				} else if (ty == SYZ_MPTCP_EV_ATTR_SPORT && dlen >= (int)sizeof(uint16)) {
 					ev_sport = *(uint16*)d;
 					have_sport = 1;
@@ -1168,7 +1178,7 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint8 loc_id, uin
 				a += NLMSG_ALIGN(at->nla_len);
 			}
 			if (have_token && have_sport && ev_token == token &&
-			    (!have_locid || ev_locid == loc_id)) {
+			    (!have_saddr4 || ev_saddr4 == saddr4_be)) {
 				// MPTCP_ATTR_SPORT is network byte order in the event
 				// (nla_put_be16 of inet_sport); DESTROY's PORT attr is
 				// host order, so convert here.
@@ -1177,7 +1187,6 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint8 loc_id, uin
 			}
 		}
 	}
-	return -1;
 }
 
 /*
@@ -1194,7 +1203,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	uint8 addr_id = (uint8)a1;
 	uint8 backup = (uint8)a2; // syzlang clamps to [0:1]
 	struct syz_mptcp_pair_slot* pair;
-	const uint32 local_addr_be = htonl(0x7f000002); // 127.0.0.2: the new subflow's local endpoint
+	uint32 local_addr_be; // this subflow's distinct per-slot local address (set below)
 	const uint32 remote_addr_be = htonl(0x7f000001); // 127.0.0.1: the pair's server
 	uint32 addr_flags;
 	uint16 local_port_h;
@@ -1246,6 +1255,14 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// ORs it in); SIGNAL is rejected outright. BACKUP is the only flag
 	// this pseudo-syscall exposes, via the syzlang `backup` parameter.
 	addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
+
+	// Distinct local address per subflow slot (127.0.0.2 + slot). The kernel's
+	// userspace PM (mptcp_userspace_pm_append_new_local_addr) compares the local
+	// address WITH port, so with port 0 every subflow would present 127.0.0.2:0
+	// and a second join on the same pair with a different addr_id would be
+	// rejected -EINVAL -- breaking concurrent multi-subflow. A per-slot address
+	// keeps concurrent subflows distinct; stored on the slot for DESTROY.
+	local_addr_be = htonl(0x7f000002 + (uint32)sub_slot);
 
 	// Let the kernel auto-assign the subflow's local port (port 0): it tracks
 	// TIME_WAIT and never reuses a cooling-down port, so a repeated program
@@ -1310,15 +1327,20 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	}
 
 	// Read the kernel-assigned local port back from the SUB_ESTABLISHED event
-	// (only when we used port 0, i.e. evfd is up). On failure local_port_h stays
-	// 0; a later DESTROY then won't match and just frees the slot bookkeeping.
+	// (only when we used port 0, i.e. evfd is up), matched by this subflow's
+	// distinct local address. On failure local_port_h stays 0; a later DESTROY
+	// with port 0 is rejected by the kernel at parse (EINVAL, "missing local
+	// port") and the slot bookkeeping is freed either way. Braces on both arms
+	// are load-bearing: csource strips the debug() line, and without them the
+	// following close(evfd) would bind to the else and leak the fd on success.
 	if (evfd >= 0) {
 		uint16 sport = 0;
-		if (mptcp_pm_recv_subflow_sport(evfd, pair->token, addr_id, &sport) == 0)
+		if (mptcp_pm_recv_subflow_sport(evfd, pair->token, local_addr_be, &sport) == 0) {
 			local_port_h = sport;
-		else
-			debug("syz_mptcp_join_subflow: pair=%ld no SUB_ESTABLISHED sport (DESTROY may not match)\n",
+		} else {
+			debug("syz_mptcp_join_subflow: pair=%ld no SUB_ESTABLISHED sport (DESTROY rejected, slot freed)\n",
 			      pair_slot);
+		}
 		close(evfd);
 		evfd = -1;
 	}
@@ -1329,6 +1351,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	syz_mptcp_subflow_pool[sub_slot].pair_generation =
 	    __atomic_load_n(&pair->generation, __ATOMIC_ACQUIRE);
 	syz_mptcp_subflow_pool[sub_slot].addr_id = addr_id;
+	syz_mptcp_subflow_pool[sub_slot].local_addr_be = local_addr_be;
 	syz_mptcp_subflow_pool[sub_slot].local_port_h = local_port_h;
 	syz_mptcp_subflow_pool[sub_slot].remote_port_h = pair->server_port_h;
 	debug("syz_mptcp_join_subflow: pair=%ld subflow=%d established "
@@ -1345,7 +1368,6 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 	long err = 0;
 	struct syz_mptcp_subflow_slot* sub;
 	struct syz_mptcp_pair_slot* pair;
-	const uint32 local_addr_be = htonl(0x7f000002);
 	const uint32 remote_addr_be = htonl(0x7f000001);
 
 	if (sub_slot < 0 || sub_slot >= SYZ_MPTCP_SUBFLOW_POOL_SIZE) {
@@ -1376,7 +1398,7 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 	}
 
 	if (mptcp_pm_subflow_destroy(pair->token, sub->addr_id,
-				     local_addr_be, sub->local_port_h,
+				     sub->local_addr_be, sub->local_port_h,
 				     remote_addr_be, sub->remote_port_h) < 0) {
 		// Free the bookkeeping even on genl failure: this subflow slot is a
 		// syzkaller resource consumed by the call regardless, and a DESTROY
