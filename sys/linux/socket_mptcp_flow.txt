@@ -45,7 +45,9 @@ syz_mptcp_pair_close(pair mptcp_pair)
 # does not establish, by design). Harness-only constants (see .const + #define).
 define MPTCP_MUT_NONE	0
 define MPTCP_MUT_HMAC_FLIP	1
-mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP
+define MPTCP_MUT_HMAC_ZERO	2
+define MPTCP_MUT_NONCE_FLIP	3
+mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_MUT_NONCE_FLIP
 syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], mut_op flags[mptcp_mut_ops]) mptcp_subflow
 syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 
