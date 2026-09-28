@@ -1,4 +1,4 @@
 # Establish an MP_CAPABLE MPTCP pair on loopback and close it.
 
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback})
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
 syz_mptcp_pair_close(r0)

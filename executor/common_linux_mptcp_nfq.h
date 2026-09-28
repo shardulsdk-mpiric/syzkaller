@@ -292,8 +292,9 @@ static inline void* syz_nfq_worker_loop(void* arg)
 		} else {
 			vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, NULL, 0);
 		}
-		if (vrc < 0)
+		if (vrc < 0) {
 			debug("syz_nfq_worker_loop: verdict send failed id=%u errno=%d\n", id, errno);
+		}
 	}
 	return NULL;
 }
@@ -306,8 +307,9 @@ static inline void syz_nfq_cleanup(void)
 		syz_nfq_worker_started = 0;
 	}
 	if (syz_nfq_iptables_inserted) {
-		if (system("iptables -D OUTPUT -o lo -p tcp -j NFQUEUE --queue-num 0 --queue-bypass") != 0)
+		if (system("iptables -D OUTPUT -o lo -p tcp -j NFQUEUE --queue-num 0 --queue-bypass") != 0) {
 			debug("syz_nfq_cleanup: iptables -D failed\n");
+		}
 		syz_nfq_iptables_inserted = 0;
 	}
 	if (syz_nfq_fd >= 0) {

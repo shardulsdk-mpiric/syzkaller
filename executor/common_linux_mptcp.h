@@ -300,7 +300,7 @@ struct syz_mptcp_info_short {
 
 static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[SYZ_MPTCP_PAIR_POOL_SIZE];
 
-// Which of the four pseudo-syscalls in this file end up compiled in
+// Which of the five pseudo-syscalls in this file end up compiled in
 // determines which of the shared pool/netlink/setup helpers below are
 // reachable. pkg/csource's per-pseudo-syscall smoke test
 // (pkg/csource.testPseudoSyscalls, "single_syz_mptcp_*") builds one call
@@ -1112,8 +1112,8 @@ static long syz_mptcp_pair_close(volatile long a0)
  *
  * addr_id 0 is rejected by the kernel ("invalid addr id" in
  * mptcp_userspace_pm_append_new_local_addr, net/mptcp/pm_userspace.c);
- * syzlang's addr_id is a signed int8, so 0 is coerced to 1 here and any
- * other value passes through unchanged.
+ * so 0 is coerced to 1 here and any other value passes through unchanged.
+ * (syzlang int8 carries no signedness; the value is just the low byte of a2.)
  */
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile long a2)
 {

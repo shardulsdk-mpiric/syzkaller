@@ -27,8 +27,11 @@
 # mutation, no nonce/HMAC capture, no kernel-side instrumentation --
 # those land as a later increment. Runs on any stock CONFIG_MPTCP kernel.
 
-resource mptcp_pair[intptr]
-resource mptcp_subflow[intptr]
+# Invalid default (0xff..ff -> -1 as the executor's long slot index, which its
+# `slot < 0` guard rejects): a defaulted/orphaned handle must NOT alias live
+# pool slot 0. Handles are real pool indices produced only by pair_init/join.
+resource mptcp_pair[intptr]: 0xffffffffffffffff
+resource mptcp_subflow[intptr]: 0xffffffffffffffff
 
 syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags]) mptcp_pair
 syz_mptcp_pair_close(pair mptcp_pair)
@@ -44,6 +47,11 @@ syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->
 # __mptcp_subflow_push_pending), the deferred-send code a shallow send never
 # reaches. Harness constant (see the matching .const + executor #define).
+# Harness-only constants (no kernel header defines them): give syz-extract the
+# values here so `make extract` stays reproducible instead of failing with
+# "defined for none of the arches". Must match the executor #defines + the .const.
+define MPTCP_INIT_RWND_CLAMP	1
+define MPTCP_INIT_CAPTURE_KEYS	2
 mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS
 
 # syz_mptcp_drive_traffic(): push data client->server on an established pair.
