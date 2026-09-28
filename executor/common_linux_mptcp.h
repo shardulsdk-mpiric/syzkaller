@@ -335,7 +335,7 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 // itself and the nested-attribute nest_begin/end helpers (only
 // SUBFLOW_CREATE/DESTROY payloads nest attributes; GETFAMILY's request
 // doesn't) are needed by exactly this pair.
-#define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
+#define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || __NR_syz_mptcp_subflow_info)
 #define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
 #define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow)
 
@@ -1465,6 +1465,54 @@ free_slot:
 	sub->remote_port_h = 0;
 	__atomic_store_n(&sub->in_use, false, __ATOMIC_RELEASE);
 	return err;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_subflow_info
+// Non-consuming lifecycle op (op-set increment 1): name a LIVE subflow WITHOUT
+// destroying it. This proves the resource model supports operations other than
+// syz_mptcp_subflow_destroy on an mptcp_subflow handle -- the basis for the
+// adversarial multi-subflow lifecycle orderings this op set is built for
+// (syzkaller can now pile ops on a still-live subflow before teardown, e.g.
+// info/traffic then a racing close). It validates the handle maps to an in-use
+// slot whose parent pair is still live (same generation -- the stale/reuse guard
+// mirrors syz_mptcp_subflow_destroy), then does a benign MPTCP_INFO getsockopt on
+// the parent msk to confirm it is alive, and reports the current subflow count.
+// It NEVER frees the slot: the subflow stays addressable for later ops.
+static long syz_mptcp_subflow_info(volatile long a0)
+{
+	long sub_slot = a0;
+	struct syz_mptcp_subflow_slot* sub;
+	struct syz_mptcp_pair_slot* pair;
+	uint8 info[128];
+	socklen_t len = sizeof(info);
+
+	if (sub_slot < 0 || sub_slot >= MPTCP_SUBFLOW_POOL_SIZE) {
+		debug("syz_mptcp_subflow_info: slot %ld out of range\n", sub_slot);
+		return -1;
+	}
+	sub = &syz_mptcp_subflow_pool[sub_slot];
+	if (!__atomic_load_n(&sub->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_subflow_info: slot %ld not in use\n", sub_slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[sub->pair_slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&pair->generation, __ATOMIC_ACQUIRE) != sub->pair_generation) {
+		debug("syz_mptcp_subflow_info: slot %ld parent pair %d stale, not live\n",
+		      sub_slot, sub->pair_slot);
+		return -1;
+	}
+
+	memset(info, 0, sizeof(info));
+	if (getsockopt(pair->client_fd, SOL_MPTCP, MPTCP_INFO, info, &len) < 0) {
+		debug("syz_mptcp_subflow_info: MPTCP_INFO: %d\n", errno);
+		return -1;
+	}
+	// info[0] == mptcpi_subflows: first field of struct mptcp_info, stable uapi.
+	debug("syz_mptcp_subflow_info: slot %ld live, mptcpi_subflows=%u\n",
+	      sub_slot, info[0]);
+	return info[0];
 }
 #endif
 
