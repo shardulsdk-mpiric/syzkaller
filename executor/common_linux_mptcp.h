@@ -78,6 +78,7 @@
 // so minimal reproducers that don't mutate don't pull in pthread/netfilter.
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
 #include "common_linux_mptcp_crypto.h"
+#include "common_linux_mptcp_mut.h"
 #include "common_linux_mptcp_nfq.h"
 #endif
 
