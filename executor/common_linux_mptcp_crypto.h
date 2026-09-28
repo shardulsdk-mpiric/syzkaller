@@ -4,11 +4,16 @@
 // Vendored SHA-256 + HMAC-SHA-256 (no external dependencies; the executor build
 // forbids linking libcrypto). Used by the MPTCP mutation layer to recompute keys
 // and MP_JOIN HMACs in userspace from wire-captured keys. Matches
-// net/mptcp/crypto.c exactly:
-//   token = be32(SHA256(be64(key))[0:4])
-//   idsn  = be64(SHA256(be64(key))[24:32])
-//   MP_JOIN HMAC = HMAC-SHA256(be64(k1) || be64(k2), msg)   (truncated as needed)
+// net/mptcp/crypto.c exactly (implemented helpers below in parentheses):
+//   token = be32(SHA256(be64(key))[0:4])                   (syz_mptcp_token_from_key)
+//   idsn  = be64(SHA256(be64(key))[24:32])                 (no helper yet -- add when a mutation needs the IDSN)
+//   MP_JOIN HMAC = HMAC-SHA256(be64(k1) || be64(k2), msg)  (syz_mptcp_join_hmac; truncate as the wire needs)
 // SHA-256 is the standard FIPS 180-4 construction.
+//
+// Naming caveat: the csource reproducer generator rewrites the substrings
+// uint8/uint16/uint32/uint64 -> uintN_t (a bare, non-word-bounded replace), so
+// never use those as a substring inside an identifier in this file (e.g. a name
+// like syz_uint32_load would become syz_uint32_t_load in the reproducer only).
 #ifndef SYZ_COMMON_LINUX_MPTCP_CRYPTO_H
 #define SYZ_COMMON_LINUX_MPTCP_CRYPTO_H
 
@@ -150,8 +155,8 @@ static inline void syz_hmac_sha256(const uint8* key, size_t keylen,
 	memset(k, 0, sizeof(k));
 	if (keylen > 64) {
 		syz_sha256(key, keylen, k); // keys >64B are hashed; ours are 16B
-	} else {
-		memcpy(k, key, keylen);
+	} else if (keylen) {
+		memcpy(k, key, keylen); // guard keylen==0: memcpy(,NULL,0) is UB
 	}
 	for (i = 0; i < 64; i++) {
 		ipad[i] = k[i] ^ 0x36;
