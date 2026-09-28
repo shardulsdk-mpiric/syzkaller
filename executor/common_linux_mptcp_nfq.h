@@ -13,8 +13,8 @@
 // the held packet synchronously before it proceeds. Raw-netlink (no
 // libnetfilter_queue dependency), mirroring the executor's other self-contained
 // netlink builders.
-#ifndef SYZ_COMMON_LINUX_MPTCP_NFQ_H
-#define SYZ_COMMON_LINUX_MPTCP_NFQ_H
+#ifndef EXECUTOR_COMMON_LINUX_MPTCP_NFQ_H
+#define EXECUTOR_COMMON_LINUX_MPTCP_NFQ_H
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -35,11 +35,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SYZ_NFQ_QUEUE_NUM 0
+#define NFQ_QUEUE_NUM 0
 
 // nftables objects that carry the diverting rule (see syz_nfq_install_rule).
-#define SYZ_NFQ_NFT_TABLE "syz_mptcp_mut"
-#define SYZ_NFQ_NFT_CHAIN "out"
+#define NFQ_NFT_TABLE "syz_mptcp_mut"
+#define NFQ_NFT_CHAIN "out"
 
 // The subsystem hook: given a copy of the IP packet (len bytes), mutate it IN
 // PLACE and return 1 if mutated, 0 to pass through. Must be a pure function of
@@ -56,10 +56,10 @@ static int syz_nfq_worker_started;
 static volatile int syz_nfq_worker_stop;
 
 // ---- local netlink-attribute walkers (no libnl) ----
-#define SYZ_NLA_OK(a, len) ((len) >= (int)sizeof(struct nlattr) && \
+#define NFQ_NLA_OK(a, len) ((len) >= (int)sizeof(struct nlattr) && \
 			    (a)->nla_len >= sizeof(struct nlattr) && (int)(a)->nla_len <= (len))
-#define SYZ_NLA_DATA(a) ((void*)((char*)(a) + NLA_HDRLEN))
-#define SYZ_NLA_NEXT(a, len) ((len) -= NLA_ALIGN((a)->nla_len), \
+#define NFQ_NLA_DATA(a) ((void*)((char*)(a) + NLA_HDRLEN))
+#define NFQ_NLA_NEXT(a, len) ((len) -= NLA_ALIGN((a)->nla_len), \
 			      (struct nlattr*)((char*)(a) + NLA_ALIGN((a)->nla_len)))
 
 // ---- IPv4 TCP checksum recompute (after an in-place TCP-segment rewrite) ----
@@ -466,7 +466,7 @@ static inline int syz_nfq_delete_rule(int fd)
 	syz_nft_batch_begin(&b);
 	m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_DELTABLE,
 			      NLM_F_REQUEST | NLM_F_ACK, NFPROTO_IPV4, 0);
-	syz_nft_put_str(&b, NFTA_TABLE_NAME, SYZ_NFQ_NFT_TABLE);
+	syz_nft_put_str(&b, NFTA_TABLE_NAME, NFQ_NFT_TABLE);
 	syz_nft_msg_end(&b, m);
 	syz_nft_batch_end(&b);
 	return syz_nft_batch_commit(fd, &b);
@@ -497,13 +497,13 @@ static inline int syz_nfq_install_rule(int fd)
 
 	m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWTABLE,
 			      NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, NFPROTO_IPV4, 0);
-	syz_nft_put_str(&b, NFTA_TABLE_NAME, SYZ_NFQ_NFT_TABLE);
+	syz_nft_put_str(&b, NFTA_TABLE_NAME, NFQ_NFT_TABLE);
 	syz_nft_msg_end(&b, m);
 
 	m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWCHAIN,
 			      NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, NFPROTO_IPV4, 0);
-	syz_nft_put_str(&b, NFTA_CHAIN_TABLE, SYZ_NFQ_NFT_TABLE);
-	syz_nft_put_str(&b, NFTA_CHAIN_NAME, SYZ_NFQ_NFT_CHAIN);
+	syz_nft_put_str(&b, NFTA_CHAIN_TABLE, NFQ_NFT_TABLE);
+	syz_nft_put_str(&b, NFTA_CHAIN_NAME, NFQ_NFT_CHAIN);
 	syz_nft_put_str(&b, NFTA_CHAIN_TYPE, "filter");
 	syz_nft_put_be32(&b, NFTA_CHAIN_POLICY, NF_ACCEPT);
 	n = syz_nft_nest_start(&b, NFTA_CHAIN_HOOK);
@@ -514,8 +514,8 @@ static inline int syz_nfq_install_rule(int fd)
 
 	m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWRULE,
 			      NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, NFPROTO_IPV4, 0);
-	syz_nft_put_str(&b, NFTA_RULE_TABLE, SYZ_NFQ_NFT_TABLE);
-	syz_nft_put_str(&b, NFTA_RULE_CHAIN, SYZ_NFQ_NFT_CHAIN);
+	syz_nft_put_str(&b, NFTA_RULE_TABLE, NFQ_NFT_TABLE);
+	syz_nft_put_str(&b, NFTA_RULE_CHAIN, NFQ_NFT_CHAIN);
 	exprs = syz_nft_nest_start(&b, NFTA_RULE_EXPRESSIONS);
 	// meta oif -> reg1
 	syz_nft_expr_start(&b, "meta", &elem, &data);
@@ -535,7 +535,7 @@ static inline int syz_nfq_install_rule(int fd)
 	syz_nft_expr_cmp_eq(&b, &tcp, sizeof(tcp));
 	// queue num 0 bypass
 	syz_nft_expr_start(&b, "queue", &elem, &data);
-	syz_nft_put_be16(&b, NFTA_QUEUE_NUM, SYZ_NFQ_QUEUE_NUM);
+	syz_nft_put_be16(&b, NFTA_QUEUE_NUM, NFQ_QUEUE_NUM);
 	syz_nft_put_be16(&b, NFTA_QUEUE_FLAGS, NFT_QUEUE_FLAG_BYPASS);
 	syz_nft_expr_end(&b, elem, data);
 	syz_nft_nest_end(&b, exprs);
@@ -621,16 +621,16 @@ static inline void* syz_nfq_worker_loop(void* arg)
 		uint32 id = 0;
 		uint8* payload = NULL;
 		int plen = 0;
-		while (SYZ_NLA_OK(a, alen)) {
+		while (NFQ_NLA_OK(a, alen)) {
 			if (a->nla_type == NFQA_PACKET_HDR &&
 			    a->nla_len >= NLA_HDRLEN + sizeof(struct nfqnl_msg_packet_hdr)) {
-				struct nfqnl_msg_packet_hdr* ph = (struct nfqnl_msg_packet_hdr*)SYZ_NLA_DATA(a);
+				struct nfqnl_msg_packet_hdr* ph = (struct nfqnl_msg_packet_hdr*)NFQ_NLA_DATA(a);
 				id = ntohl(ph->packet_id);
 			} else if (a->nla_type == NFQA_PAYLOAD) {
-				payload = (uint8*)SYZ_NLA_DATA(a);
+				payload = (uint8*)NFQ_NLA_DATA(a);
 				plen = a->nla_len - NLA_HDRLEN;
 			}
-			a = SYZ_NLA_NEXT(a, alen);
+			a = NFQ_NLA_NEXT(a, alen);
 		}
 		int mutated = 0;
 		if (syz_nfq_hook && payload && plen >= (int)(sizeof(struct iphdr) + sizeof(struct tcphdr)))
@@ -698,13 +698,13 @@ static inline int syz_nfq_setup(void)
 		goto fail;
 	(void)syz_nfq_config_cmd(syz_nfq_fd, 0, NFQNL_CFG_CMD_PF_UNBIND, AF_INET);
 	(void)syz_nfq_config_cmd(syz_nfq_fd, 0, NFQNL_CFG_CMD_PF_BIND, AF_INET);
-	if (syz_nfq_config_cmd(syz_nfq_fd, SYZ_NFQ_QUEUE_NUM, NFQNL_CFG_CMD_BIND, AF_UNSPEC) < 0)
+	if (syz_nfq_config_cmd(syz_nfq_fd, NFQ_QUEUE_NUM, NFQNL_CFG_CMD_BIND, AF_UNSPEC) < 0)
 		goto fail;
-	if (syz_nfq_config_params(syz_nfq_fd, SYZ_NFQ_QUEUE_NUM, NFQNL_COPY_PACKET, 0xffff) < 0)
+	if (syz_nfq_config_params(syz_nfq_fd, NFQ_QUEUE_NUM, NFQNL_COPY_PACKET, 0xffff) < 0)
 		goto fail;
 	// Fail-open: if the queue can't be served, accept rather than drop. Best
 	// effort -- older kernels may not support it, so don't fail setup on it.
-	(void)syz_nfq_config_flags(syz_nfq_fd, SYZ_NFQ_QUEUE_NUM, NFQA_CFG_F_FAIL_OPEN);
+	(void)syz_nfq_config_flags(syz_nfq_fd, NFQ_QUEUE_NUM, NFQA_CFG_F_FAIL_OPEN);
 	// Bound the worker's blocking recv so it periodically returns to re-check
 	// syz_nfq_worker_stop -- this is the wake source that lets cleanup join it
 	// (netlink has no working shutdown() and we send no signal). Set only now,
@@ -734,4 +734,4 @@ fail:
 	return -1;
 }
 
-#endif // SYZ_COMMON_LINUX_MPTCP_NFQ_H
+#endif // EXECUTOR_COMMON_LINUX_MPTCP_NFQ_H
