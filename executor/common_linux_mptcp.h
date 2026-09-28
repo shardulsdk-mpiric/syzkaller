@@ -52,8 +52,8 @@
 // subflow's local address is fixed at 127.0.0.2 -- see the file comment
 // above syz_mptcp_join_subflow for why a fixed address is fine here.
 
-#ifndef SYZ_COMMON_LINUX_MPTCP_H
-#define SYZ_COMMON_LINUX_MPTCP_H
+#ifndef EXECUTOR_COMMON_LINUX_MPTCP_H
+#define EXECUTOR_COMMON_LINUX_MPTCP_H
 
 #include <endian.h>
 #include <errno.h>
@@ -171,10 +171,26 @@ enum {
 	MPTCP_PM_CMD_SUBFLOW_CREATE,
 	MPTCP_PM_CMD_SUBFLOW_DESTROY,
 };
+// Subsets of enum mptcp_event_type and enum mptcp_event_attr -- same uapi
+// header family (linux/mptcp_pm.h) as the PM cmd/attr enums above, so mirrored
+// under the same MPTCP_PM_NAME sentinel. Read by the SUB_ESTABLISHED event
+// parser (mptcp_pm_recv_subflow_sport) to recover the kernel-auto-assigned
+// subflow source port. SPORT arrives in NETWORK byte order (kernel
+// nla_put_be16 of inet_sport) -- see the ntohs() at the read site; DESTROY's
+// MPTCP_PM_ADDR_ATTR_PORT is host order.
+enum {
+	MPTCP_EVENT_SUB_ESTABLISHED = 10,
+};
+enum {
+	MPTCP_ATTR_TOKEN = 1,
+	MPTCP_ATTR_LOC_ID = 3,
+	MPTCP_ATTR_SADDR4 = 5,
+	MPTCP_ATTR_SPORT = 9,
+};
 #endif
 
-#define SYZ_MPTCP_PAIR_POOL_SIZE 64
-#define SYZ_MPTCP_SUBFLOW_POOL_SIZE 64
+#define MPTCP_PAIR_POOL_SIZE 64
+#define MPTCP_SUBFLOW_POOL_SIZE 64
 
 // The kernel binds a new subflow's local endpoint to whatever port we put
 // in MPTCP_PM_ADDR_ATTR_PORT (0 lets it auto-assign, like a bare
@@ -186,12 +202,12 @@ enum {
 // reconstruction exact with no extra query step. The base sits below
 // the default net.ipv4.ip_local_port_range lower bound (32768) so it
 // doesn't collide with kernel-assigned ephemeral ports on the same host.
-#define SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE 25000
+#define MPTCP_SUBFLOW_LOCAL_PORT_BASE 25000
 
 // Bound on the 50ms MPTCP_INFO poll in syz_mptcp_join_subflow -- ~1s
 // total, generous for a loopback handshake that normally completes in
 // well under a millisecond.
-#define SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES 20
+#define MPTCP_SUBFLOW_INFO_MAX_RETRIES 20
 
 // MPTCP_INIT_RWND_CLAMP (harness flag; mirrored in socket_mptcp_flow.txt and
 // its .const): clamp the server receive window so a syz_mptcp_drive_traffic
@@ -201,7 +217,7 @@ enum {
 // SO_RCVBUF applied to the server side when clamped. The kernel doubles the
 // request and enforces SOCK_MIN_RCVBUF; 16 KiB keeps the advertised window
 // well under a burst while leaving room for the fully_established priming.
-#define SYZ_MPTCP_CLAMP_RCVBUF (16 * 1024)
+#define MPTCP_CLAMP_RCVBUF (16 * 1024)
 
 // MPTCP_INIT_CAPTURE_KEYS (harness flag; mirrored in .txt + .const): sniff the
 // MP_CAPABLE handshake off loopback (AF_PACKET) and store both keys on the pair,
@@ -303,7 +319,7 @@ struct syz_mptcp_info_short {
 	uint32 mptcpi_token;
 };
 
-static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[SYZ_MPTCP_PAIR_POOL_SIZE];
+static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 
 // Which of the five pseudo-syscalls in this file end up compiled in
 // determines which of the shared pool/netlink/setup helpers below are
@@ -319,12 +335,12 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[SYZ_MPTCP_PAIR_POOL_SIZE];
 // itself and the nested-attribute nest_begin/end helpers (only
 // SUBFLOW_CREATE/DESTROY payloads nest attributes; GETFAMILY's request
 // doesn't) are needed by exactly this pair.
-#define SYZ_MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
-#define SYZ_MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
-#define SYZ_MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow)
+#define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
+#define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
+#define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow)
 
-#if SYZ_MPTCP_NEED_SUBFLOW_CALL
-static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[SYZ_MPTCP_SUBFLOW_POOL_SIZE];
+#if MPTCP_NEED_SUBFLOW_CALL
+static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[MPTCP_SUBFLOW_POOL_SIZE];
 #endif
 
 // ---------- Userspace path-manager setup (needed for MP_JOIN) ----------
@@ -369,11 +385,11 @@ static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[SYZ_MPTCP_SUBFLOW_PO
 // file buildable standalone and matches how the rest of it already
 // avoids coupling to other subsystems' feature flags.
 //
-// Needed by (SYZ_MPTCP_NEED_NLMSG): pair_init and join_subflow (both via
+// Needed by (MPTCP_NEED_NLMSG): pair_init and join_subflow (both via
 // mptcp_pm_ensure_setup -> mptcp_pm_resolve_family) and subflow_destroy
 // (via mptcp_pm_subflow_destroy) -- every one of the four calls except
 // pair_close, which never touches netlink.
-#if SYZ_MPTCP_NEED_NLMSG
+#if MPTCP_NEED_NLMSG
 struct mptcp_nlmsg {
 	char buf[512];
 	char* pos;
@@ -441,8 +457,8 @@ static void mptcp_nlmsg_attr(struct mptcp_nlmsg* m, int typ, const void* data, i
 
 // Only SUBFLOW_CREATE/DESTROY payloads nest attributes (GETFAMILY's
 // request doesn't), so these two are needed by join_subflow and
-// subflow_destroy only -- see SYZ_MPTCP_NEED_SUBFLOW_CALL.
-#if SYZ_MPTCP_NEED_SUBFLOW_CALL
+// subflow_destroy only -- see MPTCP_NEED_SUBFLOW_CALL.
+#if MPTCP_NEED_SUBFLOW_CALL
 static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_out, int typ)
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
@@ -463,7 +479,7 @@ static void mptcp_nlmsg_nest_end(struct mptcp_nlmsg* m, struct nlattr* nest)
 		return;
 	nest->nla_len = m->pos - (char*)nest;
 }
-#endif // SYZ_MPTCP_NEED_SUBFLOW_CALL
+#endif // MPTCP_NEED_SUBFLOW_CALL
 
 // Sends m and waits for one reply datagram. Returns the number of bytes
 // received (>=0) on success -- for a bare NLM_F_ACK request (our
@@ -533,13 +549,13 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 	}
 	return (int)n;
 }
-#endif // SYZ_MPTCP_NEED_NLMSG
+#endif // MPTCP_NEED_NLMSG
 
-// Needed by (SYZ_MPTCP_NEED_PM_SETUP): pair_init and join_subflow only --
+// Needed by (MPTCP_NEED_PM_SETUP): pair_init and join_subflow only --
 // the two callers of mptcp_pm_ensure_setup(). subflow_destroy reads
 // mptcp_pm_genl_sock/mptcp_pm_family_id directly (see the NLMSG block
 // above) but never calls ensure_setup, so it doesn't need these.
-#if SYZ_MPTCP_NEED_PM_SETUP
+#if MPTCP_NEED_PM_SETUP
 static int mptcp_pm_setup_done;
 static int mptcp_pm_setup_lock; // serializes the one-time setup under -threaded
 static int mptcp_pm_event_sock = -1; // held open + subscribed so mptcp_userspace_pm_active() is true
@@ -699,7 +715,7 @@ fail:
 	mptcp_spin_unlock(&mptcp_pm_setup_lock);
 	return -1;
 }
-#endif // SYZ_MPTCP_NEED_PM_SETUP
+#endif // MPTCP_NEED_PM_SETUP
 
 // Needed only by syz_mptcp_join_subflow().
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
@@ -866,16 +882,16 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	// DESTROY it issues targets a non-existent token and the kernel rejects
 	// it (ENOENT) -- no live subflow is destroyed. Once the bumped
 	// generation is visible the mismatch rejects the stale destroy outright.
-	for (slot = 0; slot < SYZ_MPTCP_PAIR_POOL_SIZE; slot++) {
+	for (slot = 0; slot < MPTCP_PAIR_POOL_SIZE; slot++) {
 		bool expected = false;
 		if (__atomic_compare_exchange_n(&syz_mptcp_pair_pool[slot].in_use,
 						&expected, true, false,
 						__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			break;
 	}
-	if (slot == SYZ_MPTCP_PAIR_POOL_SIZE) {
+	if (slot == MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_pair_init: pool exhausted (size=%d)\n",
-		      SYZ_MPTCP_PAIR_POOL_SIZE);
+		      MPTCP_PAIR_POOL_SIZE);
 		return -1;
 	}
 	// Release store (paired with the acquire loads in syz_mptcp_subflow_destroy
@@ -918,7 +934,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		// Pin the receiver window small on the listener BEFORE listen() so the
 		// accepted msk inherits a small window_clamp from its first
 		// advertisement; re-applied on the accepted fd post-accept below.
-		int rcvbuf = SYZ_MPTCP_CLAMP_RCVBUF;
+		int rcvbuf = MPTCP_CLAMP_RCVBUF;
 		setsockopt(server_listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 	}
 	if (listen(server_listen_fd, 1) < 0) {
@@ -957,7 +973,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		goto fail;
 	}
 	if (init_flags & MPTCP_INIT_RWND_CLAMP) {
-		int rcvbuf = SYZ_MPTCP_CLAMP_RCVBUF;
+		int rcvbuf = MPTCP_CLAMP_RCVBUF;
 		setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 	}
 	// The listener stays open and bound for the rest of the pair's
@@ -1079,7 +1095,7 @@ static long syz_mptcp_pair_close(volatile long a0)
 {
 	long slot = a0;
 
-	if (slot < 0 || slot >= SYZ_MPTCP_PAIR_POOL_SIZE) {
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_pair_close: slot %ld out of range\n", slot);
 		return -1;
 	}
@@ -1115,16 +1131,9 @@ static long syz_mptcp_pair_close(volatile long a0)
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
 
-// Subset of enum mptcp_event_type / mptcp_event_attr (uapi/linux/mptcp_pm.h),
-// used to read the kernel-auto-assigned subflow source port back from the
-// mptcp_pm_events SUB_ESTABLISHED notification. SPORT is NETWORK byte order in
-// the event (kernel nla_put_be16 of inet_sport) -- see the ntohs() at the read
-// site; DESTROY's MPTCP_PM_ADDR_ATTR_PORT is host order.
-#define SYZ_MPTCP_EVENT_SUB_ESTABLISHED 10
-#define SYZ_MPTCP_EV_ATTR_TOKEN 1
-#define SYZ_MPTCP_EV_ATTR_LOC_ID 3
-#define SYZ_MPTCP_EV_ATTR_SADDR4 5
-#define SYZ_MPTCP_EV_ATTR_SPORT 9
+// The MPTCP_EVENT_SUB_ESTABLISHED / MPTCP_ATTR_* values used below are mirrored
+// with the other uapi enums under the MPTCP_PM_NAME sentinel near the top of
+// this file.
 
 // Read the auto-assigned local port back from the SUB_ESTABLISHED event, so
 // syz_mptcp_subflow_destroy() can address the exact 4-tuple. Match on the
@@ -1153,7 +1162,7 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint32 saddr4_be,
 			if (nlh->nlmsg_len < NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr)))
 				continue;
 			struct genlmsghdr* gh = (struct genlmsghdr*)NLMSG_DATA(nlh);
-			if (gh->cmd != SYZ_MPTCP_EVENT_SUB_ESTABLISHED)
+			if (gh->cmd != MPTCP_EVENT_SUB_ESTABLISHED)
 				continue;
 			char* a = (char*)nlh + NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr));
 			char* aend = (char*)nlh + nlh->nlmsg_len;
@@ -1167,13 +1176,13 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint32 saddr4_be,
 				void* d = a + NLA_HDRLEN;
 				int dlen = (int)at->nla_len - NLA_HDRLEN;
 				uint16 ty = at->nla_type & NLA_TYPE_MASK;
-				if (ty == SYZ_MPTCP_EV_ATTR_TOKEN && dlen >= (int)sizeof(uint32)) {
+				if (ty == MPTCP_ATTR_TOKEN && dlen >= (int)sizeof(uint32)) {
 					ev_token = *(uint32*)d;
 					have_token = 1;
-				} else if (ty == SYZ_MPTCP_EV_ATTR_SADDR4 && dlen >= (int)sizeof(uint32)) {
+				} else if (ty == MPTCP_ATTR_SADDR4 && dlen >= (int)sizeof(uint32)) {
 					ev_saddr4 = *(uint32*)d; // network order, as sent
 					have_saddr4 = 1;
-				} else if (ty == SYZ_MPTCP_EV_ATTR_SPORT && dlen >= (int)sizeof(uint16)) {
+				} else if (ty == MPTCP_ATTR_SPORT && dlen >= (int)sizeof(uint16)) {
 					ev_sport = *(uint16*)d;
 					have_sport = 1;
 				}
@@ -1204,7 +1213,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	long pair_slot = a0;
 	uint8 addr_id = (uint8)a1;
 	uint8 backup = (uint8)a2; // syzlang clamps to [0:1]
-	int mut_op = (int)a3; // SYZ_MPTCP_MUT_* -- 0 (NONE) leaves the join unmutated
+	int mut_op = (int)a3; // MPTCP_MUT_* -- 0 (NONE) leaves the join unmutated
 	struct syz_mptcp_pair_slot* pair;
 	uint32 local_addr_be; // this subflow's distinct per-slot local address (set below)
 	const uint32 remote_addr_be = htonl(0x7f000001); // 127.0.0.1: the pair's server
@@ -1214,7 +1223,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	int retries;
 	int evfd = -1;
 
-	if (pair_slot < 0 || pair_slot >= SYZ_MPTCP_PAIR_POOL_SIZE) {
+	if (pair_slot < 0 || pair_slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_join_subflow: pair slot %ld out of range\n", pair_slot);
 		return -1;
 	}
@@ -1240,16 +1249,16 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// Atomic claim, same rationale as the pair pool: two join calls on
 	// separate threads must not settle on the same subflow slot. Held from
 	// here; the SUBFLOW_CREATE and poll failure paths below release it.
-	for (sub_slot = 0; sub_slot < SYZ_MPTCP_SUBFLOW_POOL_SIZE; sub_slot++) {
+	for (sub_slot = 0; sub_slot < MPTCP_SUBFLOW_POOL_SIZE; sub_slot++) {
 		bool expected = false;
 		if (__atomic_compare_exchange_n(&syz_mptcp_subflow_pool[sub_slot].in_use,
 						&expected, true, false,
 						__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			break;
 	}
-	if (sub_slot == SYZ_MPTCP_SUBFLOW_POOL_SIZE) {
+	if (sub_slot == MPTCP_SUBFLOW_POOL_SIZE) {
 		debug("syz_mptcp_join_subflow: subflow pool exhausted (size=%d)\n",
-		      SYZ_MPTCP_SUBFLOW_POOL_SIZE);
+		      MPTCP_SUBFLOW_POOL_SIZE);
 		return -1;
 	}
 
@@ -1292,8 +1301,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		}
 	}
 	if (evfd < 0)
-		local_port_h = SYZ_MPTCP_SUBFLOW_LOCAL_PORT_BASE +
-			       (int)procid * SYZ_MPTCP_SUBFLOW_POOL_SIZE + sub_slot;
+		local_port_h = MPTCP_SUBFLOW_LOCAL_PORT_BASE +
+			       (int)procid * MPTCP_SUBFLOW_POOL_SIZE + sub_slot;
 
 	// Mutation (increment 3): if requested, install the NFQUEUE interceptor and
 	// publish the instruction (keyed on this subflow's per-slot source address)
@@ -1302,7 +1311,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// HMAC-corrupting op the kernel rejects the subflow, so the establishment
 	// poll below times out and the join returns -1 (expected -- the value is the
 	// exercised crypto-failure path, not a live subflow).
-	if (mut_op != SYZ_MPTCP_MUT_NONE) {
+	if (mut_op != MPTCP_MUT_NONE) {
 		syz_nfq_hook = syz_mptcp_mut_hook; // set before setup (engine contract)
 		if (syz_nfq_setup() != 0) {
 			// A requested mutation that cannot be installed must NOT masquerade
@@ -1323,7 +1332,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		debug("syz_mptcp_join_subflow: SUBFLOW_CREATE: %d\n", errno);
 		if (evfd >= 0)
 			close(evfd);
-		if (mut_op != SYZ_MPTCP_MUT_NONE)
+		if (mut_op != MPTCP_MUT_NONE)
 			syz_mptcp_mut_retire();
 		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
@@ -1334,7 +1343,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// the kernel's MPTCP option parser accepts the incoming MP_JOIN
 	// (mptcp_pm_allow_new_subflow path). Poll MPTCP_INFO with a ~1s
 	// ceiling -- a loopback handshake completes in well under that.
-	for (retries = 0; retries < SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES; retries++) {
+	for (retries = 0; retries < MPTCP_SUBFLOW_INFO_MAX_RETRIES; retries++) {
 		struct syz_mptcp_info_short info;
 		socklen_t ilen = sizeof(info);
 
@@ -1344,12 +1353,12 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 			break;
 		usleep(50000); // 50ms
 	}
-	if (retries == SYZ_MPTCP_SUBFLOW_INFO_MAX_RETRIES) {
+	if (retries == MPTCP_SUBFLOW_INFO_MAX_RETRIES) {
 		debug("syz_mptcp_join_subflow: pair=%ld subflow not established within ~1s\n",
 		      pair_slot);
 		if (evfd >= 0)
 			close(evfd);
-		if (mut_op != SYZ_MPTCP_MUT_NONE)
+		if (mut_op != MPTCP_MUT_NONE)
 			syz_mptcp_mut_retire();
 		__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 		return -1;
@@ -1376,7 +1385,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 
 	// The egress ACK has been sent (and mutated, if requested) by now; retire the
 	// instruction so a later join reusing this per-slot address isn't corrupted.
-	if (mut_op != SYZ_MPTCP_MUT_NONE)
+	if (mut_op != MPTCP_MUT_NONE)
 		syz_mptcp_mut_retire();
 
 	// in_use already published by the atomic claim above. Record the
@@ -1404,7 +1413,7 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 	struct syz_mptcp_pair_slot* pair;
 	const uint32 remote_addr_be = htonl(0x7f000001);
 
-	if (sub_slot < 0 || sub_slot >= SYZ_MPTCP_SUBFLOW_POOL_SIZE) {
+	if (sub_slot < 0 || sub_slot >= MPTCP_SUBFLOW_POOL_SIZE) {
 		debug("syz_mptcp_subflow_destroy: slot %ld out of range\n", sub_slot);
 		return -1;
 	}
@@ -1476,7 +1485,7 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile
 	char drain_buf[4096];
 	ssize_t sent = 0, drained;
 
-	if (slot < 0 || slot >= SYZ_MPTCP_PAIR_POOL_SIZE) {
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_drive_traffic: slot %ld out of range\n", slot);
 		return -1;
 	}
@@ -1520,4 +1529,4 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile
 }
 #endif
 
-#endif // SYZ_COMMON_LINUX_MPTCP_H
+#endif // EXECUTOR_COMMON_LINUX_MPTCP_H

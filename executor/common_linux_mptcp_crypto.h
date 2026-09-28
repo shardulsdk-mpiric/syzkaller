@@ -14,8 +14,8 @@
 // uint8/uint16/uint32/uint64 -> uintN_t (a bare, non-word-bounded replace), so
 // never use those as a substring inside an identifier in this file (e.g. a name
 // like syz_uint32_load would become syz_uint32_t_load in the reproducer only).
-#ifndef SYZ_COMMON_LINUX_MPTCP_CRYPTO_H
-#define SYZ_COMMON_LINUX_MPTCP_CRYPTO_H
+#ifndef EXECUTOR_COMMON_LINUX_MPTCP_CRYPTO_H
+#define EXECUTOR_COMMON_LINUX_MPTCP_CRYPTO_H
 
 #include <string.h>
 
@@ -39,7 +39,7 @@ static const uint32 syz_sha256_k[64] = {
     0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
 
-#define SYZ_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define SHA256_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 
 static inline void syz_sha256_block(struct syz_sha256* c, const uint8* p)
 {
@@ -50,8 +50,8 @@ static inline void syz_sha256_block(struct syz_sha256* c, const uint8* p)
 		w[i] = ((uint32)p[i * 4] << 24) | ((uint32)p[i * 4 + 1] << 16) |
 		       ((uint32)p[i * 4 + 2] << 8) | (uint32)p[i * 4 + 3];
 	for (i = 16; i < 64; i++) {
-		uint32 s0 = SYZ_ROR32(w[i - 15], 7) ^ SYZ_ROR32(w[i - 15], 18) ^ (w[i - 15] >> 3);
-		uint32 s1 = SYZ_ROR32(w[i - 2], 17) ^ SYZ_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+		uint32 s0 = SHA256_ROR32(w[i - 15], 7) ^ SHA256_ROR32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+		uint32 s1 = SHA256_ROR32(w[i - 2], 17) ^ SHA256_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
 		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
 	}
 	a = c->h[0];
@@ -63,10 +63,10 @@ static inline void syz_sha256_block(struct syz_sha256* c, const uint8* p)
 	g = c->h[6];
 	h = c->h[7];
 	for (i = 0; i < 64; i++) {
-		uint32 S1 = SYZ_ROR32(e, 6) ^ SYZ_ROR32(e, 11) ^ SYZ_ROR32(e, 25);
+		uint32 S1 = SHA256_ROR32(e, 6) ^ SHA256_ROR32(e, 11) ^ SHA256_ROR32(e, 25);
 		uint32 ch = (e & f) ^ (~e & g);
 		t1 = h + S1 + ch + syz_sha256_k[i] + w[i];
-		uint32 S0 = SYZ_ROR32(a, 2) ^ SYZ_ROR32(a, 13) ^ SYZ_ROR32(a, 22);
+		uint32 S0 = SHA256_ROR32(a, 2) ^ SHA256_ROR32(a, 13) ^ SHA256_ROR32(a, 22);
 		uint32 maj = (a & b) ^ (a & cc) ^ (b & cc);
 		t2 = S0 + maj;
 		h = g;
@@ -201,4 +201,4 @@ static inline void syz_mptcp_join_hmac(uint64 k1, uint64 k2,
 	syz_hmac_sha256(key, sizeof(key), msg, msglen, out);
 }
 
-#endif // SYZ_COMMON_LINUX_MPTCP_CRYPTO_H
+#endif // EXECUTOR_COMMON_LINUX_MPTCP_CRYPTO_H
