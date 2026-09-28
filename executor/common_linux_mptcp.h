@@ -1112,7 +1112,9 @@ static long syz_mptcp_pair_close(volatile long a0)
 
 // Subset of enum mptcp_event_type / mptcp_event_attr (uapi/linux/mptcp_pm.h),
 // used to read the kernel-auto-assigned subflow source port back from the
-// mptcp_pm_events SUB_ESTABLISHED notification. SPORT is host-byte-order.
+// mptcp_pm_events SUB_ESTABLISHED notification. SPORT is NETWORK byte order in
+// the event (kernel nla_put_be16 of inet_sport) -- see the ntohs() at the read
+// site; DESTROY's MPTCP_PM_ADDR_ATTR_PORT is host order.
 #define SYZ_MPTCP_EVENT_SUB_ESTABLISHED 10
 #define SYZ_MPTCP_EV_ATTR_TOKEN 1
 #define SYZ_MPTCP_EV_ATTR_LOC_ID 3
