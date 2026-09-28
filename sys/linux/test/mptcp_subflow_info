@@ -1,0 +1,13 @@
+# Non-consuming lifecycle op (op-set increment 1). Establish an MP_CAPABLE pair,
+# join a subflow, then query it TWICE with syz_mptcp_subflow_info without
+# destroying it -- proving the subflow handle stays live/addressable across
+# non-consuming ops -- and only then destroy it and tear the pair down. If
+# subflow_info freed the slot, the second info (and the destroy) would act on a
+# dead handle; both succeeding confirms the resource-model change.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
+syz_mptcp_subflow_info(r1)
+syz_mptcp_subflow_info(r1)
+syz_mptcp_subflow_destroy(r1)
+syz_mptcp_pair_close(r0)
