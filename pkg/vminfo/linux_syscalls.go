@@ -315,6 +315,12 @@ func linuxSyzGenetlinkGetFamilyIDSupported(ctx *checkContext, call *prog.Syscall
 }
 
 func linuxSyzMptcpSupported(ctx *checkContext, call *prog.Syscall) string {
+	// pair_init writes /proc/sys/net/mptcp/pm_type, which needs privilege the
+	// setuid sandbox drops after its netns unshare -- so the calls can never
+	// succeed there even though the probe socket() itself would.
+	if reason := ctx.onlySandboxNoneOrNamespace(); reason != "" {
+		return reason
+	}
 	// The pseudo-syscalls create IPPROTO_MPTCP sockets, which the kernel
 	// rejects with EPROTONOSUPPORT when it is built without CONFIG_MPTCP.
 	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",

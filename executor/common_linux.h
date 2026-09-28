@@ -3384,7 +3384,8 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 // MPTCP MP_CAPABLE pair + MP_JOIN subflow harness (see
 // executor/common_linux_mptcp.h).
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close || \
-    __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy
+    __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||         \
+    __NR_syz_mptcp_drive_traffic
 #include "common_linux_mptcp.h"
 #endif
 
