@@ -1516,6 +1516,146 @@ static long syz_mptcp_subflow_info(volatile long a0)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_inject_join_syn
+// Internet checksum over `len` bytes plus a caller-supplied partial sum (for the
+// TCP pseudo-header). Local to the injection op to avoid coupling to the NFQUEUE
+// engine's own csum. Operates on 16-bit words; handles an odd trailing byte.
+static uint16 mptcp_inj_csum16(const void* data, int len, uint32 init)
+{
+	const uint16* p = (const uint16*)data;
+	uint32 sum = init;
+	while (len > 1) {
+		sum += *p++;
+		len -= 2;
+	}
+	if (len)
+		sum += *(const uint8*)p;
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (uint16)~sum;
+}
+
+// Raw MP_JOIN SYN injection primitive (lifecycle op-set). Craft and send ONE
+// MP_JOIN SYN carrying the pair's SERVER msk token to the server's loopback
+// listener, over a raw IPv4 socket (IP_HDRINCL via IPPROTO_RAW). This drives the
+// incoming-join-request path (subflow_token_join_request -> mptcp_pm_get_local_id
+// / mptcp_pm_is_backup) directly and cheaply -- coverage stock syzkaller reaches
+// only via a full userspace-PM SUBFLOW_CREATE round-trip -- and is the injection
+// half of the close/teardown race class (an MP_JOIN SYN racing msk teardown; see
+// the lifecycle op-set design). The crash-relevant kernel path runs BEFORE HMAC
+// validation, so a dummy nonce/HMAC is fine; only the 32-bit token must match a
+// live msk. Non-consuming (the pair stays usable). Deterministic fields (fixed
+// seq, per-call-incremented source port) keep it replayable.
+static long syz_mptcp_inject_join_syn(volatile long a0)
+{
+	// Minimal on-wire headers, distinct names so they never collide with system
+	// <netinet/*> or the parser structs in common_linux_mptcp_mut.h. uintN (not
+	// stdint) per the executor-header type rule.
+	struct mptcp_inj_iphdr {
+		uint8 vihl, tos;
+		uint16 tot_len, id, frag_off;
+		uint8 ttl, protocol;
+		uint16 check;
+		uint32 saddr, daddr;
+	};
+	struct mptcp_inj_tcphdr {
+		uint16 source, dest;
+		uint32 seq, ack_seq;
+		uint16 doff_flags, window, check, urg;
+	};
+	static uint16 inj_sport = 40000; // per-call varied so SYNs are distinct flows
+
+	long slot = a0;
+	struct syz_mptcp_pair_slot* pair;
+	uint8 info[256];
+	socklen_t ilen = sizeof(info);
+	uint32 token;
+	uint8 pkt[64];
+	const int iplen = 20, tcplen = 20 + 12, total = 20 + 20 + 12; // +12 = MP_JOIN SYN opt
+	struct mptcp_inj_iphdr* ip;
+	struct mptcp_inj_tcphdr* tcp;
+	uint8* opt;
+	uint32 pseudo, tok_be, nonce;
+	int rs;
+	struct sockaddr_in dst;
+	ssize_t sent;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_inject_join_syn: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_inject_join_syn: slot %ld not in use\n", slot);
+		return -1;
+	}
+
+	// Server msk token: mptcpi_token at offset 12 of struct mptcp_info (stable uapi).
+	memset(info, 0, sizeof(info));
+	if (getsockopt(pair->server_fd, SOL_MPTCP, MPTCP_INFO, info, &ilen) < 0) {
+		debug("syz_mptcp_inject_join_syn: MPTCP_INFO: %d\n", errno);
+		return -1;
+	}
+	memcpy(&token, info + 12, sizeof(token));
+	if (!token) {
+		debug("syz_mptcp_inject_join_syn: slot %ld no token yet\n", slot);
+		return -1;
+	}
+
+	memset(pkt, 0, sizeof(pkt));
+	ip = (struct mptcp_inj_iphdr*)pkt;
+	tcp = (struct mptcp_inj_tcphdr*)(pkt + iplen);
+	opt = pkt + iplen + 20;
+	ip->vihl = 0x45;
+	ip->tot_len = htons(total);
+	ip->id = htons(1);
+	ip->ttl = 64;
+	ip->protocol = IPPROTO_TCP;
+	ip->saddr = htonl(0x7f000001);
+	ip->daddr = htonl(0x7f000001);
+	ip->check = mptcp_inj_csum16(ip, iplen, 0);
+	tcp->source = htons(inj_sport++);
+	tcp->dest = htons(pair->server_port_h);
+	tcp->seq = htonl(0x12345678);
+	tcp->doff_flags = htons((uint16)(((tcplen / 4) << 12) | 0x002)); // data-offset + SYN
+	tcp->window = htons(65535);
+	// MP_JOIN SYN option: [kind=30][len=12][subtype MP_JOIN<<4 | flags=0][addr_id]
+	//                     [token:be32][nonce:be32]
+	opt[0] = 30;
+	opt[1] = 12;
+	opt[2] = (1 << 4);
+	opt[3] = 0x01; // addr_id
+	tok_be = htonl(token);
+	memcpy(opt + 4, &tok_be, 4);
+	nonce = htonl(0xa5a5a5a5); // dummy: crash path is pre-HMAC
+	memcpy(opt + 8, &nonce, 4);
+	pseudo = 0;
+	pseudo += (ip->saddr & 0xffff) + (ip->saddr >> 16);
+	pseudo += (ip->daddr & 0xffff) + (ip->daddr >> 16);
+	pseudo += htons(IPPROTO_TCP) + htons((uint16)tcplen);
+	tcp->check = mptcp_inj_csum16(tcp, tcplen, pseudo);
+
+	rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+	if (rs < 0) {
+		debug("syz_mptcp_inject_join_syn: raw socket: %d\n", errno);
+		return -1;
+	}
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family = AF_INET;
+	dst.sin_addr.s_addr = htonl(0x7f000001);
+	dst.sin_port = htons(pair->server_port_h);
+	sent = sendto(rs, pkt, total, 0, (struct sockaddr*)&dst, sizeof(dst));
+	close(rs);
+	if (sent < 0) {
+		debug("syz_mptcp_inject_join_syn: sendto: %d\n", errno);
+		return -1;
+	}
+	debug("syz_mptcp_inject_join_syn: slot %ld sent MP_JOIN SYN token=0x%x\n",
+	      slot, token);
+	return 0;
+}
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mptcp_drive_traffic
 // Push data client->server on an established pair, exercising the MPTCP data
 // path. On a pair created with MPTCP_INIT_RWND_CLAMP the single send + full

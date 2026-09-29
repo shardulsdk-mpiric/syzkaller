@@ -57,6 +57,12 @@ syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 # the resource-model basis for adversarial multi-subflow lifecycle orderings.
 syz_mptcp_subflow_info(subflow mptcp_subflow)
 
+# Raw MP_JOIN SYN injection: sends one MP_JOIN SYN carrying the pair's server msk
+# token to the loopback listener (raw socket). Drives the incoming-join-request
+# path directly (cheaper than a full PM SUBFLOW_CREATE) and is the injection half
+# of the close/teardown race class. Non-consuming; the pair stays usable.
+syz_mptcp_inject_join_syn(pair mptcp_pair)
+
 # MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
 # so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->
