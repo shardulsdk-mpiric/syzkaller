@@ -30,12 +30,16 @@ import (
 // The base program under test mirrors sys/linux/test/mptcp_join_subflow:
 //
 //	r0 = syz_mptcp_pair_init(...)
-//	r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0)
+//	r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
 //	syz_mptcp_subflow_destroy(r1)
 //	syz_mptcp_pair_close(r0)
+//
+// The join_subflow argument list is (pair, addr_id, backup, mut_op); mut_op=0
+// (MPTCP_MUT_NONE) keeps this a plain, unmutated join -- the resource-chain
+// property under test is independent of the mutation op.
 const mptcpMinimizationBaseProg = `
 r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
-r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0)
+r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
 syz_mptcp_subflow_destroy(r1)
 syz_mptcp_pair_close(r0)
 `
