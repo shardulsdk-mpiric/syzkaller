@@ -1,0 +1,15 @@
+# Capture the MPTCP connection token from getsockopt(MPTCP_INFO): mptcpi_token is
+# typed as the mptcp_token resource (r1 below), captured from inside the output
+# struct -- the path-manager SUBFLOW_CREATE/DESTROY commands consume it via
+# MPTCP_PM_ATTR_TOKEN. This asserts the description-level producer: the resource
+# is captured from the out struct at the token field, not from the (int) return
+# value.
+#
+# This is a description/parse-level check, not a behavioral success test: a
+# nonzero token requires an established msk, and driving SUBFLOW_CREATE to return
+# 0 additionally needs pm_type=1 and the PM event listener -- reachable in this
+# harness only through syz_mptcp_pair_init -- so that path is left to it. Here the
+# socket is fresh, so the kernel reports token 0. (0x11c = SOL_MPTCP, 0x1 = MPTCP_INFO.)
+
+r0 = socket$inet_mptcp(0x2, 0x1, 0x106)
+getsockopt$inet_mptcp_info(r0, 0x11c, 0x1, &AUTO={0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, <r1=>0x0}, &AUTO=0x10)

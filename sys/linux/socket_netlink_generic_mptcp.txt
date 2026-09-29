@@ -29,7 +29,7 @@ mptcp_pm_policy [
 	MPTCP_PM_ATTR_ADDR		nlnest[MPTCP_PM_ATTR_ADDR, array[mptcp_pm_addr_policy, 0:7]]
 	MPTCP_PM_ATTR_RCV_ADD_ADDRS	nlattr[MPTCP_PM_ATTR_RCV_ADD_ADDRS, int32[0:8]]
 	MPTCP_PM_ATTR_SUBFLOWS		nlattr[MPTCP_PM_ATTR_SUBFLOWS, int32[0:8]]
-	MPTCP_PM_ATTR_TOKEN		nlattr[MPTCP_PM_ATTR_TOKEN, int32]
+	MPTCP_PM_ATTR_TOKEN		nlattr[MPTCP_PM_ATTR_TOKEN, mptcp_token]
 	MPTCP_PM_ATTR_LOC_ID		nlattr[MPTCP_PM_ATTR_LOC_ID, int8]
 	MPTCP_PM_ATTR_ADDR_REMOTE	nlnest[MPTCP_PM_ATTR_ADDR_REMOTE, array[mptcp_pm_addr_policy, 0:7]]
 ] [varlen]
