@@ -1,0 +1,11 @@
+# Raw MP_JOIN SYN injection primitive. Establish an MP_CAPABLE pair, then inject
+# two MP_JOIN SYNs carrying the server msk's token at the loopback listener. On a
+# LIVE msk the injected SYN drives subflow_token_join_request -> pm_is_backup
+# (pm.ops valid, no crash) and the join is then rejected at HMAC validation. Both
+# injections succeed (return 0) and the pair remains usable (non-consuming), then
+# it is torn down.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+syz_mptcp_inject_join_syn(r0)
+syz_mptcp_inject_join_syn(r0)
+syz_mptcp_pair_close(r0)
