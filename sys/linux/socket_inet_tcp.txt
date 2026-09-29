@@ -50,6 +50,30 @@ mptcp_option_types_buf = MPTCP_INFO, MPTCP_FULL_INFO, MPTCP_TCPINFO, MPTCP_SUBFL
 getsockopt$inet_mptcp_buf(fd sock_mptcp, level const[SOL_MPTCP], optname flags[mptcp_option_types_buf], optval buffer[out], optlen ptr[inout, len[optval, int32]])
 getsockopt$inet6_mptcp_buf(fd sock_mptcp6, level const[SOL_MPTCP], optname flags[mptcp_option_types_buf], optval buffer[out], optlen ptr[inout, len[optval, int32]])
 
+# MPTCP connection token capture. getsockopt(MPTCP_INFO) reports mptcpi_token
+# (host order) -- the identifier the path-manager netlink commands
+# (MPTCP_PM_CMD_SUBFLOW_CREATE/DESTROY) use to name the msk via
+# MPTCP_PM_ATTR_TOKEN. That attribute is currently typed as a bare int32, so no
+# captured value can reach those commands; typing the token as a resource here
+# lets a real token flow from this getsockopt into them. The struct is modelled
+# only through mptcpi_token (offset 12); MPTCP_INFO copies min(optlen, sizeof)
+# bytes, so a buffer ending at the token is enough to capture it. Token 0 is never
+# a valid msk token, so a defaulted (unproduced) mptcp_token is inert.
+resource mptcp_token[int32]
+
+mptcp_info {
+	mptcpi_subflows			int8
+	mptcpi_add_addr_signal		int8
+	mptcpi_add_addr_accepted	int8
+	mptcpi_subflows_max		int8
+	mptcpi_add_addr_signal_max	int8
+	mptcpi_add_addr_accepted_max	int8
+	mptcpi_flags			int32
+	mptcpi_token			mptcp_token
+}
+
+getsockopt$inet_mptcp_info(fd sock_mptcp, level const[SOL_MPTCP], optname const[MPTCP_INFO], optval ptr[out, mptcp_info], optlen ptr[inout, len[optval, int32]])
+
 # Specific TCP socket options
 
 getsockopt$inet_tcp_TCP_ZEROCOPY_RECEIVE(fd sock_tcp, level const[IPPROTO_TCP], optname const[TCP_ZEROCOPY_RECEIVE], optval ptr[in, tcp_zerocopy_receive], optlen ptr[inout, len[optval, int32]])
