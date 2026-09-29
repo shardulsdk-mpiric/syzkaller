@@ -1674,9 +1674,10 @@ static long syz_mptcp_inject_join_syn(volatile long a0)
 // still-open listener: on loopback a raw sendto defers the SYN to the NET_RX
 // softirq backlog, so after the burst several SYNs are still queued for
 // subflow_token_join_request when we then close the accepted server msk with
-// SO_LINGER{1,0} (synchronous teardown: mptcp_destroy_common -> token_destroy ->
-// pm_ops_release). A queued SYN's softirq token lookup can thus land in the
-// teardown window. TERMINAL: consumes the pair (frees the slot) like pair_close.
+// SO_LINGER{1,0} teardown (mptcp_destroy_common -> token_destroy ->
+// pm_ops_release), which runs INLINE only when subflows_alive==0 (protocol.c:3570)
+// and is otherwise deferred to the mptcp worker -- either way the window exists. A
+// queued SYN's softirq token lookup can thus land in the teardown window. TERMINAL: consumes the pair (frees the slot) like pair_close.
 // Per-call hit rate is low (narrow window), but across a campaign's many executions
 // + varied pre-race state it explores the teardown-race class for novel bugs. If
 // the race is won the kernel panics the VM; a clean run returns 0.
@@ -1710,8 +1711,8 @@ static long syz_mptcp_join_close_race(volatile long a0)
 		}
 	}
 
-	// Race point: synchronous teardown of the accepted server msk vs the queued
-	// SYNs' softirq token lookups.
+	// Race point: teardown of the accepted server msk (inline when subflows_alive==0,
+	// else mptcp-worker-deferred) vs the queued SYNs' softirq token lookups.
 	if (pair->server_fd >= 0) {
 		lg.l_onoff = 1;
 		lg.l_linger = 0;
@@ -1747,7 +1748,8 @@ static long syz_mptcp_join_close_race(volatile long a0)
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_close_server
 // Lifecycle verb (breadth): close ONLY the accepted server msk -- the incoming-join
-// target -- with SO_LINGER{1,0} for synchronous teardown (mptcp_destroy_common ->
+// target -- with SO_LINGER{1,0} teardown (inline when subflows_alive==0, else
+// mptcp-worker-deferred; mptcp_destroy_common ->
 // token_destroy -> pm_ops_release), leaving the listener and client alive. This
 // gives the generator a teardown verb to sequence and (via collide) run CONCURRENTLY
 // with joins, so the close/teardown race class emerges from syzkaller's own
