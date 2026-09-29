@@ -70,6 +70,13 @@ syz_mptcp_inject_join_syn(pair mptcp_pair)
 # for novel teardown UAF/NULL-deref bugs; if the race is won the kernel crashes.
 syz_mptcp_join_close_race(pair mptcp_pair)
 
+# Lifecycle verb: close ONLY the accepted server msk (SO_LINGER, synchronous
+# teardown) leaving the listener/client alive. Non-consuming. Purpose: give the
+# generator a teardown verb to SEQUENCE and (via collide) run concurrently with
+# joins, so the close/teardown race class emerges from syzkaller's own scheduling
+# (the "breadth" path) rather than a hand-crafted timing op.
+syz_mptcp_close_server(pair mptcp_pair)
+
 # MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
 # so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->
