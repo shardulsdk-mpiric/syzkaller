@@ -63,6 +63,13 @@ syz_mptcp_subflow_info(subflow mptcp_subflow)
 # of the close/teardown race class. Non-consuming; the pair stays usable.
 syz_mptcp_inject_join_syn(pair mptcp_pair)
 
+# Teardown-race op: bursts MP_JOIN SYNs (server token) at the still-open listener
+# while synchronously closing the accepted server msk (SO_LINGER), racing an
+# injected SYN's softirq token lookup against the msk teardown -- the close/teardown
+# race class. TERMINAL: consumes the pair (frees the slot) like pair_close. Explores
+# for novel teardown UAF/NULL-deref bugs; if the race is won the kernel crashes.
+syz_mptcp_join_close_race(pair mptcp_pair)
+
 # MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
 # so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->
