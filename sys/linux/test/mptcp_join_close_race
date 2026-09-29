@@ -1,0 +1,13 @@
+# Lifecycle verb: establish an MP_CAPABLE pair, then run the close/teardown race
+# in one shot -- burst MP_JOIN SYNs at the still-open listener (each deferred to
+# the NET_RX softirq) while synchronously closing the accepted server msk with
+# SO_LINGER, racing the queued SYNs' softirq token lookups against the msk
+# teardown. This is the close/join race class (finding 005's shape). On a fixed
+# kernel it completes without crashing; if the race is won on a vulnerable kernel
+# the kernel crashes -- that is the point of the verb.
+#
+# join_close_race is TERMINAL: it consumes the pair (frees the slot) itself, like
+# pair_close -- so there is deliberately no pair_close after it.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+syz_mptcp_join_close_race(r0)
