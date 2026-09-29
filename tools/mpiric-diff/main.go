@@ -152,6 +152,7 @@ func main() {
 	err = run(ctx, baseCfg, patchedCfg, store, sink, ignoreRe, outDir)
 	switch {
 	case err == nil:
+		log.Logf(0, "run finished: %v", ctx.Err())
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		log.Logf(0, "run finished: %v", err)
 	case errors.Is(err, diff.ErrPatchedAreaNotReached):
