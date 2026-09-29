@@ -1745,6 +1745,46 @@ static long syz_mptcp_join_close_race(volatile long a0)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_close_server
+// Lifecycle verb (breadth): close ONLY the accepted server msk -- the incoming-join
+// target -- with SO_LINGER{1,0} for synchronous teardown (mptcp_destroy_common ->
+// token_destroy -> pm_ops_release), leaving the listener and client alive. This
+// gives the generator a teardown verb to sequence and (via collide) run CONCURRENTLY
+// with joins, so the close/teardown race class emerges from syzkaller's own
+// scheduling + coverage guidance rather than a hand-crafted timing op. Reproducer-
+// clean (single-threaded, no pthread). NON-consuming: the pair stays in_use with
+// server_fd set to -1, so a later pair_close skips it (its `>= 0` guard) and cleans
+// up the listener/client; ops that need the server msk (inject/subflow_info) then
+// fail gracefully on the closed fd.
+static long syz_mptcp_close_server(volatile long a0)
+{
+	long slot = a0;
+	struct syz_mptcp_pair_slot* pair;
+	struct linger lg;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_close_server: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_close_server: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (pair->server_fd < 0) {
+		debug("syz_mptcp_close_server: slot %ld server already closed\n", slot);
+		return -1;
+	}
+	lg.l_onoff = 1;
+	lg.l_linger = 0;
+	setsockopt(pair->server_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+	close(pair->server_fd);
+	pair->server_fd = -1;
+	debug("syz_mptcp_close_server: slot %ld server msk closed\n", slot);
+	return 0;
+}
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mptcp_drive_traffic
 // Push data client->server on an established pair, exercising the MPTCP data
 // path. On a pair created with MPTCP_INIT_RWND_CLAMP the single send + full

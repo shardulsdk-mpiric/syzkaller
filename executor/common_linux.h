@@ -3386,7 +3386,8 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close || \
     __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||         \
     __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||         \
-    __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_drive_traffic
+    __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server ||         \
+    __NR_syz_mptcp_drive_traffic
 #include "common_linux_mptcp.h"
 #endif
 
