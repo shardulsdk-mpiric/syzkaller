@@ -33,7 +33,7 @@
 resource mptcp_pair[intptr]: 0xffffffffffffffff
 resource mptcp_subflow[intptr]: 0xffffffffffffffff
 
-syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags]) mptcp_pair
+syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags]) mptcp_pair (remote_cover)
 syz_mptcp_pair_close(pair mptcp_pair)
 
 # addr_id: local address id announced to the kernel for this subflow
@@ -48,7 +48,7 @@ define MPTCP_MUT_HMAC_FLIP	1
 define MPTCP_MUT_HMAC_ZERO	2
 define MPTCP_MUT_NONCE_FLIP	3
 mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_MUT_NONCE_FLIP
-syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], mut_op flags[mptcp_mut_ops]) mptcp_subflow
+syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], mut_op flags[mptcp_mut_ops]) mptcp_subflow (remote_cover)
 syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 
 # Non-consuming op: takes a live mptcp_subflow WITHOUT destroying it (queries the
@@ -61,21 +61,21 @@ syz_mptcp_subflow_info(subflow mptcp_subflow)
 # token to the loopback listener (raw socket). Drives the incoming-join-request
 # path directly (cheaper than a full PM SUBFLOW_CREATE) and is the injection half
 # of the close/teardown race class. Non-consuming; the pair stays usable.
-syz_mptcp_inject_join_syn(pair mptcp_pair)
+syz_mptcp_inject_join_syn(pair mptcp_pair) (remote_cover)
 
 # Teardown-race op: bursts MP_JOIN SYNs (server token) at the still-open listener
 # while synchronously closing the accepted server msk (SO_LINGER), racing an
 # injected SYN's softirq token lookup against the msk teardown -- the close/teardown
 # race class. TERMINAL: consumes the pair (frees the slot) like pair_close. Explores
 # for novel teardown UAF/NULL-deref bugs; if the race is won the kernel crashes.
-syz_mptcp_join_close_race(pair mptcp_pair)
+syz_mptcp_join_close_race(pair mptcp_pair) (remote_cover)
 
 # Lifecycle verb: close ONLY the accepted server msk (SO_LINGER, synchronous
 # teardown) leaving the listener/client alive. Non-consuming. Purpose: give the
 # generator a teardown verb to SEQUENCE and (via collide) run concurrently with
 # joins, so the close/teardown race class emerges from syzkaller's own scheduling
 # (the "breadth" path) rather than a hand-crafted timing op.
-syz_mptcp_close_server(pair mptcp_pair)
+syz_mptcp_close_server(pair mptcp_pair) (remote_cover)
 
 # Lifecycle verb: disconnect the accepted server msk via connect(AF_UNSPEC), driving
 # mptcp_disconnect -> destroy_common (pm.ops NULL) -> pm_data_reset (pm.ops re-init)
@@ -83,7 +83,7 @@ syz_mptcp_close_server(pair mptcp_pair)
 # (inject_join_syn), the ~50-line pm.ops NULL->reassign window is raceable -- the
 # disconnect/reconnect reset-staleness surface. Reviewer-verified easier to hit than
 # the close path.
-syz_mptcp_disconnect(pair mptcp_pair)
+syz_mptcp_disconnect(pair mptcp_pair) (remote_cover)
 
 # MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
 # so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
@@ -101,4 +101,4 @@ mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS
 # On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains
 # only partially, leaving data on the msk send head so the kernel flushes it
 # from the softirq deferred-push path.
-syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len[data])
+syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len[data]) (remote_cover)
