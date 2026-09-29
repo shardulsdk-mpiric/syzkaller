@@ -77,6 +77,14 @@ syz_mptcp_join_close_race(pair mptcp_pair)
 # (the "breadth" path) rather than a hand-crafted timing op.
 syz_mptcp_close_server(pair mptcp_pair)
 
+# Lifecycle verb: disconnect the accepted server msk via connect(AF_UNSPEC), driving
+# mptcp_disconnect -> destroy_common (pm.ops NULL) -> pm_data_reset (pm.ops re-init)
+# on a REUSED socket. Non-consuming (socket reused, not closed). Collided with a join
+# (inject_join_syn), the ~50-line pm.ops NULL->reassign window is raceable -- the
+# disconnect/reconnect reset-staleness surface. Reviewer-verified easier to hit than
+# the close path.
+syz_mptcp_disconnect(pair mptcp_pair)
+
 # MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
 # so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->

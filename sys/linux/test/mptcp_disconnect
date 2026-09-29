@@ -1,0 +1,9 @@
+# Lifecycle verb: establish an MP_CAPABLE pair, disconnect the accepted server msk
+# via connect(AF_UNSPEC) (resets it on the reused socket), then tear the pair down.
+# Sequential (no concurrent join), so it exercises the verb without the teardown
+# race -- run-tests-safe. The disconnect returns 0; pair_close then closes the
+# reused (disconnected) server_fd and the rest.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+syz_mptcp_disconnect(r0)
+syz_mptcp_pair_close(r0)
