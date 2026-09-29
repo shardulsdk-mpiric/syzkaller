@@ -1,0 +1,12 @@
+# Establish an MP_CAPABLE pair with the receive window pinned small
+# (MPTCP_INIT_RWND_CLAMP = 0x1, via SO_RCVBUF), push a data burst client->server
+# with syz_mptcp_drive_traffic, then tear the pair down. On a clamped pair the
+# executor bursts then only partially drains, leaving data on the msk send head so
+# the kernel flushes it from the softirq deferred-push path -- the state this verb
+# exists to reach. Sequential (no concurrent teardown), so it exercises the verb
+# without a race: run-tests-safe. drive_traffic does not consume the pair, so
+# pair_close follows.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x1)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pair_close(r0)
