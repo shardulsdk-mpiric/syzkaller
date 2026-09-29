@@ -1516,10 +1516,25 @@ static long syz_mptcp_subflow_info(volatile long a0)
 }
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_mptcp_inject_join_syn
-// Internet checksum over `len` bytes plus a caller-supplied partial sum (for the
-// TCP pseudo-header). Local to the injection op to avoid coupling to the NFQUEUE
-// engine's own csum. Operates on 16-bit words; handles an odd trailing byte.
+#if SYZ_EXECUTOR || __NR_syz_mptcp_inject_join_syn || __NR_syz_mptcp_join_close_race
+// Shared raw MP_JOIN SYN injection helpers, used by syz_mptcp_inject_join_syn
+// (one-shot) and syz_mptcp_join_close_race (burst). Minimal distinct-named on-wire
+// structs avoid colliding with system <netinet/*> and the parser structs in
+// common_linux_mptcp_mut.h; uintN (not stdint) per the executor-header type rule.
+struct mptcp_inj_iphdr {
+	uint8 vihl, tos;
+	uint16 tot_len, id, frag_off;
+	uint8 ttl, protocol;
+	uint16 check;
+	uint32 saddr, daddr;
+};
+struct mptcp_inj_tcphdr {
+	uint16 source, dest;
+	uint32 seq, ack_seq;
+	uint16 doff_flags, window, check, urg;
+};
+
+// Internet checksum over `len` bytes plus a partial sum (TCP pseudo-header).
 static uint16 mptcp_inj_csum16(const void* data, int len, uint32 init)
 {
 	const uint16* p = (const uint16*)data;
@@ -1535,72 +1550,35 @@ static uint16 mptcp_inj_csum16(const void* data, int len, uint32 init)
 	return (uint16)~sum;
 }
 
-// Raw MP_JOIN SYN injection primitive (lifecycle op-set). Craft and send ONE
-// MP_JOIN SYN carrying the pair's SERVER msk token to the server's loopback
-// listener, over a raw IPv4 socket (IP_HDRINCL via IPPROTO_RAW). This drives the
-// incoming-join-request path (subflow_token_join_request -> mptcp_pm_get_local_id
-// / mptcp_pm_is_backup) directly and cheaply -- coverage stock syzkaller reaches
-// only via a full userspace-PM SUBFLOW_CREATE round-trip -- and is the injection
-// half of the close/teardown race class (an MP_JOIN SYN racing msk teardown; see
-// the lifecycle op-set design). The crash-relevant kernel path runs BEFORE HMAC
-// validation, so a dummy nonce/HMAC is fine; only the 32-bit token must match a
-// live msk. Non-consuming (the pair stays usable). Deterministic fields (fixed
-// seq, per-call-incremented source port) keep it replayable.
-static long syz_mptcp_inject_join_syn(volatile long a0)
-{
-	// Minimal on-wire headers, distinct names so they never collide with system
-	// <netinet/*> or the parser structs in common_linux_mptcp_mut.h. uintN (not
-	// stdint) per the executor-header type rule.
-	struct mptcp_inj_iphdr {
-		uint8 vihl, tos;
-		uint16 tot_len, id, frag_off;
-		uint8 ttl, protocol;
-		uint16 check;
-		uint32 saddr, daddr;
-	};
-	struct mptcp_inj_tcphdr {
-		uint16 source, dest;
-		uint32 seq, ack_seq;
-		uint16 doff_flags, window, check, urg;
-	};
-	static uint16 inj_sport = 40000; // per-call varied so SYNs are distinct flows
+// Source port varied per SYN so successive injections are distinct flows.
+static uint16 mptcp_inj_sport = 40000;
 
-	long slot = a0;
-	struct syz_mptcp_pair_slot* pair;
+// Read the pair's SERVER msk token (mptcpi_token at offset 12 of struct mptcp_info,
+// stable uapi). Returns 0 if unavailable.
+static uint32 mptcp_inj_server_token(int server_fd)
+{
 	uint8 info[256];
 	socklen_t ilen = sizeof(info);
-	uint32 token;
+	uint32 token = 0;
+	memset(info, 0, sizeof(info));
+	if (getsockopt(server_fd, SOL_MPTCP, MPTCP_INFO, info, &ilen) < 0)
+		return 0;
+	memcpy(&token, info + 12, sizeof(token));
+	return token;
+}
+
+// Build and send ONE MP_JOIN SYN (server `token`, dummy nonce -- the crash-relevant
+// path is pre-HMAC) to 127.0.0.1:server_port_h over the raw socket `rs` (IP_HDRINCL
+// via IPPROTO_RAW). Returns 0 on send, -1 on error.
+static int mptcp_inj_send_one(int rs, uint32 token, uint16 server_port_h)
+{
 	uint8 pkt[64];
 	const int iplen = 20, tcplen = 20 + 12, total = 20 + 20 + 12; // +12 = MP_JOIN SYN opt
 	struct mptcp_inj_iphdr* ip;
 	struct mptcp_inj_tcphdr* tcp;
 	uint8* opt;
 	uint32 pseudo, tok_be, nonce;
-	int rs;
 	struct sockaddr_in dst;
-	ssize_t sent;
-
-	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
-		debug("syz_mptcp_inject_join_syn: slot %ld out of range\n", slot);
-		return -1;
-	}
-	pair = &syz_mptcp_pair_pool[slot];
-	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
-		debug("syz_mptcp_inject_join_syn: slot %ld not in use\n", slot);
-		return -1;
-	}
-
-	// Server msk token: mptcpi_token at offset 12 of struct mptcp_info (stable uapi).
-	memset(info, 0, sizeof(info));
-	if (getsockopt(pair->server_fd, SOL_MPTCP, MPTCP_INFO, info, &ilen) < 0) {
-		debug("syz_mptcp_inject_join_syn: MPTCP_INFO: %d\n", errno);
-		return -1;
-	}
-	memcpy(&token, info + 12, sizeof(token));
-	if (!token) {
-		debug("syz_mptcp_inject_join_syn: slot %ld no token yet\n", slot);
-		return -1;
-	}
 
 	memset(pkt, 0, sizeof(pkt));
 	ip = (struct mptcp_inj_iphdr*)pkt;
@@ -1614,8 +1592,8 @@ static long syz_mptcp_inject_join_syn(volatile long a0)
 	ip->saddr = htonl(0x7f000001);
 	ip->daddr = htonl(0x7f000001);
 	ip->check = mptcp_inj_csum16(ip, iplen, 0);
-	tcp->source = htons(inj_sport++);
-	tcp->dest = htons(pair->server_port_h);
+	tcp->source = htons(mptcp_inj_sport++);
+	tcp->dest = htons(server_port_h);
 	tcp->seq = htonl(0x12345678);
 	tcp->doff_flags = htons((uint16)(((tcplen / 4) << 12) | 0x002)); // data-offset + SYN
 	tcp->window = htons(65535);
@@ -1635,23 +1613,134 @@ static long syz_mptcp_inject_join_syn(volatile long a0)
 	pseudo += htons(IPPROTO_TCP) + htons((uint16)tcplen);
 	tcp->check = mptcp_inj_csum16(tcp, tcplen, pseudo);
 
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family = AF_INET;
+	dst.sin_addr.s_addr = htonl(0x7f000001);
+	dst.sin_port = htons(server_port_h);
+	return sendto(rs, pkt, total, 0, (struct sockaddr*)&dst, sizeof(dst)) < 0 ? -1 : 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_inject_join_syn
+// Raw MP_JOIN SYN injection primitive (lifecycle op-set). Send ONE MP_JOIN SYN
+// carrying the pair's SERVER msk token to the loopback listener. Drives the
+// incoming-join-request path (subflow_token_join_request -> mptcp_pm_get_local_id
+// / mptcp_pm_is_backup) directly -- coverage stock syzkaller reaches only via a
+// full userspace-PM SUBFLOW_CREATE round-trip -- and is the injection half of the
+// close/teardown race class. On a LIVE msk pm.ops is valid, so no crash; the join
+// is rejected later at HMAC. Non-consuming (the pair stays usable).
+static long syz_mptcp_inject_join_syn(volatile long a0)
+{
+	long slot = a0;
+	struct syz_mptcp_pair_slot* pair;
+	uint32 token;
+	int rs, r;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_inject_join_syn: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_inject_join_syn: slot %ld not in use\n", slot);
+		return -1;
+	}
+	token = mptcp_inj_server_token(pair->server_fd);
+	if (!token) {
+		debug("syz_mptcp_inject_join_syn: slot %ld no token\n", slot);
+		return -1;
+	}
 	rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
 	if (rs < 0) {
 		debug("syz_mptcp_inject_join_syn: raw socket: %d\n", errno);
 		return -1;
 	}
-	memset(&dst, 0, sizeof(dst));
-	dst.sin_family = AF_INET;
-	dst.sin_addr.s_addr = htonl(0x7f000001);
-	dst.sin_port = htons(pair->server_port_h);
-	sent = sendto(rs, pkt, total, 0, (struct sockaddr*)&dst, sizeof(dst));
+	r = mptcp_inj_send_one(rs, token, pair->server_port_h);
 	close(rs);
-	if (sent < 0) {
+	if (r < 0) {
 		debug("syz_mptcp_inject_join_syn: sendto: %d\n", errno);
 		return -1;
 	}
 	debug("syz_mptcp_inject_join_syn: slot %ld sent MP_JOIN SYN token=0x%x\n",
 	      slot, token);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_close_race
+// Teardown-race op (lifecycle op-set): create the finding-005-class close/teardown
+// race on demand -- single-threaded and reproducer-clean (no pthread, so the
+// generated C reproducer stays portable). Burst MP_JOIN SYNs (server token) at the
+// still-open listener: on loopback a raw sendto defers the SYN to the NET_RX
+// softirq backlog, so after the burst several SYNs are still queued for
+// subflow_token_join_request when we then close the accepted server msk with
+// SO_LINGER{1,0} (synchronous teardown: mptcp_destroy_common -> token_destroy ->
+// pm_ops_release). A queued SYN's softirq token lookup can thus land in the
+// teardown window. TERMINAL: consumes the pair (frees the slot) like pair_close.
+// Per-call hit rate is low (narrow window), but across a campaign's many executions
+// + varied pre-race state it explores the teardown-race class for novel bugs. If
+// the race is won the kernel panics the VM; a clean run returns 0.
+static long syz_mptcp_join_close_race(volatile long a0)
+{
+	long slot = a0;
+	struct syz_mptcp_pair_slot* pair;
+	uint32 token;
+	int rs = -1, i;
+	const int burst = 64;
+	struct linger lg;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_join_close_race: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_join_close_race: slot %ld not in use\n", slot);
+		return -1;
+	}
+
+	// Burst MP_JOIN SYNs at the still-open listener; a loopback raw sendto defers
+	// each to the NET_RX softirq, so several are still queued when we close below.
+	token = mptcp_inj_server_token(pair->server_fd);
+	if (token) {
+		rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+		if (rs >= 0) {
+			for (i = 0; i < burst; i++)
+				mptcp_inj_send_one(rs, token, pair->server_port_h);
+		}
+	}
+
+	// Race point: synchronous teardown of the accepted server msk vs the queued
+	// SYNs' softirq token lookups.
+	if (pair->server_fd >= 0) {
+		lg.l_onoff = 1;
+		lg.l_linger = 0;
+		setsockopt(pair->server_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+		close(pair->server_fd);
+		pair->server_fd = -1;
+	}
+	if (rs >= 0)
+		close(rs);
+
+	// Consume the pair (mirror pair_close: guarded fds, preserve generation,
+	// reset keys, in_use=false LAST with a release store).
+	if (pair->server_fd >= 0)
+		close(pair->server_fd);
+	if (pair->server_listen_fd >= 0)
+		close(pair->server_listen_fd);
+	if (pair->client_fd >= 0)
+		close(pair->client_fd);
+	pair->server_fd = 0;
+	pair->client_fd = 0;
+	pair->server_listen_fd = 0;
+	pair->token = 0;
+	pair->server_port_h = 0;
+	pair->rwnd_clamped = false;
+	pair->local_key = 0;
+	pair->remote_key = 0;
+	pair->keys_valid = false;
+	__atomic_store_n(&pair->in_use, false, __ATOMIC_RELEASE);
+	debug("syz_mptcp_join_close_race: slot %ld raced + consumed\n", slot);
 	return 0;
 }
 #endif
