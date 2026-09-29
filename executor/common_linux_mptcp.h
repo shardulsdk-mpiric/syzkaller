@@ -1785,6 +1785,48 @@ static long syz_mptcp_close_server(volatile long a0)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_disconnect
+// Lifecycle verb (differential-instrument increment 1): disconnect an msk via
+// connect(fd, AF_UNSPEC), which drives mptcp_disconnect -> mptcp_destroy_common
+// (token removal and path-manager teardown) THEN mptcp_pm_data_reset, on the SAME
+// reused socket. This gives a concurrent incoming MP_JOIN a disconnect/reconnect
+// reset to race against. Disconnects
+// the ACCEPTED SERVER msk (the join target the token resolves to netns-globally).
+// NON-consuming: the socket is reused not closed, so server_fd stays a valid fd and
+// the pair remains usable (reconnect / further ops); the fuzzer collides this with
+// inject_join_syn for the memory-safety half.
+static long syz_mptcp_disconnect(volatile long a0)
+{
+	long slot = a0;
+	struct syz_mptcp_pair_slot* pair;
+	struct sockaddr unspec;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_disconnect: slot %ld out of range\n", slot);
+		return -1;
+	}
+	pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_disconnect: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (pair->server_fd < 0) {
+		debug("syz_mptcp_disconnect: slot %ld server msk gone\n", slot);
+		return -1;
+	}
+	// connect(AF_UNSPEC): __inet_stream_connect routes to sk_prot->disconnect
+	// (= mptcp_disconnect) before the state switch, so it is state-agnostic.
+	memset(&unspec, 0, sizeof(unspec));
+	unspec.sa_family = AF_UNSPEC;
+	if (connect(pair->server_fd, &unspec, sizeof(unspec)) < 0) {
+		debug("syz_mptcp_disconnect: connect(AF_UNSPEC): %d\n", errno);
+		return -1;
+	}
+	debug("syz_mptcp_disconnect: slot %ld server msk disconnected\n", slot);
+	return 0;
+}
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mptcp_drive_traffic
 // Push data client->server on an established pair, exercising the MPTCP data
 // path. On a pair created with MPTCP_INIT_RWND_CLAMP the single send + full
