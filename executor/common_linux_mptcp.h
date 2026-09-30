@@ -491,9 +491,6 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 {
 	struct nlmsghdr* hdr = (struct nlmsghdr*)m->buf;
 	struct sockaddr_nl addr;
-	ssize_t n;
-	uint32 seq;
-	int attempts;
 
 	// A message that overran buf[] was never fully built -- refuse to send
 	// a truncated request rather than let the kernel misparse it.
@@ -503,7 +500,7 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 		return -1;
 	}
 
-	seq = __atomic_add_fetch(&mptcp_nlmsg_seq_ctr, 1, __ATOMIC_RELAXED);
+	uint32 seq = __atomic_add_fetch(&mptcp_nlmsg_seq_ctr, 1, __ATOMIC_RELAXED);
 	hdr->nlmsg_len = m->pos - m->buf;
 	hdr->nlmsg_seq = seq;
 	memset(&addr, 0, sizeof(addr));
@@ -513,14 +510,15 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 	// transaction can't steal our reply (m->buf is per-call stack, only
 	// the socket is shared).
 	mptcp_spin_lock(&mptcp_nlmsg_lock);
-	n = sendto(sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&addr, sizeof(addr));
+	ssize_t n = sendto(sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&addr, sizeof(addr));
 	if (n != (ssize_t)hdr->nlmsg_len) {
 		mptcp_spin_unlock(&mptcp_nlmsg_lock);
 		debug("mptcp_nlmsg_send: short write: %zd/%u errno=%d\n", n, hdr->nlmsg_len, errno);
 		return -1;
 	}
 	// Skip any stale/foreign datagram whose seq doesn't match ours.
-	for (attempts = 0; attempts < 8; attempts++) {
+	int attempts = 0;
+	for (; attempts < 8; attempts++) {
 		n = recv(sock, m->buf, sizeof(m->buf), 0);
 		if (n < (ssize_t)sizeof(struct nlmsghdr)) {
 			mptcp_spin_unlock(&mptcp_nlmsg_lock);
@@ -569,13 +567,12 @@ static int mptcp_pm_resolve_family(int sock, uint16* family_id_out, uint32* even
 	struct genlmsghdr genlhdr;
 	uint16 family_id = 0;
 	uint32 event_grp_id = 0;
-	int n;
 
 	memset(&genlhdr, 0, sizeof(genlhdr));
 	genlhdr.cmd = CTRL_CMD_GETFAMILY;
 	mptcp_nlmsg_init(&m, GENL_ID_CTRL, &genlhdr, sizeof(genlhdr));
 	mptcp_nlmsg_attr(&m, CTRL_ATTR_FAMILY_NAME, MPTCP_PM_NAME, strlen(MPTCP_PM_NAME) + 1);
-	n = mptcp_nlmsg_send(&m, sock);
+	int n = mptcp_nlmsg_send(&m, sock);
 	if (n < 0) {
 		debug("mptcp_pm_resolve_family: GETFAMILY: %d\n", errno);
 		return -1;
@@ -735,7 +732,6 @@ static int mptcp_pm_subflow_create(uint32 token, uint8 addr_id, uint32 addr_flag
 {
 	struct mptcp_nlmsg m;
 	struct genlmsghdr genlhdr;
-	struct nlattr* nest;
 	uint16 fam_v = AF_INET;
 
 	memset(&genlhdr, 0, sizeof(genlhdr));
@@ -748,6 +744,7 @@ static int mptcp_pm_subflow_create(uint32 token, uint8 addr_id, uint32 addr_flag
 	// only included when non-zero (the NORMAL/backup=0 path omits it
 	// entirely, matching the shape a hand-written ip-mptcp(8) call
 	// would send).
+	struct nlattr* nest = NULL;
 	mptcp_nlmsg_nest_begin(&m, &nest, MPTCP_PM_ATTR_ADDR | NLA_F_NESTED);
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
@@ -783,7 +780,6 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 {
 	struct mptcp_nlmsg m;
 	struct genlmsghdr genlhdr;
-	struct nlattr* nest;
 	uint16 fam_v = AF_INET;
 
 	memset(&genlhdr, 0, sizeof(genlhdr));
@@ -792,6 +788,7 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
 
+	struct nlattr* nest = NULL;
 	mptcp_nlmsg_nest_begin(&m, &nest, MPTCP_PM_ATTR_ADDR | NLA_F_NESTED);
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ID, &addr_id, sizeof(addr_id));
@@ -862,8 +859,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	unsigned long init_flags = (unsigned long)a2;
 
 	struct sockaddr_in srv_addr;
-	socklen_t alen;
-	int slot;
+	socklen_t alen = sizeof(srv_addr);
 	int one = 1;
 	int server_listen_fd = -1, client_fd = -1, server_fd = -1, cap_fd = -1;
 
@@ -882,7 +878,8 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	// DESTROY it issues targets a non-existent token and the kernel rejects
 	// it (ENOENT) -- no live subflow is destroyed. Once the bumped
 	// generation is visible the mismatch rejects the stale destroy outright.
-	for (slot = 0; slot < MPTCP_PAIR_POOL_SIZE; slot++) {
+	int slot = 0;
+	for (; slot < MPTCP_PAIR_POOL_SIZE; slot++) {
 		bool expected = false;
 		if (__atomic_compare_exchange_n(&syz_mptcp_pair_pool[slot].in_use,
 						&expected, true, false,
@@ -925,7 +922,6 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		debug("syz_mptcp_pair_init: bind: %d\n", errno);
 		goto fail;
 	}
-	alen = sizeof(srv_addr);
 	if (getsockname(server_listen_fd, (struct sockaddr*)&srv_addr, &alen) < 0) {
 		debug("syz_mptcp_pair_init: getsockname: %d\n", errno);
 		goto fail;
@@ -1200,34 +1196,27 @@ static int mptcp_pm_recv_subflow_sport(int evfd, uint32 token, uint32 saddr4_be,
 	}
 }
 
-/*
- * NORMAL-mode MP_JOIN (see the file comment for the mechanism and scope).
- *
- * addr_id 0 is rejected by the kernel ("invalid addr id" in
- * mptcp_userspace_pm_append_new_local_addr, net/mptcp/pm_userspace.c);
- * so 0 is coerced to 1 here and any other value passes through unchanged.
- * (syzlang int8 carries no signedness; the value is just the low byte of a2.)
- */
+// NORMAL-mode MP_JOIN (see the file comment for the mechanism and scope).
+//
+// addr_id 0 is rejected by the kernel ("invalid addr id" in
+// mptcp_userspace_pm_append_new_local_addr, net/mptcp/pm_userspace.c);
+// so 0 is coerced to 1 here and any other value passes through unchanged.
+// (syzlang int8 carries no signedness; the value is just the low byte of a2.)
 static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
 	long pair_slot = a0;
 	uint8 addr_id = (uint8)a1;
 	uint8 backup = (uint8)a2; // syzlang clamps to [0:1]
 	int mut_op = (int)a3; // MPTCP_MUT_* -- 0 (NONE) leaves the join unmutated
-	struct syz_mptcp_pair_slot* pair;
 	uint32 local_addr_be; // this subflow's distinct per-slot local address (set below)
 	const uint32 remote_addr_be = htonl(0x7f000001); // 127.0.0.1: the pair's server
-	uint32 addr_flags;
-	uint16 local_port_h;
-	int sub_slot;
-	int retries;
 	int evfd = -1;
 
 	if (pair_slot < 0 || pair_slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_join_subflow: pair slot %ld out of range\n", pair_slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[pair_slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[pair_slot];
 	if (!pair->in_use) {
 		debug("syz_mptcp_join_subflow: pair slot %ld not in use\n", pair_slot);
 		return -1;
@@ -1249,7 +1238,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// Atomic claim, same rationale as the pair pool: two join calls on
 	// separate threads must not settle on the same subflow slot. Held from
 	// here; the SUBFLOW_CREATE and poll failure paths below release it.
-	for (sub_slot = 0; sub_slot < MPTCP_SUBFLOW_POOL_SIZE; sub_slot++) {
+	int sub_slot = 0;
+	for (; sub_slot < MPTCP_SUBFLOW_POOL_SIZE; sub_slot++) {
 		bool expected = false;
 		if (__atomic_compare_exchange_n(&syz_mptcp_subflow_pool[sub_slot].in_use,
 						&expected, true, false,
@@ -1266,7 +1256,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// handler regardless of what we send (mptcp_pm_nl_subflow_create_doit
 	// ORs it in); SIGNAL is rejected outright. BACKUP is the only flag
 	// this pseudo-syscall exposes, via the syzlang `backup` parameter.
-	addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
+	uint32 addr_flags = backup ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
 
 	// Distinct local address per subflow slot (127.0.0.2 + slot). The kernel's
 	// userspace PM (mptcp_userspace_pm_append_new_local_addr) compares the local
@@ -1284,7 +1274,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// the notification can't be missed. If that can't be set up, fall back to a
 	// procid+slot-scoped fixed port (below the ephemeral floor; repeat-mode may
 	// then EADDRINUSE, but the common single-run case still works).
-	local_port_h = 0;
+	uint16 local_port_h = 0;
 	evfd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 	if (evfd >= 0) {
 		struct sockaddr_nl esa;
@@ -1343,7 +1333,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// the kernel's MPTCP option parser accepts the incoming MP_JOIN
 	// (mptcp_pm_allow_new_subflow path). Poll MPTCP_INFO with a ~1s
 	// ceiling -- a loopback handshake completes in well under that.
-	for (retries = 0; retries < MPTCP_SUBFLOW_INFO_MAX_RETRIES; retries++) {
+	int retries = 0;
+	for (; retries < MPTCP_SUBFLOW_INFO_MAX_RETRIES; retries++) {
 		struct syz_mptcp_info_short info;
 		socklen_t ilen = sizeof(info);
 
@@ -1380,7 +1371,6 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 			      pair_slot);
 		}
 		close(evfd);
-		evfd = -1;
 	}
 
 	// The egress ACK has been sent (and mutated, if requested) by now; retire the
@@ -1409,21 +1399,19 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 {
 	long sub_slot = a0;
 	long err = 0;
-	struct syz_mptcp_subflow_slot* sub;
-	struct syz_mptcp_pair_slot* pair;
 	const uint32 remote_addr_be = htonl(0x7f000001);
 
 	if (sub_slot < 0 || sub_slot >= MPTCP_SUBFLOW_POOL_SIZE) {
 		debug("syz_mptcp_subflow_destroy: slot %ld out of range\n", sub_slot);
 		return -1;
 	}
-	sub = &syz_mptcp_subflow_pool[sub_slot];
+	struct syz_mptcp_subflow_slot* sub = &syz_mptcp_subflow_pool[sub_slot];
 	if (!__atomic_load_n(&sub->in_use, __ATOMIC_ACQUIRE)) {
 		debug("syz_mptcp_subflow_destroy: slot %ld not in use\n", sub_slot);
 		return -1;
 	}
 
-	pair = &syz_mptcp_pair_pool[sub->pair_slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[sub->pair_slot];
 	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE) ||
 	    __atomic_load_n(&pair->generation, __ATOMIC_ACQUIRE) != sub->pair_generation) {
 		// Parent pair already gone, OR its pool slot was closed and
@@ -1431,8 +1419,8 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 		// this subflow no longer maps to a live kernel object we may
 		// address. Issuing a genl DESTROY now would, in the reuse case,
 		// target the NEW occupant's token with our stale tuple -- so
-		// just free our own bookkeeping. (Closing a pair tears its
-		// subflows down kernel-side already.)
+		// just free our own bookkeeping. Closing a pair tears its
+		// subflows down kernel-side already.
 		debug("syz_mptcp_subflow_destroy: slot %ld parent pair %d stale "
 		      "(in_use=%d gen have=%u want=%u), freeing bookkeeping only\n",
 		      sub_slot, sub->pair_slot, pair->in_use,
@@ -1482,8 +1470,6 @@ free_slot:
 static long syz_mptcp_subflow_info(volatile long a0)
 {
 	long sub_slot = a0;
-	struct syz_mptcp_subflow_slot* sub;
-	struct syz_mptcp_pair_slot* pair;
 	uint8 info[128];
 	socklen_t len = sizeof(info);
 
@@ -1491,12 +1477,12 @@ static long syz_mptcp_subflow_info(volatile long a0)
 		debug("syz_mptcp_subflow_info: slot %ld out of range\n", sub_slot);
 		return -1;
 	}
-	sub = &syz_mptcp_subflow_pool[sub_slot];
+	struct syz_mptcp_subflow_slot* sub = &syz_mptcp_subflow_pool[sub_slot];
 	if (!__atomic_load_n(&sub->in_use, __ATOMIC_ACQUIRE)) {
 		debug("syz_mptcp_subflow_info: slot %ld not in use\n", sub_slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[sub->pair_slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[sub->pair_slot];
 	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE) ||
 	    __atomic_load_n(&pair->generation, __ATOMIC_ACQUIRE) != sub->pair_generation) {
 		debug("syz_mptcp_subflow_info: slot %ld parent pair %d stale, not live\n",
@@ -1519,7 +1505,7 @@ static long syz_mptcp_subflow_info(volatile long a0)
 #if SYZ_EXECUTOR || __NR_syz_mptcp_inject_join_syn || __NR_syz_mptcp_join_close_race
 // Shared raw MP_JOIN SYN injection helpers, used by syz_mptcp_inject_join_syn
 // (one-shot) and syz_mptcp_join_close_race (burst). Minimal distinct-named on-wire
-// structs avoid colliding with system <netinet/*> and the parser structs in
+// structs avoid colliding with system <netinet/...> headers and the parser structs in
 // common_linux_mptcp_mut.h; uintN (not stdint) per the executor-header type rule.
 struct mptcp_inj_iphdr {
 	uint8 vihl, tos;
@@ -1574,16 +1560,12 @@ static int mptcp_inj_send_one(int rs, uint32 token, uint16 server_port_h)
 {
 	uint8 pkt[64];
 	const int iplen = 20, tcplen = 20 + 12, total = 20 + 20 + 12; // +12 = MP_JOIN SYN opt
-	struct mptcp_inj_iphdr* ip;
-	struct mptcp_inj_tcphdr* tcp;
-	uint8* opt;
-	uint32 pseudo, tok_be, nonce;
 	struct sockaddr_in dst;
 
 	memset(pkt, 0, sizeof(pkt));
-	ip = (struct mptcp_inj_iphdr*)pkt;
-	tcp = (struct mptcp_inj_tcphdr*)(pkt + iplen);
-	opt = pkt + iplen + 20;
+	struct mptcp_inj_iphdr* ip = (struct mptcp_inj_iphdr*)pkt;
+	struct mptcp_inj_tcphdr* tcp = (struct mptcp_inj_tcphdr*)(pkt + iplen);
+	uint8* opt = pkt + iplen + 20;
 	ip->vihl = 0x45;
 	ip->tot_len = htons(total);
 	ip->id = htons(1);
@@ -1603,11 +1585,11 @@ static int mptcp_inj_send_one(int rs, uint32 token, uint16 server_port_h)
 	opt[1] = 12;
 	opt[2] = (1 << 4);
 	opt[3] = 0x01; // addr_id
-	tok_be = htonl(token);
+	uint32 tok_be = htonl(token);
 	memcpy(opt + 4, &tok_be, 4);
-	nonce = htonl(0xa5a5a5a5); // dummy: crash path is pre-HMAC
+	uint32 nonce = htonl(0xa5a5a5a5); // dummy: crash path is pre-HMAC
 	memcpy(opt + 8, &nonce, 4);
-	pseudo = 0;
+	uint32 pseudo = 0;
 	pseudo += (ip->saddr & 0xffff) + (ip->saddr >> 16);
 	pseudo += (ip->daddr & 0xffff) + (ip->daddr >> 16);
 	pseudo += htons(IPPROTO_TCP) + htons((uint16)tcplen);
@@ -1632,30 +1614,27 @@ static int mptcp_inj_send_one(int rs, uint32 token, uint16 server_port_h)
 static long syz_mptcp_inject_join_syn(volatile long a0)
 {
 	long slot = a0;
-	struct syz_mptcp_pair_slot* pair;
-	uint32 token;
-	int rs, r;
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_inject_join_syn: slot %ld out of range\n", slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
 	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
 		debug("syz_mptcp_inject_join_syn: slot %ld not in use\n", slot);
 		return -1;
 	}
-	token = mptcp_inj_server_token(pair->server_fd);
+	uint32 token = mptcp_inj_server_token(pair->server_fd);
 	if (!token) {
 		debug("syz_mptcp_inject_join_syn: slot %ld no token\n", slot);
 		return -1;
 	}
-	rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+	int rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
 	if (rs < 0) {
 		debug("syz_mptcp_inject_join_syn: raw socket: %d\n", errno);
 		return -1;
 	}
-	r = mptcp_inj_send_one(rs, token, pair->server_port_h);
+	int r = mptcp_inj_send_one(rs, token, pair->server_port_h);
 	close(rs);
 	if (r < 0) {
 		debug("syz_mptcp_inject_join_syn: sendto: %d\n", errno);
@@ -1684,8 +1663,6 @@ static long syz_mptcp_inject_join_syn(volatile long a0)
 static long syz_mptcp_join_close_race(volatile long a0)
 {
 	long slot = a0;
-	struct syz_mptcp_pair_slot* pair;
-	uint32 token;
 	int rs = -1, i;
 	const int burst = 64;
 	struct linger lg;
@@ -1694,7 +1671,7 @@ static long syz_mptcp_join_close_race(volatile long a0)
 		debug("syz_mptcp_join_close_race: slot %ld out of range\n", slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
 	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
 		debug("syz_mptcp_join_close_race: slot %ld not in use\n", slot);
 		return -1;
@@ -1702,7 +1679,7 @@ static long syz_mptcp_join_close_race(volatile long a0)
 
 	// Burst MP_JOIN SYNs at the still-open listener; a loopback raw sendto defers
 	// each to the NET_RX softirq, so several are still queued when we close below.
-	token = mptcp_inj_server_token(pair->server_fd);
+	uint32 token = mptcp_inj_server_token(pair->server_fd);
 	if (token) {
 		rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
 		if (rs >= 0) {
@@ -1761,14 +1738,13 @@ static long syz_mptcp_join_close_race(volatile long a0)
 static long syz_mptcp_close_server(volatile long a0)
 {
 	long slot = a0;
-	struct syz_mptcp_pair_slot* pair;
 	struct linger lg;
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_close_server: slot %ld out of range\n", slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
 	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
 		debug("syz_mptcp_close_server: slot %ld not in use\n", slot);
 		return -1;
@@ -1805,14 +1781,13 @@ static long syz_mptcp_close_server(volatile long a0)
 static long syz_mptcp_disconnect(volatile long a0)
 {
 	long slot = a0;
-	struct syz_mptcp_pair_slot* pair;
 	struct sockaddr unspec;
 
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_disconnect: slot %ld out of range\n", slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
 	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
 		debug("syz_mptcp_disconnect: slot %ld not in use\n", slot);
 		return -1;
@@ -1847,7 +1822,6 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile
 	long slot = a0;
 	const void* data = (const void*)a1;
 	size_t data_len = (size_t)a2;
-	struct syz_mptcp_pair_slot* pair;
 	char drain_buf[4096];
 	ssize_t sent = 0, drained;
 
@@ -1855,7 +1829,7 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile
 		debug("syz_mptcp_drive_traffic: slot %ld out of range\n", slot);
 		return -1;
 	}
-	pair = &syz_mptcp_pair_pool[slot];
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
 	if (!pair->in_use) {
 		debug("syz_mptcp_drive_traffic: slot %ld not in use\n", slot);
 		return -1;
