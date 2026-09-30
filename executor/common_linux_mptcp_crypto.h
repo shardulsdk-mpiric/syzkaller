@@ -44,12 +44,11 @@ static const uint32 syz_sha256_k[64] = {
 static inline void syz_sha256_block(struct syz_sha256* c, const uint8* p)
 {
 	uint32 w[64], a, b, cc, d, e, f, g, h, t1, t2;
-	int i;
 
-	for (i = 0; i < 16; i++)
+	for (int i = 0; i < 16; i++)
 		w[i] = ((uint32)p[i * 4] << 24) | ((uint32)p[i * 4 + 1] << 16) |
 		       ((uint32)p[i * 4 + 2] << 8) | (uint32)p[i * 4 + 3];
-	for (i = 16; i < 64; i++) {
+	for (int i = 16; i < 64; i++) {
 		uint32 s0 = SHA256_ROR32(w[i - 15], 7) ^ SHA256_ROR32(w[i - 15], 18) ^ (w[i - 15] >> 3);
 		uint32 s1 = SHA256_ROR32(w[i - 2], 17) ^ SHA256_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
 		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
@@ -62,7 +61,7 @@ static inline void syz_sha256_block(struct syz_sha256* c, const uint8* p)
 	f = c->h[5];
 	g = c->h[6];
 	h = c->h[7];
-	for (i = 0; i < 64; i++) {
+	for (int i = 0; i < 64; i++) {
 		uint32 S1 = SHA256_ROR32(e, 6) ^ SHA256_ROR32(e, 11) ^ SHA256_ROR32(e, 25);
 		uint32 ch = (e & f) ^ (~e & g);
 		t1 = h + S1 + ch + syz_sha256_k[i] + w[i];
@@ -104,8 +103,7 @@ static inline void syz_sha256_init(struct syz_sha256* c)
 
 static inline void syz_sha256_update(struct syz_sha256* c, const uint8* data, size_t n)
 {
-	size_t i;
-	for (i = 0; i < n; i++) {
+	for (size_t i = 0; i < n; i++) {
 		c->buf[c->idx++] = data[i];
 		if (c->idx == 64) {
 			syz_sha256_block(c, c->buf);
@@ -118,17 +116,16 @@ static inline void syz_sha256_update(struct syz_sha256* c, const uint8* data, si
 static inline void syz_sha256_final(struct syz_sha256* c, uint8 out[32])
 {
 	uint64 bits = c->len * 8;
-	int i;
 	uint8 pad = 0x80;
 	syz_sha256_update(c, &pad, 1);
 	pad = 0;
 	while (c->idx != 56)
 		syz_sha256_update(c, &pad, 1);
 	uint8 lenb[8];
-	for (i = 0; i < 8; i++)
+	for (int i = 0; i < 8; i++)
 		lenb[i] = (uint8)(bits >> (56 - i * 8));
 	syz_sha256_update(c, lenb, 8);
-	for (i = 0; i < 8; i++) {
+	for (int i = 0; i < 8; i++) {
 		out[i * 4] = (uint8)(c->h[i] >> 24);
 		out[i * 4 + 1] = (uint8)(c->h[i] >> 16);
 		out[i * 4 + 2] = (uint8)(c->h[i] >> 8);
@@ -150,15 +147,13 @@ static inline void syz_hmac_sha256(const uint8* key, size_t keylen,
 {
 	uint8 k[64], ipad[64], opad[64], inner[32];
 	struct syz_sha256 c;
-	size_t i;
 
 	memset(k, 0, sizeof(k));
-	if (keylen > 64) {
+	if (keylen > 64)
 		syz_sha256(key, keylen, k); // keys >64B are hashed; ours are 16B
-	} else if (keylen) {
+	else if (keylen)
 		memcpy(k, key, keylen); // guard keylen==0: memcpy(,NULL,0) is UB
-	}
-	for (i = 0; i < 64; i++) {
+	for (size_t i = 0; i < 64; i++) {
 		ipad[i] = k[i] ^ 0x36;
 		opad[i] = k[i] ^ 0x5c;
 	}
@@ -175,8 +170,7 @@ static inline void syz_hmac_sha256(const uint8* key, size_t keylen,
 // be64 helper without pulling <endian.h> semantics ambiguity.
 static inline void syz_put_be64(uint8 b[8], uint64 v)
 {
-	int i;
-	for (i = 0; i < 8; i++)
+	for (int i = 0; i < 8; i++)
 		b[i] = (uint8)(v >> (56 - i * 8));
 }
 
