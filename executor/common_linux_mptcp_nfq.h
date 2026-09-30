@@ -116,7 +116,6 @@ static inline int syz_nfq_send_msg(int fd, uint16 msg_type, uint16 res_id,
 	char buf[256], ack[256];
 	struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
 	struct nfgenmsg* nfg = (struct nfgenmsg*)NLMSG_DATA(nlh);
-	ssize_t n;
 
 	if (NLMSG_LENGTH(sizeof(*nfg)) + attr_len > sizeof(buf))
 		return -1;
@@ -134,7 +133,7 @@ static inline int syz_nfq_send_msg(int fd, uint16 msg_type, uint16 res_id,
 	}
 	if (send(fd, buf, nlh->nlmsg_len, 0) < 0)
 		return -1;
-	n = recv(fd, ack, sizeof(ack), 0);
+	ssize_t n = recv(fd, ack, sizeof(ack), 0);
 	if (n < 0)
 		return -1;
 	struct nlmsghdr* anlh = (struct nlmsghdr*)ack;
@@ -378,11 +377,11 @@ static inline void syz_nft_expr_end(struct syz_nft_buf* b, int elem, int data)
 // "cmp": reg1 == <value> (raw bytes, vlen of them).
 static inline void syz_nft_expr_cmp_eq(struct syz_nft_buf* b, const void* value, uint16 vlen)
 {
-	int elem, data, d;
+	int elem = 0, data = 0;
 	syz_nft_expr_start(b, "cmp", &elem, &data);
 	syz_nft_put_be32(b, NFTA_CMP_SREG, NFT_REG_1);
 	syz_nft_put_be32(b, NFTA_CMP_OP, NFT_CMP_EQ);
-	d = syz_nft_nest_start(b, NFTA_CMP_DATA);
+	int d = syz_nft_nest_start(b, NFTA_CMP_DATA);
 	syz_nft_put(b, NFTA_DATA_VALUE, value, vlen);
 	syz_nft_nest_end(b, d);
 	syz_nft_expr_end(b, elem, data);
@@ -397,7 +396,6 @@ static inline void syz_nft_expr_cmp_eq(struct syz_nft_buf* b, const void* value,
 static inline int syz_nft_batch_commit(int fd, struct syz_nft_buf* b)
 {
 	char ack[2048];
-	int i;
 
 	if (b->err) {
 		errno = EMSGSIZE;
@@ -405,7 +403,7 @@ static inline int syz_nft_batch_commit(int fd, struct syz_nft_buf* b)
 	}
 	if (send(fd, b->p, b->len, 0) < 0)
 		return -1;
-	for (i = 0; i < 256; i++) {
+	for (int i = 0; i < 256; i++) {
 		ssize_t n = recv(fd, ack, sizeof(ack), 0);
 		if (n < 0) {
 			if (errno == EINTR)
@@ -460,12 +458,11 @@ static inline int syz_nfq_delete_rule(int fd)
 {
 	char raw[256];
 	struct syz_nft_buf b;
-	int m;
 
 	syz_nft_buf_init(&b, raw, sizeof(raw));
 	syz_nft_batch_begin(&b);
-	m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_DELTABLE,
-			      NLM_F_REQUEST | NLM_F_ACK, NFPROTO_IPV4, 0);
+	int m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_DELTABLE,
+				  NLM_F_REQUEST | NLM_F_ACK, NFPROTO_IPV4, 0);
 	syz_nft_put_str(&b, NFTA_TABLE_NAME, NFQ_NFT_TABLE);
 	syz_nft_msg_end(&b, m);
 	syz_nft_batch_end(&b);
@@ -481,7 +478,6 @@ static inline int syz_nfq_install_rule(int fd)
 	struct syz_nft_buf b;
 	uint32 lo_ifindex = if_nametoindex("lo");
 	uint8 tcp = IPPROTO_TCP;
-	int m, n, exprs, elem, data;
 
 	if (lo_ifindex == 0) {
 		errno = ENODEV;
@@ -495,8 +491,8 @@ static inline int syz_nfq_install_rule(int fd)
 	syz_nft_buf_init(&b, raw, sizeof(raw));
 	syz_nft_batch_begin(&b);
 
-	m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWTABLE,
-			      NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, NFPROTO_IPV4, 0);
+	int m = syz_nft_msg_start(&b, (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWTABLE,
+				  NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, NFPROTO_IPV4, 0);
 	syz_nft_put_str(&b, NFTA_TABLE_NAME, NFQ_NFT_TABLE);
 	syz_nft_msg_end(&b, m);
 
@@ -506,7 +502,7 @@ static inline int syz_nfq_install_rule(int fd)
 	syz_nft_put_str(&b, NFTA_CHAIN_NAME, NFQ_NFT_CHAIN);
 	syz_nft_put_str(&b, NFTA_CHAIN_TYPE, "filter");
 	syz_nft_put_be32(&b, NFTA_CHAIN_POLICY, NF_ACCEPT);
-	n = syz_nft_nest_start(&b, NFTA_CHAIN_HOOK);
+	int n = syz_nft_nest_start(&b, NFTA_CHAIN_HOOK);
 	syz_nft_put_be32(&b, NFTA_HOOK_HOOKNUM, NF_INET_LOCAL_OUT);
 	syz_nft_put_be32(&b, NFTA_HOOK_PRIORITY, 0);
 	syz_nft_nest_end(&b, n);
@@ -516,8 +512,9 @@ static inline int syz_nfq_install_rule(int fd)
 			      NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK, NFPROTO_IPV4, 0);
 	syz_nft_put_str(&b, NFTA_RULE_TABLE, NFQ_NFT_TABLE);
 	syz_nft_put_str(&b, NFTA_RULE_CHAIN, NFQ_NFT_CHAIN);
-	exprs = syz_nft_nest_start(&b, NFTA_RULE_EXPRESSIONS);
+	int exprs = syz_nft_nest_start(&b, NFTA_RULE_EXPRESSIONS);
 	// meta oif -> reg1
+	int elem = 0, data = 0;
 	syz_nft_expr_start(&b, "meta", &elem, &data);
 	syz_nft_put_be32(&b, NFTA_META_KEY, NFT_META_OIF);
 	syz_nft_put_be32(&b, NFTA_META_DREG, NFT_REG_1);
