@@ -1,0 +1,84 @@
+From 4cd86b6285779e204a16b28fb5455d4fca02b2e1 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 2 Oct 2026 00:04:19 +0530
+Subject: [PATCH 2/3] sctp: annotate the receive-softirq chunk dispatch with
+ kcov remote coverage
+
+sctp_rcv() runs under the receive softirq and, unless the socket is owned
+by a user, pushes the packet straight into the endpoint's or association's
+inqueue, whose immediate handler (sctp_endpoint_bh_rcv() /
+sctp_assoc_bh_rcv()) pops the chunks and runs each through sctp_do_sm().
+Everything downstream -- the vtag-gated state functions, sctp_eat_data(),
+the ulp and out queues, the SACK/response transmit -- therefore executes
+with no per-task kcov attribution.
+
+Bracket the two bh_rcv loops with the softirq-guarded helper keyed on the
+association's (resp. endpoint's) kcov handle: one remote section per
+packet, opened after the hold and closed after the loop, so the early
+breaks on a dead association / freed endpoint stay balanced (stop does not
+touch the object). The brackets sit above sctp_do_sm() rather than inside
+it because sctp_do_sm() re-enters itself from sctp_cmd_process_sack(), and
+kcov forbids nested softirq sections. The same two functions also run in
+process context from sctp_backlog_rcv(), where the helper is a no-op and
+per-task kcov already records them.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/sctp/associola.c   | 8 ++++++++
+ net/sctp/endpointola.c | 8 ++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index c95a96fa46204..261cd198cade9 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -996,6 +996,13 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
+ 
+ 	inqueue = &asoc->base.inqueue;
+ 	sctp_association_hold(asoc);
++	/* Attribute the per-packet chunk dispatch (inqueue pop, state
++	 * machine, side effects, response transmit) to the task that opened
++	 * the socket when this runs in the receive softirq; no-op when it runs
++	 * from the backlog drain in process context.  One section per packet,
++	 * closed below after the loop.
++	 */
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	while (NULL != (chunk = sctp_inq_pop(inqueue))) {
+ 		state = asoc->state;
+ 		subtype = SCTP_ST_CHUNK(chunk->chunk_hdr->type);
+@@ -1070,6 +1077,7 @@ static void sctp_assoc_bh_rcv(struct work_struct *work)
+ 		if (first_time)
+ 			first_time = 0;
+ 	}
++	sctp_kcov_remote_stop();
+ 	sctp_association_put(asoc);
+ }
+ 
+diff --git a/net/sctp/endpointola.c b/net/sctp/endpointola.c
+index 2ff671b0cbd1c..74a2e5a650dc9 100644
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@ -355,6 +355,13 @@ static void sctp_endpoint_bh_rcv(struct work_struct *work)
+ 	sk = ep->base.sk;
+ 	net = sock_net(sk);
+ 
++	/* Attribute the endpoint-level chunk dispatch (INIT, COOKIE-ECHO and
++	 * anything that arrives before an association exists) to the task
++	 * that opened the socket when this runs in the receive softirq; no-op
++	 * from the backlog drain in process context.  One section per packet,
++	 * closed below after the loop.
++	 */
++	sctp_kcov_remote_start(ep->kcov_handle);
+ 	while (NULL != (chunk = sctp_inq_pop(inqueue))) {
+ 		subtype = SCTP_ST_CHUNK(chunk->chunk_hdr->type);
+ 
+@@ -432,4 +439,5 @@ static void sctp_endpoint_bh_rcv(struct work_struct *work)
+ 		if (first_time)
+ 			first_time = 0;
+ 	}
++	sctp_kcov_remote_stop();
+ }
+-- 
+2.34.1
+

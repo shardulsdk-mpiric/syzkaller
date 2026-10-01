@@ -1,0 +1,34 @@
+From dff1bd0439d955f0885b6a0efbf81530aa5f81e3 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Sun, 27 Sep 2026 12:24:06 +0530
+Subject: [PATCH 3/5] mptcp: adapt kcov handle to kcov_common_handle_id wrapper
+
+The kcov remote-handle helpers were written when the common handle was a
+bare u64. Upstream commit 5a13e296a3e32 ("kcov: refactor common handle ID
+into kcov_common_handle_id") wrapped it in a zero-sized-without-CONFIG_KCOV
+struct, changing kcov_common_handle() and kcov_remote_start_common() to take
+that type. Change msk->kcov_handle to struct kcov_common_handle_id so the
+capture and the start helper type-check against the current API.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/mptcp/protocol.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index da7b1eb892d9f..064d448ea1811 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -402,7 +402,7 @@ struct mptcp_sock {
+ 	 * socket.  Zero when the creating task had no kcov remote coverage
+ 	 * enabled, in which case the receive-path annotations are no-ops.
+ 	 */
+-	u64		kcov_handle;
++	struct kcov_common_handle_id kcov_handle;
+ #endif
+ };
+ 
+-- 
+2.34.1
+
