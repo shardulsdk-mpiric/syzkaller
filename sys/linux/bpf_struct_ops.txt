@@ -21,8 +21,14 @@
 #   tcp_cong     struct tcp_congestion_ops  net/ipv4/bpf_tcp_ca.c  (mainline)
 #   mptcp_sched  struct mptcp_sched_ops     net/mptcp/bpf.c        (mptcp/export tree)
 
-syz_bpf_struct_ops_load$tcp_cong(obj ptr[in, bpf_struct_ops_obj_tcp_cong], len bytesize[obj]) (no_squash)
-syz_bpf_struct_ops_load$mptcp_sched(obj ptr[in, bpf_struct_ops_obj_mptcp_sched], len bytesize[obj]) (no_squash)
+# The call returns the bpf link that holds the registration (the loader
+# always registers through a BPF_F_LINK struct_ops map + BPF_LINK_CREATE, so
+# the registration dies with the fd; see executor/common_linux_structops.h
+# for why a link-less registration would outlive the program).  The existing
+# bpf$ descriptions can drive the link further (BPF_LINK_UPDATE, LINK_DETACH).
+
+syz_bpf_struct_ops_load$tcp_cong(obj ptr[in, bpf_struct_ops_obj_tcp_cong], len bytesize[obj]) fd_bpf_link (no_squash)
+syz_bpf_struct_ops_load$mptcp_sched(obj ptr[in, bpf_struct_ops_obj_mptcp_sched], len bytesize[obj]) fd_bpf_link (no_squash)
 
 bpf_struct_ops_obj_tcp_cong {
 	data	array[int8]
