@@ -1,0 +1,33 @@
+# Copyright 2026 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
+# BPF struct_ops carrier.
+#
+# syz_bpf_struct_ops_load takes a generated, verifier-valid BPF struct_ops
+# object for one kernel struct_ops surface and loads + registers it (BTF
+# load, one BPF_PROG_LOAD per callback, a BPF_MAP_TYPE_STRUCT_OPS map whose
+# value carries the callback prog fds, then the map update / link create
+# that registers the instance with the kernel subsystem).
+#
+# The object blob types below are produced by pkg/structops through
+# Target.SpecialTypes (sys/linux/init_structops.go): one blob type per
+# surface, so the fuzzer's choice of syscall variant is the surface choice,
+# and mutation of a blob re-generates it rather than byte-flipping it (a
+# corrupt object just fails at load).  no_squash keeps the mutator's
+# squashAny from flattening the blob into an ANYBLOB, which would bypass
+# that -- the same reason syz_kvm_add_vcpu carries it for its code blob.
+#
+# Surfaces:
+#   tcp_cong     struct tcp_congestion_ops  net/ipv4/bpf_tcp_ca.c  (mainline)
+#   mptcp_sched  struct mptcp_sched_ops     net/mptcp/bpf.c        (mptcp/export tree)
+
+syz_bpf_struct_ops_load$tcp_cong(obj ptr[in, bpf_struct_ops_obj_tcp_cong], len bytesize[obj]) (no_squash)
+syz_bpf_struct_ops_load$mptcp_sched(obj ptr[in, bpf_struct_ops_obj_mptcp_sched], len bytesize[obj]) (no_squash)
+
+bpf_struct_ops_obj_tcp_cong {
+	data	array[int8]
+}
+
+bpf_struct_ops_obj_mptcp_sched {
+	data	array[int8]
+}
