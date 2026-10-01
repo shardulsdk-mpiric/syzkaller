@@ -470,7 +470,15 @@ static long syz_sctp_inject_chunk(volatile long a0, volatile long a1, volatile l
 		vtag_h = 0; // SCTP_VTAG_ZERO (and any other value)
 	}
 
-	int total = 12 + 4 + (int)payload_len;
+	// Pad the chunk to a 4-byte boundary (RFC 4960 3.2: a chunk's total length MUST
+	// be a multiple of 4; the pad bytes are zero and are NOT counted in ck->length).
+	// The kernel's chunk walk (sctp_inq_pop) advances by SCTP_PAD4(length); an
+	// unpadded non-4-aligned chunk overruns skb->len, fails sctp_chunk_length_valid,
+	// and tears the association down (sctp_sf_violation_chunklen). Without this every
+	// payload_len % 4 != 0 inject was poisoning the slot, so later injects became
+	// out-of-association traffic -- a major cause of the SCTP coverage plateau.
+	int padded_payload = ((int)payload_len + 3) & ~3; // <= SCTP_PAD4(1024) = 1024, fits pkt[]
+	int total = 12 + 4 + padded_payload;
 	memset(pkt, 0, (size_t)total);
 	struct sctp_inj_common* ch = (struct sctp_inj_common*)pkt;
 	struct sctp_inj_chunk* ck = (struct sctp_inj_chunk*)(pkt + 12);
