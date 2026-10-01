@@ -1,0 +1,98 @@
+From 0ceb3b1136c120b777716a18b371f3bba054206f Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Mon, 28 Sep 2026 16:05:06 +0530
+Subject: [PATCH 5/5] mptcp: capture kcov handle in mptcp_init_sock so passive
+ msks inherit it
+
+The kcov remote handle was captured in __mptcp_init_sock(), which also runs on
+the clone path (mptcp_sk_clone_init -> __mptcp_init_sock) during the third-ACK
+receive softirq. There kcov_common_handle() returns 0 (not in task context), so
+the clone's __mptcp_init_sock() overwrote the handle that sock_copy() had just
+propagated from the listener with {0}. Result: accepted (passive/server-side)
+msks carried a zero handle, and every receive-softirq coverage bracket keyed on
+a passive msk (server-side MP_JOIN/thmac/HMAC/ADD_ADDR validation, the push and
+worker brackets) was a silent no-op or attributed to a racing task.
+
+Move the capture into mptcp_init_sock() (the proto->init callback, run only from
+socket()), next to the existing mptcp_ca_reset() which is placed there for the
+exact same clone-propagation reason. sock_copy() then propagates the handle to
+accepted msks and the receive-softirq attribution works on the passive side.
+
+No functional/protocol change; instrumentation-only. Found in code review; the
+prior coverage measurement (design doc section 8) must be re-run, server-side
+numbers are expected to rise.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/mptcp/protocol.c | 20 +++++++++++---------
+ net/mptcp/protocol.h |  8 +++++---
+ 2 files changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 25f9a42e6bf07..9a01fa1e086bb 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3250,15 +3250,6 @@ static void __mptcp_init_sock(struct sock *sk)
+ 	mptcp_pm_data_init(msk);
+ 	spin_lock_init(&msk->fallback_lock);
+ 
+-#ifdef CONFIG_KCOV
+-	/* Capture the creating task's kcov remote handle so receive-softirq
+-	 * MP_JOIN/option processing can be attributed back to it.  Returns 0
+-	 * outside task context or when the task has no remote coverage
+-	 * enabled; accepted msks inherit this via sk_clone_lock().
+-	 */
+-	msk->kcov_handle = kcov_common_handle();
+-#endif
+-
+ 	/* re-use the csk retrans timer for MPTCP-level retrans */
+ 	timer_setup(&sk->mptcp_retransmit_timer, mptcp_retransmit_timer, 0);
+ 	timer_setup(&msk->sk.mptcp_tout_timer, mptcp_tout_timer, 0);
+@@ -3304,6 +3295,17 @@ static int mptcp_init_sock(struct sock *sk)
+ 	 */
+ 	mptcp_ca_reset(sk);
+ 
++#ifdef CONFIG_KCOV
++	/* Capture the creating task's kcov remote handle so receive-softirq
++	 * MP_JOIN/option processing is attributed back to it.  Done here rather
++	 * than in __mptcp_init_sock() for the same reason as mptcp_ca_reset()
++	 * above: __mptcp_init_sock() re-runs on the clone in softirq context and
++	 * would zero the handle, whereas sk_clone_lock()'s sock_copy() propagates
++	 * this value set here to accepted (passive) msks.
++	 */
++	mptcp_sk(sk)->kcov_handle = kcov_common_handle();
++#endif
++
+ 	sk_sockets_allocated_inc(sk);
+ 	sk->sk_rcvbuf = READ_ONCE(net->ipv4.sysctl_tcp_rmem[1]);
+ 	sk->sk_sndbuf = READ_ONCE(net->ipv4.sysctl_tcp_wmem[1]);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 245c0248db55c..db8b714cc537f 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -396,8 +396,10 @@ struct mptcp_sock {
+ 	u32		backlog_unaccounted;
+ #ifdef CONFIG_KCOV
+ 	/* kcov remote coverage handle, captured from the creating task in
+-	 * __mptcp_init_sock() and inherited by accepted (child) msks via
+-	 * sk_clone_lock().  Lets MP_JOIN and option processing that runs in
++	 * mptcp_init_sock() (outside __mptcp_init_sock() so it is not zeroed when
++	 * the clone re-runs that in softirq) and inherited by accepted (child)
++	 * msks via sk_clone_lock()'s sock_copy().  Lets MP_JOIN and option
++	 * processing that runs in
+ 	 * the receive softirq be attributed to the task that opened the
+ 	 * socket.  Zero when the creating task had no kcov remote coverage
+ 	 * enabled, in which case the receive-path annotations are no-ops.
+@@ -426,7 +428,7 @@ static inline void msk_owned_by_me(const struct mptcp_sock *msk)
+ /* Bracket an MP_JOIN/ADD_ADDR cryptographic validation call that runs in
+  * the receive softirq so the coverage it executes is attributed to the
+  * task that created the socket, via msk->kcov_handle (captured in
+- * __mptcp_init_sock()).  Use as a balanced start/stop pair around a single
++ * mptcp_init_sock()).  Use as a balanced start/stop pair around a single
+  * validator call; see net/mac80211/rx.c for the equivalent skb-carried
+  * pattern.
+  *
+-- 
+2.34.1
+

@@ -1,0 +1,117 @@
+From 1dc6838bbce0073ae14609ce712e1b70c5ba9522 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Sun, 27 Sep 2026 12:35:18 +0530
+Subject: [PATCH 4/5] mptcp: extend kcov remote coverage to the deferred send
+ push and worker
+
+The MP_JOIN/option gates were annotated, but the deferred send path and the
+msk work queue -- both of which run outside the syscall task -- were still
+dark. __mptcp_subflow_push_pending() runs in the receive softirq via
+__mptcp_check_push() (window-update/ACK driven) and via the NAPI-delegated
+path (mptcp_subflow_process_delegated); mptcp_worker() runs on a kworker.
+Per-task kcov records none of these.
+
+Wrap the two softirq push sites with the existing softirq-guarded helper
+keyed on msk->kcov_handle, and add a task-context helper variant to bracket
+mptcp_worker() (kworker has no per-task kcov, so open the section
+unconditionally, as vhost/io_uring do). Sections are non-nesting and
+balanced across the worker's goto-unlock exits.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/mptcp/protocol.c | 22 ++++++++++++++++++----
+ net/mptcp/protocol.h | 18 ++++++++++++++++++
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 17468d145cf41..25f9a42e6bf07 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3165,6 +3165,11 @@ static void mptcp_worker(struct work_struct *work)
+ 	int state;
+ 
+ 	lock_sock(sk);
++	/* Attribute the worker's softirq-free deferred work (retrans, deferred
++	 * push, pm work) to the creating task; task-context section on the
++	 * kworker. Balanced by the stop at the unlock label below.
++	 */
++	mptcp_kcov_remote_start_task(msk);
+ 	state = sk->sk_state;
+ 	if (unlikely((1 << state) & (TCPF_CLOSE | TCPF_LISTEN)))
+ 		goto unlock;
+@@ -3202,6 +3207,7 @@ static void mptcp_worker(struct work_struct *work)
+ 		mptcp_mp_fail_no_response(msk);
+ 
+ unlock:
++	mptcp_kcov_remote_stop_task(msk);
+ 	release_sock(sk);
+ 	sock_put(sk);
+ }
+@@ -3852,9 +3858,15 @@ void __mptcp_data_acked(struct sock *sk)
+ 
+ void __mptcp_check_push(struct sock *sk, struct sock *ssk)
+ {
+-	if (!sock_owned_by_user(sk))
++	if (!sock_owned_by_user(sk)) {
++		/* The deferred send push runs here in the receive softirq;
++		 * attribute its coverage to the task that created the msk
++		 * (this path is dark under stock per-task kcov).
++		 */
++		mptcp_kcov_remote_start(mptcp_sk(sk));
+ 		__mptcp_subflow_push_pending(sk, ssk, false);
+-	else
++		mptcp_kcov_remote_stop(mptcp_sk(sk));
++	} else
+ 		__set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->cb_flags);
+ }
+ 
+@@ -3958,9 +3970,11 @@ void mptcp_subflow_process_delegated(struct sock *ssk, long status)
+ 
+ 	if (status & BIT(MPTCP_DELEGATE_SEND)) {
+ 		mptcp_data_lock(sk);
+-		if (!sock_owned_by_user(sk))
++		if (!sock_owned_by_user(sk)) {
++			mptcp_kcov_remote_start(mptcp_sk(sk));
+ 			__mptcp_subflow_push_pending(sk, ssk, true);
+-		else
++			mptcp_kcov_remote_stop(mptcp_sk(sk));
++		} else
+ 			__set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->cb_flags);
+ 		mptcp_data_unlock(sk);
+ 	}
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 064d448ea1811..245c0248db55c 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -450,9 +450,27 @@ static inline void mptcp_kcov_remote_stop(const struct mptcp_sock *msk)
+ 	if (msk && in_serving_softirq())
+ 		kcov_remote_stop();
+ }
++
++/* Task-context variant for the workqueue path (mptcp_worker): the worker
++ * runs on a kworker that has no per-task kcov, so the section is opened
++ * unconditionally (io_uring/vhost precedent) rather than gated on softirq.
++ */
++static inline void mptcp_kcov_remote_start_task(const struct mptcp_sock *msk)
++{
++	if (msk)
++		kcov_remote_start_common(msk->kcov_handle);
++}
++
++static inline void mptcp_kcov_remote_stop_task(const struct mptcp_sock *msk)
++{
++	if (msk)
++		kcov_remote_stop();
++}
+ #else
+ static inline void mptcp_kcov_remote_start(const struct mptcp_sock *msk) { }
+ static inline void mptcp_kcov_remote_stop(const struct mptcp_sock *msk) { }
++static inline void mptcp_kcov_remote_start_task(const struct mptcp_sock *msk) { }
++static inline void mptcp_kcov_remote_stop_task(const struct mptcp_sock *msk) { }
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_NET
+-- 
+2.34.1
+

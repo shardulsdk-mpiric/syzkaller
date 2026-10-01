@@ -1,0 +1,188 @@
+From 19466731b863f95a69d503252f25e23cf48e30fe Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 2 Oct 2026 00:03:12 +0530
+Subject: [PATCH 1/3] sctp: add kcov remote handle capture and annotation
+ helpers
+
+The SCTP chunk state machine runs in the receive softirq (sctp_rcv ->
+sctp_inq_push -> sctp_{assoc,endpoint}_bh_rcv -> sctp_do_sm), in the timer
+softirq (sctp_generate_*_event) and from the ICMP error handler. kcov's
+per-task mode records nothing there: the current task is whatever was
+interrupted, not the process driving the association, so the vtag-gated
+chunk handlers, sctp_eat_data(), the ulp/out queues and the response
+transmit are attributed to no kcov area. kcov solves this with remote
+coverage, but the softirq side needs a handle to attribute coverage to,
+and kcov_common_handle() returns 0 outside task context.
+
+Capture the creating task's common handle on the endpoint in
+sctp_endpoint_init(), which only ever runs in that task (socket(),
+accept() via create_accept_sk, peeloff). Make every association inherit
+it from its endpoint in sctp_association_init() instead of calling
+kcov_common_handle() there: passive associations (created from
+COOKIE-ECHO in sctp_unpack_cookie) and the temporary associations used
+for INIT processing are created in the receive softirq, where the common
+handle is 0, so capturing on the association would leave the passive side
+dark. Re-sync the association's handle in sctp_assoc_migrate() so an
+accepted/peeled-off association follows its new endpoint.
+
+Add sctp_kcov_remote_start()/_stop() helpers that open a remote coverage
+section using that handle, restricted to softirq context: the same code
+runs in process context when the backlog is drained from a syscall, where
+per-task kcov already records it and kcov_remote_start() warns if a task
+with kcov enabled opens a remote section. A zero handle is a lookup miss
+and makes both calls no-ops. The field is struct kcov_common_handle_id,
+which is zero-sized without CONFIG_KCOV, so no ifdefs are needed.
+
+No new uAPI and no change to the kcov core; same shape as the per-object
+handle in vhost, io_uring and usbip, and as the MPTCP msk-carried handle.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ include/net/sctp/sctp.h    | 34 ++++++++++++++++++++++++++++++++++
+ include/net/sctp/structs.h | 19 +++++++++++++++++++
+ net/sctp/associola.c       | 14 ++++++++++++++
+ net/sctp/endpointola.c     |  8 ++++++++
+ 4 files changed, 75 insertions(+)
+
+diff --git a/include/net/sctp/sctp.h b/include/net/sctp/sctp.h
+index d50c27812504f..9315d1ae37050 100644
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@ -48,6 +48,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/jiffies.h>
+ #include <linux/idr.h>
++#include <linux/kcov.h>
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/ipv6.h>
+@@ -669,4 +670,37 @@ static inline void sctp_sock_set_nodelay(struct sock *sk)
+ 	release_sock(sk);
+ }
+ 
++/* kcov remote coverage for the SCTP softirq state-machine entry points.
++ *
++ * The chunk state machine -- sctp_do_sm() and everything under it: the
++ * sm_statefuns handlers, sctp_eat_data(), the ulp and out queues, the
++ * response transmit -- runs in the receive softirq, in the timer softirq
++ * and from the ICMP error handler, i.e. outside the task that owns the
++ * socket.  kcov's per-task mode records nothing there.  These helpers open
++ * a kcov remote section keyed on the common handle captured from the
++ * socket's creating task (ep->kcov_handle, inherited by every association
++ * as asoc->kcov_handle), so that coverage is attributed to that task.
++ *
++ * Restricted to softirq on purpose: the same code also runs in process
++ * context when the socket backlog is drained from a syscall
++ * (sctp_backlog_rcv()) and from the socket primitives, where the task's
++ * own per-task kcov already records it and kcov_remote_start() warns if a
++ * task with kcov enabled opens a remote section.  A zero handle (no remote
++ * coverage enabled on the creating task) is a lookup miss in kcov, so start
++ * and stop are both no-ops and stay balanced.  Sections must not nest:
++ * bracket the callers of sctp_do_sm(), never sctp_do_sm() itself, which
++ * re-enters from sctp_cmd_process_sack().
++ */
++static inline void sctp_kcov_remote_start(struct kcov_common_handle_id id)
++{
++	if (IS_ENABLED(CONFIG_KCOV) && in_serving_softirq())
++		kcov_remote_start_common(id);
++}
++
++static inline void sctp_kcov_remote_stop(void)
++{
++	if (IS_ENABLED(CONFIG_KCOV) && in_serving_softirq())
++		kcov_remote_stop();
++}
++
+ #endif /* __net_sctp_h__ */
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index b21f23b736fd2..ee31bb37c95e9 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -1324,6 +1324,15 @@ struct sctp_endpoint {
+ 	      reconf_enable:1;
+ 
+ 	__u8  strreset_enable;
++
++	/* kcov remote coverage handle of the task that created the socket,
++	 * captured in sctp_endpoint_init(), which only ever runs in that task
++	 * (socket(), accept(), peeloff).  Every association created on this
++	 * endpoint inherits it, see sctp_association_init().  Zero-sized
++	 * without CONFIG_KCOV.
++	 */
++	struct kcov_common_handle_id kcov_handle;
++
+ 	struct rcu_head rcu;
+ };
+ 
+@@ -2084,6 +2093,16 @@ struct sctp_association {
+ 	u32 secid;
+ 	u32 peer_secid;
+ 
++	/* kcov remote coverage handle, inherited from the endpoint in
++	 * sctp_association_init() and re-synced in sctp_assoc_migrate().  Not
++	 * captured with kcov_common_handle() here on purpose: passive and
++	 * temporary associations are created in the receive softirq, where
++	 * that returns 0.  Keys the receive/timer softirq coverage sections
++	 * (sctp_kcov_remote_start()) so the chunk state machine is attributed
++	 * to the task that opened the socket.  Zero-sized without CONFIG_KCOV.
++	 */
++	struct kcov_common_handle_id kcov_handle;
++
+ 	struct rcu_head rcu;
+ };
+ 
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index 4521be3bd85aa..c95a96fa46204 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -69,6 +69,15 @@ static struct sctp_association *sctp_association_init(
+ 	sctp_endpoint_hold(asoc->ep);
+ 	sock_hold(asoc->base.sk);
+ 
++	/* Inherit the endpoint's kcov remote handle rather than calling
++	 * kcov_common_handle(): passive associations (COOKIE-ECHO) and the
++	 * temporary ones used for INIT processing are created here in the
++	 * receive softirq, where kcov_common_handle() returns 0.  The endpoint
++	 * captured the handle in task context, so this is the only reliable
++	 * source for both active and passive associations.
++	 */
++	asoc->kcov_handle = ep->kcov_handle;
++
+ 	/* Initialize the common base substructure.  */
+ 	asoc->base.type = SCTP_EP_TYPE_ASSOCIATION;
+ 
+@@ -1086,6 +1095,11 @@ void sctp_assoc_migrate(struct sctp_association *assoc, struct sock *newsk)
+ 	/* Get a reference to the new endpoint.  */
+ 	assoc->ep = newsp->ep;
+ 	sctp_endpoint_hold(assoc->ep);
++	/* Follow the endpoint: the accepted/peeled-off socket's endpoint was
++	 * created in the accept()/peeloff task, so keep attributing the
++	 * association's softirq work to the task that now owns it.
++	 */
++	assoc->kcov_handle = assoc->ep->kcov_handle;
+ 
+ 	/* Get a reference to the new sock.  */
+ 	assoc->base.sk = newsk;
+diff --git a/net/sctp/endpointola.c b/net/sctp/endpointola.c
+index a15b599b20b76..2ff671b0cbd1c 100644
+--- a/net/sctp/endpointola.c
++++ b/net/sctp/endpointola.c
+@@ -118,6 +118,14 @@ static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
+ 	ep->base.net = sock_net(sk);
+ 	sock_hold(ep->base.sk);
+ 
++	/* Capture the creating task's kcov remote handle so the receive and
++	 * timer softirq state-machine work on this endpoint and on its
++	 * associations can be attributed back to it.  This runs only in that
++	 * task (socket(), accept(), peeloff); it is zero when the task has no
++	 * remote coverage enabled, which makes the annotations no-ops.
++	 */
++	ep->kcov_handle = kcov_common_handle();
++
+ 	return ep;
+ 
+ nomem_shkey:
+-- 
+2.34.1
+

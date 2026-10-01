@@ -1,0 +1,139 @@
+From 300173089b5c48de87444df30babcc166422bf90 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 2 Oct 2026 00:05:03 +0530
+Subject: [PATCH 3/3] sctp: annotate timer and ICMP state-machine entry points
+ with kcov remote coverage
+
+The receive dispatch is now attributed, but the state machine has two
+more softirq entry points that drive association-level work with no task
+in scope: the per-association and per-transport timers (T1/T2/T3-RTX,
+T4-RTO, T5 shutdown guard, heartbeat, SACK, autoclose, reconf, probe,
+proto-unreach), which call sctp_do_sm() from the timer softirq, and the
+ICMP protocol-unreachable path, which calls it from the ICMP error
+handler in the receive softirq. Retransmission, heartbeat, delayed-SACK
+generation and the resulting transmit all run there.
+
+Bracket each sctp_do_sm() call in sctp_generate_t3_rtx_event(),
+sctp_generate_timeout_event(), sctp_generate_heartbeat_event(),
+sctp_generate_proto_unreach_event(), sctp_generate_reconf_event(),
+sctp_generate_probe_event() and sctp_icmp_proto_unreachable() with the
+softirq-guarded helper keyed on asoc->kcov_handle. The brackets are
+placed after the sock-busy / dead-association early exits so every path
+that opens a section closes it, and are non-nesting: a timer softirq
+cannot interrupt a receive-softirq section on the same CPU, and the
+sections key on different tasks on different CPUs.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/sctp/input.c         |  3 +++
+ net/sctp/sm_sideeffect.c | 16 +++++++++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/net/sctp/input.c b/net/sctp/input.c
+index 9494cfa51106c..34403ce34f139 100644
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@ -450,10 +450,13 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
+ 		if (timer_delete(&t->proto_unreach_timer))
+ 			sctp_transport_put(t);
+ 
++		/* Reached from the ICMP error handler in the receive softirq. */
++		sctp_kcov_remote_start(asoc->kcov_handle);
+ 		sctp_do_sm(net, SCTP_EVENT_T_OTHER,
+ 			   SCTP_ST_OTHER(SCTP_EVENT_ICMP_PROTO_UNREACH),
+ 			   asoc->state, asoc->ep, asoc, t,
+ 			   GFP_ATOMIC);
++		sctp_kcov_remote_stop();
+ 	}
+ }
+ 
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index 35f540fb15fc1..bffdea5a8c1ba 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -250,12 +250,16 @@ void sctp_generate_t3_rtx_event(struct timer_list *t)
+ 		goto out_unlock;
+ 	}
+ 
+-	/* Run through the state machine.  */
++	/* Run through the state machine.  Timers fire in the timer softirq,
++	 * so attribute the retransmit work to the socket's creating task.
++	 */
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	error = sctp_do_sm(net, SCTP_EVENT_T_TIMEOUT,
+ 			   SCTP_ST_TIMEOUT(SCTP_EVENT_TIMEOUT_T3_RTX),
+ 			   asoc->state,
+ 			   asoc->ep, asoc,
+ 			   transport, GFP_ATOMIC);
++	sctp_kcov_remote_stop();
+ 
+ 	if (error)
+ 		sk->sk_err = -error;
+@@ -294,10 +298,12 @@ static void sctp_generate_timeout_event(struct sctp_association *asoc,
+ 		goto out_unlock;
+ 
+ 	/* Run through the state machine.  */
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	error = sctp_do_sm(net, SCTP_EVENT_T_TIMEOUT,
+ 			   SCTP_ST_TIMEOUT(timeout_type),
+ 			   asoc->state, asoc->ep, asoc,
+ 			   (void *)timeout_type, GFP_ATOMIC);
++	sctp_kcov_remote_stop();
+ 
+ 	if (error)
+ 		sk->sk_err = -error;
+@@ -397,10 +403,12 @@ void sctp_generate_heartbeat_event(struct timer_list *t)
+ 		goto out_unlock;
+ 	}
+ 
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	error = sctp_do_sm(net, SCTP_EVENT_T_TIMEOUT,
+ 			   SCTP_ST_TIMEOUT(SCTP_EVENT_TIMEOUT_HEARTBEAT),
+ 			   asoc->state, asoc->ep, asoc,
+ 			   transport, GFP_ATOMIC);
++	sctp_kcov_remote_stop();
+ 
+ 	if (error)
+ 		sk->sk_err = -error;
+@@ -439,9 +447,11 @@ void sctp_generate_proto_unreach_event(struct timer_list *t)
+ 	if (asoc->base.dead)
+ 		goto out_unlock;
+ 
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	sctp_do_sm(net, SCTP_EVENT_T_OTHER,
+ 		   SCTP_ST_OTHER(SCTP_EVENT_ICMP_PROTO_UNREACH),
+ 		   asoc->state, asoc->ep, asoc, transport, GFP_ATOMIC);
++	sctp_kcov_remote_stop();
+ 
+ out_unlock:
+ 	bh_unlock_sock(sk);
+@@ -473,10 +483,12 @@ void sctp_generate_reconf_event(struct timer_list *t)
+ 	if (!asoc->strreset_chunk)
+ 		goto out_unlock;
+ 
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	error = sctp_do_sm(net, SCTP_EVENT_T_TIMEOUT,
+ 			   SCTP_ST_TIMEOUT(SCTP_EVENT_TIMEOUT_RECONF),
+ 			   asoc->state, asoc->ep, asoc,
+ 			   transport, GFP_ATOMIC);
++	sctp_kcov_remote_stop();
+ 
+ 	if (error)
+ 		sk->sk_err = -error;
+@@ -507,10 +519,12 @@ void sctp_generate_probe_event(struct timer_list *t)
+ 		goto out_unlock;
+ 	}
+ 
++	sctp_kcov_remote_start(asoc->kcov_handle);
+ 	error = sctp_do_sm(net, SCTP_EVENT_T_TIMEOUT,
+ 			   SCTP_ST_TIMEOUT(SCTP_EVENT_TIMEOUT_PROBE),
+ 			   asoc->state, asoc->ep, asoc,
+ 			   transport, GFP_ATOMIC);
++	sctp_kcov_remote_stop();
+ 
+ 	if (error)
+ 		sk->sk_err = -error;
+-- 
+2.34.1
+
