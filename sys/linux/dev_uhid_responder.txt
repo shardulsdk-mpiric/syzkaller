@@ -1,0 +1,50 @@
+# Copyright 2026 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
+# /dev/uhid content-aware responder.
+#
+# A HID driver's .probe may issue hid_hw_raw_request(HID_REQ_GET_REPORT), which on
+# a uhid device blocks in the kernel (up to 5 s) for a UHID_GET_REPORT_REPLY whose
+# id matches the UHID_GET_REPORT event it queued to userspace; the reply's data[]
+# is then the byte string the driver's parser consumes. The stock write$UHID_*
+# calls in dev_uhid.txt never read the request, so they can neither match the id
+# nor carry chosen content.
+#
+# syz_uhid_create_responder() opens /dev/uhid, UHID_CREATE2s a device whose
+# bus/vendor/product bind it to the chosen target driver, and runs a background
+# thread that answers every UHID_GET_REPORT / UHID_SET_REPORT with a matching
+# reply (echoed id, err=0) carrying reply_payload as data[]. The returned fd is a
+# sub-resource of fd_uhid so the stock write$UHID_INPUT2 / write$UHID_DESTROY can
+# be sequenced on the bound device. syz_uhid_destroy_responder() is the consuming
+# edge: stop + join the thread and UHID_DESTROY the device.
+#
+# Executor side: executor/common_linux_uhid.h.
+
+resource fd_uhid_responder[fd_uhid]
+
+# Target profiles: which in-tree driver the created device binds to (vendor/product
+# from drivers/hid/hid-ids.h). Harness-only constants, mirrored as executor
+# #defines (UHID_TARGET_*); must stay in sync with the .const.
+define UHID_TARGET_GENERIC	0
+define UHID_TARGET_PS_DUALSENSE_USB	1
+define UHID_TARGET_PS_DUALSENSE_BT	2
+define UHID_TARGET_PS_DS4_USB	3
+define UHID_TARGET_CP2112	4
+uhid_resp_targets = UHID_TARGET_GENERIC, UHID_TARGET_PS_DUALSENSE_USB, UHID_TARGET_PS_DUALSENSE_BT, UHID_TARGET_PS_DS4_USB, UHID_TARGET_CP2112
+
+# Reply shaping flags (bitmask). ECHO_RNUM: data[0] = requested report id, the
+# hid-playstation ps_get_report gate. CRC32: trailing crc32 over the reply, the
+# playstation Bluetooth gate. SET_FAIL: ack SET_REPORT with err=1 (driver sees
+# -EIO). EXACT_LEN: reply exactly payload_len bytes instead of the driver-expected
+# length (drives the short-reply error paths). WAIT_PROBE: block the call until the
+# async probe's request burst has been answered (bounded). Harness-only constants,
+# mirrored as executor #defines (UHID_RESP_*); must stay in sync with the .const.
+define UHID_RESP_ECHO_RNUM	1
+define UHID_RESP_CRC32	2
+define UHID_RESP_SET_FAIL	4
+define UHID_RESP_EXACT_LEN	8
+define UHID_RESP_WAIT_PROBE	16
+uhid_resp_flags = UHID_RESP_ECHO_RNUM, UHID_RESP_CRC32, UHID_RESP_SET_FAIL, UHID_RESP_EXACT_LEN, UHID_RESP_WAIT_PROBE
+
+syz_uhid_create_responder(target flags[uhid_resp_targets], reply_payload ptr[in, array[int8]], payload_len len[reply_payload], flags flags[uhid_resp_flags]) fd_uhid_responder
+syz_uhid_destroy_responder(fd fd_uhid_responder)
