@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# BRF embargo guard -- see embargo_guard.sh. $1=remote name, $2=URL; refs on stdin.
+exec "$(dirname "$0")/embargo_guard.sh" pre-push "${1:-origin}" "${2:-}"
