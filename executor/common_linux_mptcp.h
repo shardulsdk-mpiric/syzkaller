@@ -1763,6 +1763,94 @@ static long syz_mptcp_close_server(volatile long a0)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_listener_close_race
+// Listener-close / accept-vs-worker race op (lifecycle op-set, design §9d). Targets
+// the unaccepted-socket teardown UAF class: 0a3f4f1f ("UaF in listener shutdown"),
+// b6985b9b ("UaF destroying unaccepted sockets"), 6aeed904 ("race on unaccepted
+// mptcp sockets", msk->first UaF). Self-contained -- claims NO pool slot: create a
+// fresh MPTCP listener, complete n MP_CAPABLE handshakes WITHOUT accept()ing them
+// (they queue as unaccepted msks on the listener's accept queue), send a byte on
+// each so the server-side data_ready schedules the msk worker on the unaccepted
+// child, then close the listener so inet_csk_listen_stop -> inet_child_forget frees
+// the unaccepted children, racing any in-flight worker / softirq token lookup on
+// them. KASAN is the oracle; a won race reports a UAF. Reproducer-clean
+// (single-threaded, no pthread). Per-call hit rate is low (narrow race); value
+// accrues across a campaign's many executions + varied co-scheduled state.
+#define MPTCP_LCR_MAX_UNACCEPTED 8
+static long syz_mptcp_listener_close_race(volatile long a0)
+{
+	long n = a0;
+	struct sockaddr_in srv_addr;
+	socklen_t alen = sizeof(srv_addr);
+	int one = 1;
+	int listen_fd = -1;
+	int client_fd[MPTCP_LCR_MAX_UNACCEPTED];
+
+	if (n < 1)
+		n = 1;
+	if (n > MPTCP_LCR_MAX_UNACCEPTED)
+		n = MPTCP_LCR_MAX_UNACCEPTED;
+	for (int i = 0; i < MPTCP_LCR_MAX_UNACCEPTED; i++)
+		client_fd[i] = -1;
+
+	listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+	if (listen_fd < 0) {
+		debug("syz_mptcp_listener_close_race: listen socket: %d\n", errno);
+		return -1;
+	}
+	setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	memset(&srv_addr, 0, sizeof(srv_addr));
+	srv_addr.sin_family = AF_INET;
+	srv_addr.sin_port = 0; // kernel picks an ephemeral port
+	srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (bind(listen_fd, (struct sockaddr*)&srv_addr, sizeof(srv_addr)) < 0) {
+		debug("syz_mptcp_listener_close_race: bind: %d\n", errno);
+		close(listen_fd);
+		return -1;
+	}
+	if (getsockname(listen_fd, (struct sockaddr*)&srv_addr, &alen) < 0) {
+		debug("syz_mptcp_listener_close_race: getsockname: %d\n", errno);
+		close(listen_fd);
+		return -1;
+	}
+	if (listen(listen_fd, MPTCP_LCR_MAX_UNACCEPTED) < 0) {
+		debug("syz_mptcp_listener_close_race: listen: %d\n", errno);
+		close(listen_fd);
+		return -1;
+	}
+
+	// Complete n MP_CAPABLE handshakes but never accept() -- each queues as an
+	// unaccepted msk. Send a byte on each so the server schedules the msk worker
+	// (widens the free-vs-worker window; targets the 6aeed904 msk->first path).
+	for (int i = 0; i < n; i++) {
+		client_fd[i] = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+		if (client_fd[i] < 0) {
+			debug("syz_mptcp_listener_close_race: client %d socket: %d\n", i, errno);
+			continue;
+		}
+		if (connect(client_fd[i], (struct sockaddr*)&srv_addr, sizeof(srv_addr)) < 0) {
+			debug("syz_mptcp_listener_close_race: client %d connect: %d\n", i, errno);
+			continue;
+		}
+		if (send(client_fd[i], "x", 1, MSG_DONTWAIT) < 0) {
+			debug("syz_mptcp_listener_close_race: client %d send: %d\n", i, errno);
+		}
+	}
+
+	// Race point: closing the listener runs inet_csk_listen_stop ->
+	// inet_child_forget, freeing the unaccepted children, racing any in-flight
+	// worker / softirq token lookup on them.
+	close(listen_fd);
+
+	for (int i = 0; i < n; i++)
+		if (client_fd[i] >= 0)
+			close(client_fd[i]);
+
+	debug("syz_mptcp_listener_close_race: raced close vs %ld unaccepted\n", n);
+	return 0;
+}
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mptcp_disconnect
 // Lifecycle verb (differential-instrument increment 1): disconnect an msk via
 // connect(fd, AF_UNSPEC), which drives mptcp_disconnect -> mptcp_destroy_common
