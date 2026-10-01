@@ -47,6 +47,7 @@ import (
 	"github.com/google/syzkaller/pkg/runtest"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
+	"github.com/google/syzkaller/pkg/structops"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
@@ -250,6 +251,15 @@ func main() {
 	if !mode.UseDashboard {
 		cfg.DashboardClient = ""
 		cfg.HubClient = ""
+	}
+	if cfg.TargetOS == targets.Linux && (cfg.KernelObj != "" || cfg.StructOpsVmlinuxH != "") {
+		// BPF struct_ops carrier: generated programs are compiled host-side
+		// against this kernel's BTF (sys/linux/init_structops.go).
+		structops.Configure(structops.CompileConfig{
+			KernelObj: cfg.KernelObj,
+			VmlinuxH:  cfg.StructOpsVmlinuxH,
+			CacheDir:  filepath.Join(cfg.Workdir, "structops"),
+		})
 	}
 	if cfg.Experimental.EnableKFuzzTest {
 		vmLinuxPath := path.Join(cfg.KernelObj, cfg.SysTarget.KernelObject)
