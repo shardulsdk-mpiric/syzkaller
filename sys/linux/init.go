@@ -73,6 +73,9 @@ func InitTarget(target *prog.Target) {
 		"usb_device_descriptor_uac2":    arch.generateAudioDeviceDescriptor,
 		"usb_device_descriptor_uac3":    arch.generateAudioDeviceDescriptor,
 		"usb_device_descriptor_midi":    arch.generateAudioDeviceDescriptor,
+		// BPF struct_ops object blobs (sys/linux/init_structops.go).
+		"bpf_struct_ops_obj_tcp_cong":    arch.generateStructOpsObjTCPCong,
+		"bpf_struct_ops_obj_mptcp_sched": arch.generateStructOpsObjMptcpSched,
 	}
 
 	target.AuxResources = map[string]bool{

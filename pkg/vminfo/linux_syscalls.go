@@ -106,6 +106,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_sctp_pair_close":           linuxSctpSupported,
 	"syz_sctp_drive_traffic":        linuxSctpSupported,
 	"syz_sctp_inject_chunk":         linuxSctpSupported,
+	"syz_bpf_struct_ops_load":       linuxSyzBpfStructOpsSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
 	"syz_read_part_table":           linuxSyzReadPartTableSupported,
 	"syz_io_uring_setup":            alwaysSupported,
@@ -337,6 +338,16 @@ func linuxSyzMptcpSupported(ctx *checkContext, call *prog.Syscall) string {
 	// rejects with EPROTONOSUPPORT when it is built without CONFIG_MPTCP.
 	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
 		ctx.val("AF_INET"), ctx.val("SOCK_STREAM"), ctx.val("IPPROTO_MPTCP")))
+}
+
+func linuxSyzBpfStructOpsSupported(ctx *checkContext, call *prog.Syscall) string {
+	// Loading a struct_ops object needs the kernel's own BTF
+	// (CONFIG_DEBUG_INFO_BTF, which implies CONFIG_BPF_SYSCALL): kfunc and
+	// struct_ops value-type ids are resolved against /sys/kernel/btf/vmlinux
+	// at load time.  Whether the surface itself is present (mptcp_sched_ops
+	// exists only in the mptcp/export tree) is learnt from the load's errno,
+	// not probed here.
+	return ctx.rootCanOpen("/sys/kernel/btf/vmlinux")
 }
 
 func linuxPkeysSupported(ctx *checkContext, call *prog.Syscall) string {
