@@ -1,0 +1,121 @@
+From cf10728ea9f7a1e8c1ed1391a71ebf141dd58f53 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Thu, 18 Jun 2026 19:20:20 +0530
+Subject: [PATCH 2/5] mptcp: annotate MP_JOIN/ADD_ADDR validation gates with
+ kcov
+
+Bracket the receive-softirq validation gates -- MP_JOIN token lookup, SYN-ACK thmac, third-ACK hmac, ADD_ADDR HMAC, and the incoming option parser -- with the mptcp_kcov_remote_start()/_stop() helpers, so a coverage-guided fuzzer driving these paths gets coverage attributed to the task that opened the socket.
+
+The annotations fire only in softirq: the same gates also run in process context while the socket backlog is drained from a syscall, where per-task kcov already records them and opening a remote section would trip kcov_remote_start()'s "started twice" warning.
+
+Follows the remote-coverage pattern already used by net/mac80211, net/bluetooth and net/nfc. No-op under CONFIG_KCOV=n.
+---
+ net/mptcp/options.c |  8 +++++++-
+ net/mptcp/subflow.c | 16 ++++++++++++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 2bf3686709de1..4a111f0b64e81 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -1179,10 +1179,12 @@ static bool add_addr_hmac_valid(struct mptcp_sock *msk,
+ 				struct mptcp_options_received *mp_opt)
+ {
+ 	u64 hmac = 0;
++	bool valid;
+ 
+ 	if (mp_opt->echo)
+ 		return true;
+ 
++	mptcp_kcov_remote_start(msk);
+ 	hmac = add_addr_generate_hmac(READ_ONCE(msk->remote_key),
+ 				      READ_ONCE(msk->local_key),
+ 				      &mp_opt->addr);
+@@ -1190,7 +1192,9 @@ static bool add_addr_hmac_valid(struct mptcp_sock *msk,
+ 	pr_debug("msk=%p, ahmac=%llu, mp_opt->ahmac=%llu\n",
+ 		 msk, hmac, mp_opt->ahmac);
+ 
+-	return hmac == mp_opt->ahmac;
++	valid = hmac == mp_opt->ahmac;
++	mptcp_kcov_remote_stop(msk);
++	return valid;
+ }
+ 
+ static bool mptcp_over_limit(struct sock *sk, struct sock *ssk,
+@@ -1249,7 +1253,9 @@ bool mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 		return !mptcp_over_limit(subflow->conn, sk, skb);
+ 	}
+ 
++	mptcp_kcov_remote_start(msk);
+ 	mptcp_get_options(skb, &mp_opt);
++	mptcp_kcov_remote_stop(msk);
+ 
+ 	/* The subflow can be in close state only if check_fully_established()
+ 	 * just sent a reset. If so, tell the caller to ignore the current packet.
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 14aa82647c3d1..3e58b3b94c8b7 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -223,7 +223,9 @@ static int subflow_check_req(struct request_sock *req,
+ 		subflow_req->remote_id = mp_opt.join_id;
+ 		subflow_req->token = mp_opt.token;
+ 		subflow_req->remote_nonce = mp_opt.nonce;
++		mptcp_kcov_remote_start(mptcp_sk(listener->conn));
+ 		subflow_req->msk = subflow_token_join_request(req);
++		mptcp_kcov_remote_stop(mptcp_sk(listener->conn));
+ 
+ 		/* Can't fall back to TCP in this case. */
+ 		if (!subflow_req->msk) {
+@@ -243,7 +245,9 @@ static int subflow_check_req(struct request_sock *req,
+ 			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINPORTSYNRX);
+ 		}
+ 
++		mptcp_kcov_remote_start(subflow_req->msk);
+ 		subflow_req_create_thmac(subflow_req);
++		mptcp_kcov_remote_stop(subflow_req->msk);
+ 
+ 		if (unlikely(req->syncookie)) {
+ 			if (!mptcp_can_accept_new_subflow(subflow_req->msk)) {
+@@ -568,6 +572,7 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+ 		mptcp_propagate_state(parent, sk, subflow, &mp_opt);
+ 	} else if (subflow->request_join) {
+ 		u8 hmac[SHA256_DIGEST_SIZE];
++		bool thmac_ok;
+ 
+ 		if (!(mp_opt.suboptions & OPTION_MPTCP_MPJ_SYNACK)) {
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPJOINSYNACKNOMPJOIN);
+@@ -582,7 +587,10 @@ static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+ 			 subflow, mp_opt.thmac, subflow->remote_nonce,
+ 			 subflow->backup);
+ 
+-		if (!subflow_thmac_valid(subflow, mp_opt.thmac)) {
++		mptcp_kcov_remote_start(msk);
++		thmac_ok = subflow_thmac_valid(subflow, mp_opt.thmac);
++		mptcp_kcov_remote_stop(msk);
++		if (!thmac_ok) {
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_JOINSYNACKMAC);
+ 			subflow->reset_reason = MPTCP_RST_EMPTCP;
+ 			goto do_reset;
+@@ -818,6 +826,7 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 	struct mptcp_subflow_request_sock *subflow_req;
+ 	struct mptcp_options_received mp_opt;
+ 	bool fallback, fallback_is_fatal;
++	bool hmac_ok;
+ 	enum sk_rst_reason reason;
+ 	struct mptcp_sock *owner;
+ 	struct sock *child;
+@@ -914,7 +923,10 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 				goto dispose_child;
+ 			}
+ 
+-			if (!subflow_hmac_valid(subflow_req, &mp_opt)) {
++			mptcp_kcov_remote_start(owner);
++			hmac_ok = subflow_hmac_valid(subflow_req, &mp_opt);
++			mptcp_kcov_remote_stop(owner);
++			if (!hmac_ok) {
+ 				SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKMAC);
+ 				subflow_add_reset_reason(skb, MPTCP_RST_EMPTCP);
+ 				goto dispose_child;
+-- 
+2.34.1
+

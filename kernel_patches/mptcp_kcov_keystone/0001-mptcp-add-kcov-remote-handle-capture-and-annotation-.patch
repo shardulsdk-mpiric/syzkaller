@@ -1,0 +1,115 @@
+From 3091dd9d6cd6e1b1e8401716eaeb70053b2ecb34 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Thu, 18 Jun 2026 19:20:19 +0530
+Subject: [PATCH 1/5] mptcp: add kcov remote handle capture and annotation
+ helpers
+
+MP_JOIN and MPTCP option processing run in the receive softirq, where kcov's per-task mode records nothing: in softirq the current task is whatever was interrupted, not the process driving the connection, so the covered PCs are attributed to no kcov area. kcov solves this with remote coverage, but the softirq side needs a handle to attribute coverage to, and kcov_common_handle() returns 0 outside task context.
+
+Capture the creating task's common handle in __mptcp_init_sock(), which runs in the task that opened the socket, and store it on the msk; accepted (child) msks inherit it via the sk_clone_lock() copy. Add mptcp_kcov_remote_start()/_stop() helpers that open a remote coverage section using that handle, restricted to softirq context. The handle is zero when the creating task had no remote coverage enabled, making the helpers no-ops; they are also no-ops under CONFIG_KCOV=n.
+
+Carry the handle on the socket rather than the skb (as mac80211/Bluetooth/NFC do) because the MP_JOIN handshake segments are cloned on transmit and regenerated in softirq, and neither path retains the originating task's skb->kcov_handle. No new uAPI and no change to the kcov core.
+---
+ net/mptcp/protocol.c | 10 ++++++++++
+ net/mptcp/protocol.h | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 09779428e9ea8..17468d145cf41 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -12,6 +12,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/atomic.h>
+ #include <linux/errqueue.h>
++#include <linux/kcov.h>
+ #include <net/aligned_data.h>
+ #include <net/rps.h>
+ #include <net/sock.h>
+@@ -3243,6 +3244,15 @@ static void __mptcp_init_sock(struct sock *sk)
+ 	mptcp_pm_data_init(msk);
+ 	spin_lock_init(&msk->fallback_lock);
+ 
++#ifdef CONFIG_KCOV
++	/* Capture the creating task's kcov remote handle so receive-softirq
++	 * MP_JOIN/option processing can be attributed back to it.  Returns 0
++	 * outside task context or when the task has no remote coverage
++	 * enabled; accepted msks inherit this via sk_clone_lock().
++	 */
++	msk->kcov_handle = kcov_common_handle();
++#endif
++
+ 	/* re-use the csk retrans timer for MPTCP-level retrans */
+ 	timer_setup(&sk->mptcp_retransmit_timer, mptcp_retransmit_timer, 0);
+ 	timer_setup(&msk->sk.mptcp_tout_timer, mptcp_tout_timer, 0);
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 4bf04f9ecbd9d..da7b1eb892d9f 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -13,6 +13,7 @@
+ #include <uapi/linux/mptcp.h>
+ #include <net/genetlink.h>
+ #include <net/rstreason.h>
++#include <linux/kcov.h>
+ 
+ #define MPTCP_SUPPORTED_VERSION	1
+ 
+@@ -393,6 +394,16 @@ struct mptcp_sock {
+ 	struct list_head backlog_list;	/* protected by the data lock */
+ 	u32		backlog_len;
+ 	u32		backlog_unaccounted;
++#ifdef CONFIG_KCOV
++	/* kcov remote coverage handle, captured from the creating task in
++	 * __mptcp_init_sock() and inherited by accepted (child) msks via
++	 * sk_clone_lock().  Lets MP_JOIN and option processing that runs in
++	 * the receive softirq be attributed to the task that opened the
++	 * socket.  Zero when the creating task had no kcov remote coverage
++	 * enabled, in which case the receive-path annotations are no-ops.
++	 */
++	u64		kcov_handle;
++#endif
+ };
+ 
+ #define mptcp_data_lock(sk) spin_lock_bh(&(sk)->sk_lock.slock)
+@@ -412,6 +423,38 @@ static inline void msk_owned_by_me(const struct mptcp_sock *msk)
+ 	sock_owned_by_me((const struct sock *)msk);
+ }
+ 
++/* Bracket an MP_JOIN/ADD_ADDR cryptographic validation call that runs in
++ * the receive softirq so the coverage it executes is attributed to the
++ * task that created the socket, via msk->kcov_handle (captured in
++ * __mptcp_init_sock()).  Use as a balanced start/stop pair around a single
++ * validator call; see net/mac80211/rx.c for the equivalent skb-carried
++ * pattern.
++ *
++ * Restricted to softirq on purpose: the same validators also run in
++ * process context while the socket backlog is drained from a syscall,
++ * where the task's own per-task kcov already records them.  Opening a
++ * remote section there would double-count and trip kcov_remote_start()'s
++ * "started twice in task" warning.  A zero handle (no remote coverage
++ * enabled) makes kcov_remote_start_common() a lookup miss, i.e. a no-op,
++ * and the matching stop is likewise a no-op, so the pair stays balanced.
++ */
++#ifdef CONFIG_KCOV
++static inline void mptcp_kcov_remote_start(const struct mptcp_sock *msk)
++{
++	if (msk && in_serving_softirq())
++		kcov_remote_start_common(msk->kcov_handle);
++}
++
++static inline void mptcp_kcov_remote_stop(const struct mptcp_sock *msk)
++{
++	if (msk && in_serving_softirq())
++		kcov_remote_stop();
++}
++#else
++static inline void mptcp_kcov_remote_start(const struct mptcp_sock *msk) { }
++static inline void mptcp_kcov_remote_stop(const struct mptcp_sock *msk) { }
++#endif
++
+ #ifdef CONFIG_DEBUG_NET
+ /* MPTCP-specific: we might (indirectly) call this helper with the wrong sk */
+ #undef tcp_sk
+-- 
+2.34.1
+
