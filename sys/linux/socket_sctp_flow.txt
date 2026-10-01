@@ -1,0 +1,63 @@
+# Copyright 2026 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
+# SCTP (RFC 9260) protocol-flow harness -- increment 1.
+#
+# syz_sctp_pair_init() establishes a real SCTP association on loopback
+# (client connect() + server accept(), both SOCK_STREAM / IPPROTO_SCTP);
+# the kernel runs the full 4-way INIT/COOKIE handshake itself, so the
+# cookie-HMAC gate is satisfied for real with no userspace crypto. The
+# association is threaded through a resource so later calls have a genuine
+# dependency edge on it -- see docs/pseudo_syscalls.md.
+#
+# syz_sctp_pair_close() is the consuming edge: closes the fds, frees the slot.
+#
+# syz_sctp_drive_traffic() sctp_sendmsg()s on the association, reaching the
+# DATA / reassembly path.
+#
+# syz_sctp_inject_chunk() is the edge (M-CARRY): it crafts a full SCTP packet
+# (common header + one attacker-shaped chunk) stamping a chosen vtag + a
+# recomputed CRC32c and injects it via a raw IPPROTO_SCTP socket toward the
+# server. With vtag_mode=CAPTURED the kernel's sctp_vtag_verify passes and the
+# chunk reaches its handler; ZERO/WRONG are negative controls. The vtag is
+# sniffed off the wire during pair_init (SCTP_INIT_CAPTURE_VTAG) because it is
+# not exposed by any getsockopt.
+#
+# Increment 1 scope: NORMAL establish + vtag capture + M-CARRY inject + data
+# drive, on any stock CONFIG_IP_SCTP kernel. No NFQUEUE egress mutation
+# (M-WIRE), no feature-sockopt init flags, no kernel-side kcov -- increment 2.
+#
+# Executor side: executor/common_linux_sctp.h.
+
+# Invalid default (0xff..ff -> -1 as the executor's long slot index, which its
+# `slot < 0` guard rejects): a defaulted/orphaned handle must NOT alias live
+# pool slot 0. Handles are real pool indices produced only by pair_init.
+resource sctp_assoc[intptr]: 0xffffffffffffffff
+
+# SCTP_INIT_CAPTURE_VTAG: open an AF_PACKET loopback sniffer during the
+# handshake and store both directions' init_tag (Vs/Vc) on the slot, so
+# syz_sctp_inject_chunk can stamp the captured tag. Harness-only constant (no
+# kernel header defines it): give syz-extract the value here so `make extract`
+# stays reproducible instead of failing "defined for none of the arches". Must
+# match the executor #define + the .const.
+define SCTP_INIT_CAPTURE_VTAG	1
+sctp_init_flags = SCTP_INIT_CAPTURE_VTAG
+
+# vtag_mode for syz_sctp_inject_chunk. CAPTURED echoes the server's captured
+# tag (passes sctp_vtag_verify); ZERO and WRONG are negative controls the gate
+# rejects. Harness-only constants, mirrored as executor #defines; must stay in
+# sync with the .const.
+define SCTP_VTAG_CAPTURED	0
+define SCTP_VTAG_ZERO	1
+define SCTP_VTAG_WRONG	2
+sctp_vtag_modes = SCTP_VTAG_CAPTURED, SCTP_VTAG_ZERO, SCTP_VTAG_WRONG
+
+syz_sctp_pair_init(flags flags[sctp_init_flags]) sctp_assoc (remote_cover)
+syz_sctp_pair_close(assoc sctp_assoc)
+syz_sctp_drive_traffic(assoc sctp_assoc, data ptr[in, array[int8]], data_len len[data]) (remote_cover)
+
+# chunk_type: the SCTP chunk type byte the crafted chunk carries (fuzzer-mutated
+# across the DATA/SACK/RECONF/FORWARD-TSN/... surface). chunk_payload: the
+# chunk value bytes. vtag_mode selects the verification tag stamped on the
+# common header.
+syz_sctp_inject_chunk(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode flags[sctp_vtag_modes]) (remote_cover)

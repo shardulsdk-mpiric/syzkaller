@@ -3391,6 +3391,19 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 #include "common_linux_mptcp.h"
 #endif
 
+// /dev/uhid content-aware GET_REPORT/SET_REPORT responder (see
+// executor/common_linux_uhid.h).
+#if SYZ_EXECUTOR || __NR_syz_uhid_create_responder || __NR_syz_uhid_destroy_responder
+#include "common_linux_uhid.h"
+#endif
+
+// SCTP association pair + vtag-capture + chunk-inject pseudo-syscalls (see
+// executor/common_linux_sctp.h).
+#if SYZ_EXECUTOR || __NR_syz_sctp_pair_init || __NR_syz_sctp_pair_close || \
+    __NR_syz_sctp_drive_traffic || __NR_syz_sctp_inject_chunk
+#include "common_linux_sctp.h"
+#endif
+
 #if SYZ_EXECUTOR || __NR_syz_mount_image || __NR_syz_read_part_table
 #include "common_zlib.h"
 #include <errno.h>

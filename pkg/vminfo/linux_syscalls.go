@@ -98,7 +98,14 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_mptcp_join_close_race":     linuxSyzMptcpSupported,
 	"syz_mptcp_close_server":        linuxSyzMptcpSupported,
 	"syz_mptcp_disconnect":          linuxSyzMptcpSupported,
+	"syz_mptcp_listener_close_race": linuxSyzMptcpSupported,
 	"syz_mptcp_drive_traffic":       linuxSyzMptcpSupported,
+	"syz_uhid_create_responder":     linuxUhidResponderSupported,
+	"syz_uhid_destroy_responder":    linuxUhidResponderSupported,
+	"syz_sctp_pair_init":            linuxSctpSupported,
+	"syz_sctp_pair_close":           linuxSctpSupported,
+	"syz_sctp_drive_traffic":        linuxSctpSupported,
+	"syz_sctp_inject_chunk":         linuxSctpSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
 	"syz_read_part_table":           linuxSyzReadPartTableSupported,
 	"syz_io_uring_setup":            alwaysSupported,
@@ -342,6 +349,23 @@ func linuxSyzSocketConnectNvmeTCPSupported(ctx *checkContext, call *prog.Syscall
 
 func linuxVhciInjectionSupported(ctx *checkContext, call *prog.Syscall) string {
 	return ctx.rootCanOpen("/dev/vhci")
+}
+
+func linuxUhidResponderSupported(ctx *checkContext, call *prog.Syscall) string {
+	return ctx.rootCanOpen("/dev/uhid")
+}
+
+func linuxSctpSupported(ctx *checkContext, call *prog.Syscall) string {
+	// inject_chunk opens a raw IPPROTO_SCTP socket and pair_init opens an
+	// AF_PACKET loopback sniffer -- both need CAP_NET_RAW, which the setuid
+	// sandbox drops after its netns unshare, so restrict to none/namespace.
+	if reason := ctx.onlySandboxNoneOrNamespace(); reason != "" {
+		return reason
+	}
+	// The pseudo-syscalls create IPPROTO_SCTP sockets, which the kernel
+	// rejects with EPROTONOSUPPORT when built without CONFIG_IP_SCTP.
+	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
+		ctx.val("AF_INET"), ctx.val("SOCK_STREAM"), ctx.val("IPPROTO_SCTP")))
 }
 
 func linuxSyzInitNetSocketSupported(ctx *checkContext, call *prog.Syscall) string {

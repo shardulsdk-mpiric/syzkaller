@@ -85,6 +85,15 @@ syz_mptcp_close_server(pair mptcp_pair) (remote_cover)
 # the close path.
 syz_mptcp_disconnect(pair mptcp_pair) (remote_cover)
 
+# Lifecycle verb (design §9d): listener-close / accept-vs-worker race. Self-contained
+# (no pair resource) -- opens a fresh MPTCP listener, completes n_unaccepted MP_CAPABLE
+# handshakes WITHOUT accept()ing them (they queue as unaccepted msks), sends a byte on
+# each to schedule the msk worker, then closes the listener so inet_csk_listen_stop ->
+# inet_child_forget frees the unaccepted children, racing the worker / softirq token
+# lookup. Targets the unaccepted-teardown UAF class (0a3f4f1f / b6985b9b / 6aeed904).
+# KASAN is the oracle.
+syz_mptcp_listener_close_race(n_unaccepted int8[1:8]) (remote_cover)
+
 # MPTCP_INIT_RWND_CLAMP: pin the server receive window small (SO_RCVBUF)
 # so a syz_mptcp_drive_traffic burst cannot flush inline -- the backlog is
 # pushed later from the ACK-driven softirq path (__mptcp_check_push ->
