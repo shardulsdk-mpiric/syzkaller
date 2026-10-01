@@ -49,6 +49,10 @@ type Config struct {
 	ModuleObj []string `json:"module_obj,omitempty"`
 	// Kernel source directory (if not set defaults to KernelObj).
 	KernelSrc string `json:"kernel_src,omitempty"`
+	// Pre-dumped vmlinux.h (bpftool btf dump file vmlinux format c) of the target kernel,
+	// used by the BPF struct_ops carrier (syz_bpf_struct_ops_load) to compile generated
+	// struct_ops programs host-side. Optional: by default it is dumped from <kernel_obj>/vmlinux.
+	StructOpsVmlinuxH string `json:"struct_ops_vmlinux_h,omitempty"`
 	// Location of the driectory where the kernel was built (if not set defaults to KernelSrc)
 	KernelBuildSrc string `json:"kernel_build_src,omitempty"`
 	// Is the kernel built separately from the modules? (Specific to Android builds)

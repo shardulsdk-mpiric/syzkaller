@@ -1,0 +1,126 @@
+// Copyright 2026 syzkaller project authors. All rights reserved.
+// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
+package structops
+
+import (
+	"math/rand"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestCompileRecipe runs the real host compile step (clang + llvm-strip +
+// bpftool against a kernel build's vmlinux) over a seed range of both
+// surfaces and checks the recipe each object digests to.  It needs a
+// target kernel build, named by SYZ_STRUCTOPS_KERNEL_OBJ (a directory
+// holding vmlinux built with CONFIG_DEBUG_INFO_BTF), and skips otherwise.
+func TestCompileRecipe(t *testing.T) {
+	kobj := os.Getenv("SYZ_STRUCTOPS_KERNEL_OBJ")
+	if kobj == "" {
+		t.Skip("SYZ_STRUCTOPS_KERNEL_OBJ not set")
+	}
+	for _, tool := range []string{"clang", "llvm-strip", "bpftool"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%v not in PATH", tool)
+		}
+	}
+	Configure(CompileConfig{KernelObj: kobj, CacheDir: t.TempDir()})
+	const seeds = 8
+	for _, surf := range []*Surface{TCPCong, MptcpSched} {
+		t.Run(surf.Tag(), func(t *testing.T) {
+			start := time.Now()
+			for seed := int64(0); seed < seeds; seed++ {
+				p := Generate(rand.New(rand.NewSource(seed)), surf)
+				src := p.Render()
+				blob, err := Compile(src)
+				if err != nil {
+					t.Fatalf("seed %d: %v", seed, err)
+				}
+				if !IsRecipe(blob) {
+					t.Fatalf("seed %d: not a recipe", seed)
+				}
+				r, err := ParseRecipe(blob)
+				if err != nil {
+					t.Fatalf("seed %d: %v", seed, err)
+				}
+				checkRecipe(t, p, surf, r, src)
+				// The cache must serve the same bytes back.
+				again, err := Compile(src)
+				if err != nil || string(again) != string(blob) {
+					t.Fatalf("seed %d: cache miss/mismatch: %v", seed, err)
+				}
+			}
+			st := Stats()
+			t.Logf("%s: %d seeds compiled in %v, %.0f ms/compile",
+				surf.Tag(), seeds, time.Since(start), float64(time.Since(start).Milliseconds())/seeds)
+			if st.Failed != 0 {
+				t.Errorf("failed compiles: %d", st.Failed)
+			}
+		})
+	}
+}
+
+func checkRecipe(t *testing.T, p *Prog, surf *Surface, r *Recipe, src string) {
+	t.Helper()
+	wantStruct := strings.TrimPrefix(surf.instanceStruct, "struct ")
+	if r.StructName != wantStruct {
+		t.Errorf("struct name %q, want %q", r.StructName, wantStruct)
+	}
+	if r.Link != (surf.linkSection == ".struct_ops.link") {
+		t.Errorf("link flag %v for section %q", r.Link, surf.linkSection)
+	}
+	if len(r.BTF) < 24 {
+		t.Errorf("BTF too small: %d", len(r.BTF))
+	}
+	b, err := parseBTF(r.BTF)
+	if err != nil {
+		t.Fatalf("recipe BTF: %v", err)
+	}
+	for id := 1; id < b.numTypes(); id++ {
+		pos := b.offs[id]
+		kind, vlen := b.kindVlen(pos)
+		if kind == btfKindFunc && vlen == btfFuncExtern {
+			t.Errorf("BTF FUNC %s still extern", b.typeName(uint32(id)))
+		}
+		if kind == btfKindDatasec && b.typeSizeOrType(uint32(id)) == 0 {
+			t.Errorf("BTF DATASEC %s has size 0", b.typeName(uint32(id)))
+		}
+	}
+	// One prog per rendered callback, filling the member its suffix names.
+	if len(r.Progs) != len(p.Callbacks) {
+		t.Fatalf("%d progs, want %d", len(r.Progs), len(p.Callbacks))
+	}
+	byMember := map[string]RecipeProg{}
+	for _, pr := range r.Progs {
+		byMember[pr.Member] = pr
+		if pr.Name != p.SchedName+"_"+pr.Member {
+			t.Errorf("prog %s fills member %s", pr.Name, pr.Member)
+		}
+		if len(pr.Insns) == 0 || len(pr.Insns)%bpfInsnSize != 0 {
+			t.Errorf("prog %s: %d insn bytes", pr.Name, len(pr.Insns))
+		}
+		if b.typeKind(pr.FuncTypeID) != btfKindFunc || b.typeName(pr.FuncTypeID) != pr.Name {
+			t.Errorf("prog %s: func_type_id %d is not its FUNC", pr.Name, pr.FuncTypeID)
+		}
+		for _, k := range pr.Kfuncs {
+			if int(k.InsnIdx)*bpfInsnSize >= len(pr.Insns) {
+				t.Errorf("prog %s: kfunc %s at insn %d out of range", pr.Name, k.Name, k.InsnIdx)
+			}
+			// Each call site is a BPF_JMP|BPF_CALL (0x85) with imm -1.
+			if pr.Insns[k.InsnIdx*bpfInsnSize] != 0x85 {
+				t.Errorf("prog %s: kfunc %s site is not a call insn", pr.Name, k.Name)
+			}
+			if !strings.Contains(src, "extern") || !strings.Contains(src, k.Name+"(") {
+				t.Errorf("prog %s: kfunc %s not declared in source", pr.Name, k.Name)
+			}
+		}
+	}
+	for _, cb := range p.Callbacks {
+		if _, ok := byMember[cb.Suffix[1:]]; !ok {
+			t.Errorf("callback %s has no prog", cb.Suffix)
+		}
+	}
+}
