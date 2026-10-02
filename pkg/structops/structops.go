@@ -46,12 +46,30 @@
 // its own model and its own renderer.
 //
 // Scope (Stage C-minimal): the `get_send` callback is a FIXED kfunc
-// prologue/epilogue skeleton (`bpf_mptcp_subflow_ctx` ->
+// prologue/epilogue skeleton (fetch the first subflow ->
 // `mptcp_subflow_set_scheduled`) wrapped around a BRF-generated body of
 // context reads, context *writes*, and arithmetic.  The two writable
 // fields are exactly those accepted by `bpf_mptcp_sched_btf_struct_access`
 // in net/mptcp/bpf.c: `struct mptcp_sock.snd_burst` and
 // `struct mptcp_subflow_context.avg_pacing_rate`.
+//
+// Re-pin (2026-10, kernel 7.3-rc / mptcp/export): the prologue originally
+// derived the subflow as `bpf_mptcp_subflow_ctx(msk->first)`, and
+// `msk->first` was a pool value usable as a kfunc argument.  The current
+// verifier rejects that: a pointer loaded by walking a trusted ctx pointer
+// is NOT trusted, and every `KF_ARG_PTR_TO_BTF_ID` kfunc argument must be
+// ("R1 must be referenced or trusted", check_kfunc_args).  The prologue
+// now fetches the first subflow through the open-coded subflow iterator
+// (`bpf_iter_mptcp_subflow_new/next/destroy`, the idiom of the kernel's
+// own tools/testing/selftests/bpf/progs/mptcp_bpf_first.c) -- an
+// iterator-returned pointer is PTR_TRUSTED, and stays so after the
+// iterator is destroyed (mptcp_bpf_burst.c schedules a subflow saved from
+// a finished bpf_for_each).  The `struct sock *` pool value is the
+// trusted cast `(struct sock *)msk` (what mptcp_bpf_burst.c passes to
+// mptcp_set_timeout), never `msk->first`.  The kfunc table was refreshed
+// to the kernel's current `bpf_mptcp_common_kfunc_ids`
+// (bpf_mptcp_subflow_queues_empty is gone; bpf_sk_stream_memory_free now
+// takes the subflow context).
 //
 // Scope (Stage C-full, Stage 1): the generated body additionally emits
 // straight-line, contract-aware calls to six more common MPTCP kfuncs
@@ -164,27 +182,37 @@ func (kf *Kfunc) needsNullGuard() bool {
 	return kf.IsPtrRet && kf.RetNull
 }
 
-// mptcpSchedKfuncs are the kfuncs the get_send body may use.
-// net/mptcp/bpf.c registers MPTCP kfuncs via `bpf_mptcp_common_kfunc_ids`
-// and `bpf_mptcp_iter_kfunc_ids`.  Modelled here:
+// mptcpSchedKfuncs are the kfuncs the generated bodies may call: the
+// kernel's CURRENT `bpf_mptcp_common_kfunc_ids` set (net/mptcp/bpf.c),
+// in registration order.  Of these, `mptcp_subflow_set_scheduled` is the
+// FIXED epilogue's kfunc (rendered by the surface, never generated); the
+// other six are what the Stage C-full Stage 1 call generator draws on.
 //
-//   - the two the FIXED prologue/epilogue needs
-//     (`bpf_mptcp_subflow_ctx`, `mptcp_subflow_set_scheduled`);
-//   - the six straight-line common kfuncs the Stage C-full Stage 1
-//     call generator draws on.
+// The three `bpf_iter_mptcp_subflow_*` iterator kfuncs
+// (`bpf_mptcp_iter_kfunc_ids`) are modelled separately
+// (`mptcpSubflowIterKfuncs`) -- they are not callable individually by the
+// kfunc-call generator; the renderer emits the verifier-required
+// `new -> next* -> destroy` triple as one atomic unit (the fixed get_send
+// prologue, and every generated StmtSubflowIter).
 //
-// The three `bpf_iter_mptcp_subflow_*` iterator kfuncs are modelled
-// separately (`mptcpSubflowIterKfuncs`) -- they are not callable
-// individually by the kfunc-call generator; the renderer emits the
-// verifier-required `new -> next* -> destroy` triple as one atomic unit.
-//
-// Deliberately EXCLUDED: `mptcp_pm_subflow_chk_stale` (KF_SLEEPABLE --
-// not callable from the non-sleepable `get_send`).
+// No longer in the kernel's set (and so dropped here):
+// `bpf_mptcp_subflow_queues_empty` (unresolvable kfunc -> load failure)
+// and `mptcp_pm_subflow_chk_stale`.
 //
 // Signatures are transcribed verbatim from net/mptcp/bpf.c (the
-// `__bpf_kfunc` definitions) and net/mptcp/protocol.h.
+// `__bpf_kfunc` definitions) and net/mptcp/protocol.h.  Every pointer
+// parameter must receive a TRUSTED pointer (check_kfunc_args): the ctx
+// `msk`, its cast `(struct sock *)msk`, the prologue / iterator `subflow`,
+// or a kfunc-returned (hence implicitly trusted) pointer.
 var mptcpSchedKfuncs = []Kfunc{
 	{
+		// __bpf_kfunc struct mptcp_subflow_context *
+		// bpf_mptcp_subflow_ctx(const struct sock *sk)
+		// Returns NULL unless sk is an MPTCP subflow's tcp_sock -- so
+		// on `(struct sock *)msk` it yields NULL and the guard returns
+		// -1 (a legal "nothing to schedule" path); on a
+		// bpf_mptcp_subflow_tcp_sock result it round-trips to the
+		// subflow context.
 		Name: "bpf_mptcp_subflow_ctx",
 		CDecl: "extern struct mptcp_subflow_context *\n" +
 			"bpf_mptcp_subflow_ctx(const struct sock *sk) __ksym;",
@@ -192,14 +220,6 @@ var mptcpSchedKfuncs = []Kfunc{
 		ArgTypes: []string{"const struct sock *"},
 		IsPtrRet: true,
 		RetNull:  true, // BTF_ID_FLAGS(..., KF_RET_NULL)
-	},
-	{
-		Name: "mptcp_subflow_set_scheduled",
-		CDecl: "extern void\n" +
-			"mptcp_subflow_set_scheduled(struct mptcp_subflow_context *subflow,\n" +
-			"\t\t\t    bool scheduled) __ksym;",
-		RetType:  "", // void
-		ArgTypes: []string{"struct mptcp_subflow_context *", "bool"},
 	},
 	{
 		// __bpf_kfunc struct sock *
@@ -213,25 +233,12 @@ var mptcpSchedKfuncs = []Kfunc{
 		RetNull:  true, // BTF_ID_FLAGS(..., KF_RET_NULL)
 	},
 	{
-		// __bpf_kfunc bool bpf_sk_stream_memory_free(const struct sock *sk)
-		// Registered KF_RET_NULL, but the return is a scalar (bool), so
-		// no NULL-guard is required -- KF_RET_NULL on a scalar return
-		// only means the value may be 0.
-		Name: "bpf_sk_stream_memory_free",
-		CDecl: "extern bool\n" +
-			"bpf_sk_stream_memory_free(const struct sock *sk) __ksym;",
-		RetType:  "bool",
-		ArgTypes: []string{"const struct sock *"},
-		IsPtrRet: false,
-		RetNull:  true, // KF_RET_NULL, but scalar -> no guard (see needsNullGuard)
-	},
-	{
-		// __bpf_kfunc bool bpf_mptcp_subflow_queues_empty(struct sock *sk)
-		Name: "bpf_mptcp_subflow_queues_empty",
-		CDecl: "extern bool\n" +
-			"bpf_mptcp_subflow_queues_empty(struct sock *sk) __ksym;",
-		RetType:  "bool",
-		ArgTypes: []string{"struct sock *"},
+		Name: "mptcp_subflow_set_scheduled",
+		CDecl: "extern void\n" +
+			"mptcp_subflow_set_scheduled(struct mptcp_subflow_context *subflow,\n" +
+			"\t\t\t    bool scheduled) __ksym;",
+		RetType:  "", // void
+		ArgTypes: []string{"struct mptcp_subflow_context *", "bool"},
 	},
 	{
 		// bool mptcp_subflow_active(struct mptcp_subflow_context *subflow);
@@ -242,7 +249,8 @@ var mptcpSchedKfuncs = []Kfunc{
 		ArgTypes: []string{"struct mptcp_subflow_context *"},
 	},
 	{
-		// void mptcp_set_timeout(struct sock *sk);
+		// void mptcp_set_timeout(struct sock *sk);  -- sk is the MPTCP
+		// socket itself (the kernel's bpf_burst passes (struct sock *)msk).
 		Name: "mptcp_set_timeout",
 		CDecl: "extern void\n" +
 			"mptcp_set_timeout(struct sock *sk) __ksym;",
@@ -256,6 +264,18 @@ var mptcpSchedKfuncs = []Kfunc{
 			"mptcp_wnd_end(const struct mptcp_sock *msk) __ksym;",
 		RetType:  "__u64",
 		ArgTypes: []string{"const struct mptcp_sock *"},
+	},
+	{
+		// __bpf_kfunc bool
+		// bpf_sk_stream_memory_free(const struct mptcp_subflow_context *subflow)
+		// (takes the subflow context now, not `const struct sock *`; no
+		// longer flagged KF_RET_NULL -- a scalar return never needed a
+		// guard anyway).
+		Name: "bpf_sk_stream_memory_free",
+		CDecl: "extern bool\n" +
+			"bpf_sk_stream_memory_free(const struct mptcp_subflow_context *subflow) __ksym;",
+		RetType:  "bool",
+		ArgTypes: []string{"const struct mptcp_subflow_context *"},
 	},
 }
 
@@ -486,7 +506,7 @@ type Stmt struct {
 	KfuncIdx int
 	// KfuncArgs are the C expressions passed as arguments to the
 	// kfunc -- valid for KfuncCall.  Each is a typed, in-scope value
-	// (`msk`, `msk->first`, `subflow`, or an earlier local).
+	// (`msk`, `(struct sock *)msk`, `subflow`, or an earlier local).
 	KfuncArgs []string
 	// NullGuard is true when this KfuncCall's pointer result is
 	// KF_RET_NULL and the renderer must emit the mandatory
@@ -684,13 +704,22 @@ func normalizeCType(t string) string {
 
 // typedVal is one value in scope inside the generated get_send body: a
 // C expression and its (normalized) C type.  The pool starts with the
-// three fixed values -- `msk`, `msk->first`, `subflow` -- and grows
-// with every ctx-read local, arithmetic local, and (Stage 1) typed
-// kfunc-call result local.
+// three fixed values -- `msk`, `(struct sock *)msk`, `subflow` -- and
+// grows with every ctx-read local, arithmetic local, and (Stage 1) typed
+// kfunc-call result local.  Every pointer in the pool is TRUSTED in the
+// verifier's sense (ctx, a cast of ctx, an iterator element, or a kfunc
+// result), which is what lets any of them be a kfunc argument; a pointer
+// loaded by walking a struct (e.g. `msk->first`) is not, and is never
+// pooled.
 type typedVal struct {
-	expr  string // C expression, e.g. "msk", "msk->first", "s3"
+	expr  string // C expression, e.g. "msk", "(struct sock *)msk", "s3"
 	ctype string // normalized C type, e.g. "struct sock *"
 }
+
+// mskSockExpr is the `struct sock *` view of the MPTCP socket -- the
+// trusted cast of the ctx pointer, as the kernel's own bpf_burst
+// scheduler passes it to mptcp_set_timeout / bpf_for_each.
+const mskSockExpr = "(struct sock *)msk"
 
 // scalarCType reports whether a C type is a usable arithmetic scalar
 // (an integer-like value an Arith statement may operate on).  Pointer
@@ -860,8 +889,8 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 	pool := append([]typedVal(nil), sc.pool...)
 
 	// callableKfuncs returns the indices of kfuncs whose every
-	// argument type is satisfiable from the current pool.  The two
-	// fixed-skeleton kfuncs (bpf_mptcp_subflow_ctx,
+	// argument type is satisfiable from the current pool.  The
+	// surface's fixed-skeleton kfuncs (MPTCP:
 	// mptcp_subflow_set_scheduled) are excluded from generation -- the
 	// renderer emits those itself as the fixed prologue/epilogue.
 	// When sc.noReturn is set, a KF_RET_NULL-pointer kfunc is excluded
@@ -1168,13 +1197,13 @@ func genSubflowIter(r *randGen, sop *Prog, varId *int) Stmt {
 	sfVar := fmt.Sprintf("sf%d", id)
 
 	// The loop body sees `sfN` (the per-iteration subflow) plus the
-	// callback's `msk` and `msk->first`.  Writes are confined to the
-	// subflow field re-based onto `sfN`; reading/writing msk->snd_burst
-	// is also valid inside the loop.
+	// callback's `msk` and its `(struct sock *)` cast.  Writes are
+	// confined to the subflow field re-based onto `sfN`; reading/writing
+	// msk->snd_burst is also valid inside the loop.
 	loopScope := bodyScope{
 		pool: []typedVal{
 			{expr: "msk", ctype: "struct mptcp_sock *"},
-			{expr: "msk->first", ctype: "struct sock *"},
+			{expr: mskSockExpr, ctype: "struct sock *"},
 			{expr: sfVar, ctype: "struct mptcp_subflow_context *"},
 		},
 		writeFields: []ctxWriteField{
@@ -1254,6 +1283,11 @@ type Surface struct {
 	// iterator kfunc set for this surface.
 	kfuncs     []Kfunc
 	iterKfuncs []Kfunc
+	// iterInPrologue is true when a callback's FIXED prologue text itself
+	// calls the iterator kfuncs (MPTCP get_send fetches its subflow
+	// through the iterator), so their externs are always rendered -- not
+	// only when a generated StmtSubflowIter uses them.
+	iterInPrologue bool
 	// writeFields is the writable ctx surface for this struct_ops type.
 	writeFields []CtxField
 	// prologueKfuncNames are the kfuncs the renderer emits ITSELF as part
@@ -1304,10 +1338,21 @@ func (surf *Surface) resolveWriteFields() []ctxWriteField {
 	return out
 }
 
-// MptcpSched reproduces TODAY'S MPTCP rendering exactly.  The
-// callbacks are listed in GENERATION order (get_send, init, release --
-// which fixes the random-draw sequence) and RENDERED in renderOrder
-// (init, release, get_send -- which fixes the text).
+// MptcpSched is the MPTCP `mptcp_sched_ops` surface.  The callbacks are
+// listed in GENERATION order (get_send, init, release -- which fixes the
+// random-draw sequence) and RENDERED in renderOrder (init, release,
+// get_send -- which fixes the text).
+//
+// The get_send prologue fetches the FIRST subflow through the open-coded
+// subflow iterator and closes the iterator at once -- the one-element
+// form of the kernel selftest's `bpf_for_each(mptcp_subflow, subflow,
+// (struct sock *)msk)` (tools/testing/selftests/bpf/progs/mptcp_bpf_first.c).
+// `_next` returns a trusted pointer that does not depend on the iterator
+// staying open, so destroying before the generated body is what keeps
+// the body's own `return -1` NULL-guards legal (a `return` past a live
+// iterator is a verifier reject for an unreleased iterator).  The
+// epilogue schedules that subflow, so get_send always schedules >= 1
+// subflow on every fall-through path.
 var MptcpSched = &Surface{
 	tag:            "mptcp_sched",
 	instanceStruct: "struct mptcp_sched_ops",
@@ -1319,9 +1364,10 @@ var MptcpSched = &Surface{
 	ctxVar:         "msk",
 	kfuncs:         mptcpSchedKfuncs,
 	iterKfuncs:     mptcpSubflowIterKfuncs,
+	iterInPrologue: true,
 	writeFields:    mptcpSchedWriteFields,
 	prologueKfuncNames: []string{
-		"bpf_mptcp_subflow_ctx", "mptcp_subflow_set_scheduled",
+		"mptcp_subflow_set_scheduled",
 	},
 	kfuncExternComment: "/* MPTCP scheduler kfuncs (net/mptcp/bpf.c). */",
 	iterExternComment:  "/* MPTCP subflow-iterator kfuncs (net/mptcp/bpf.c). */",
@@ -1336,8 +1382,11 @@ var MptcpSched = &Surface{
 		{
 			suffix:  "_get_send",
 			retType: "int",
-			prologue: "\tstruct mptcp_subflow_context *subflow;\n\n" +
-				"\tsubflow = bpf_mptcp_subflow_ctx(msk->first);\n" +
+			prologue: "\tstruct bpf_iter_mptcp_subflow it;\n" +
+				"\tstruct mptcp_subflow_context *subflow;\n\n" +
+				"\tbpf_iter_mptcp_subflow_new(&it, " + mskSockExpr + ");\n" +
+				"\tsubflow = bpf_iter_mptcp_subflow_next(&it);\n" +
+				"\tbpf_iter_mptcp_subflow_destroy(&it);\n" +
 				"\tif (!subflow)\n" +
 				"\t\treturn -1;\n\n",
 			epilogue: "\tmptcp_subflow_set_scheduled(subflow, true);\n" +
@@ -1346,7 +1395,7 @@ var MptcpSched = &Surface{
 				return bodyScope{
 					pool: []typedVal{
 						{expr: "msk", ctype: "struct mptcp_sock *"},
-						{expr: "msk->first", ctype: "struct sock *"},
+						{expr: mskSockExpr, ctype: "struct sock *"},
 						{expr: "subflow", ctype: "struct mptcp_subflow_context *"},
 					},
 					writeFields:  surf.resolveWriteFields(),
@@ -1374,17 +1423,17 @@ var MptcpSched = &Surface{
 }
 
 // mptcpInitReleaseScope is the bodyScope for the MPTCP init / release
-// bodies.  Only `msk` (and the derived `msk->first`) is in scope -- there
-// is no scheduling and no `subflow` prologue -- so the writable surface
-// is just `msk->snd_burst`, the iterator is not allowed, and no write is
-// forced.  noReturn is set: init/release are `void`, so a KF_RET_NULL-
-// pointer guard (`if (!v) return -1;`) would be an invalid return from a
-// void function; such a kfunc is therefore not offered here.
+// bodies.  Only `msk` (and its `(struct sock *)` cast) is in scope --
+// there is no scheduling and no `subflow` prologue -- so the writable
+// surface is just `msk->snd_burst`, the iterator is not allowed, and no
+// write is forced.  noReturn is set: init/release are `void`, so a
+// KF_RET_NULL-pointer guard (`if (!v) return -1;`) would be an invalid
+// return from a void function; such a kfunc is therefore not offered here.
 func mptcpInitReleaseScope(surf *Surface) bodyScope {
 	return bodyScope{
 		pool: []typedVal{
 			{expr: "msk", ctype: "struct mptcp_sock *"},
-			{expr: "msk->first", ctype: "struct sock *"},
+			{expr: mskSockExpr, ctype: "struct sock *"},
 		},
 		writeFields: []ctxWriteField{
 			{accessor: "msk->snd_burst", ctype: "int"},
@@ -1606,8 +1655,8 @@ func (sop *Prog) usesSubflowIter() bool {
 }
 
 // usedKfuncIdxs returns the indices of every kfunc the rendered
-// translation unit actually references -- the two the fixed
-// prologue/epilogue needs plus every kfunc a generated KfuncCall
+// translation unit actually references -- the surface's fixed
+// prologue/epilogue kfuncs plus every kfunc a generated KfuncCall
 // statement targets in ANY body (get_send / init / release, including
 // inside iterator loop bodies) -- so Render emits an
 // `extern … __ksym;` decl for exactly those and no more.  An unused
@@ -1777,11 +1826,11 @@ func (sop *Prog) Render() string {
 	for _, ki := range sop.usedKfuncIdxs() {
 		fmt.Fprintf(s, "%s\n", sop.Kfuncs[ki].CDecl)
 	}
-	// Iterator kfuncs -- emitted only when a generated body uses the
-	// iterator and the surface defines one.  The verifier requires the
-	// full new -> next* -> destroy triple, so either all three externs
-	// are needed or none are.
-	if len(sop.IterKfuncs) > 0 && sop.usesSubflowIter() {
+	// Iterator kfuncs -- emitted when the surface defines them and either
+	// a fixed prologue (MPTCP get_send) or a generated body uses the
+	// iterator.  The verifier requires the full new -> next* -> destroy
+	// triple, so either all three externs are needed or none are.
+	if len(sop.IterKfuncs) > 0 && (surf.iterInPrologue || sop.usesSubflowIter()) {
 		fmt.Fprintf(s, "%s\n", surf.iterExternComment)
 		for i := range sop.IterKfuncs {
 			fmt.Fprintf(s, "%s\n", sop.IterKfuncs[i].CDecl)
