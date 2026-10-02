@@ -39,6 +39,14 @@ import (
 //	                 u32 nkfunc | u32 ninsn | u32 reserved
 //	                 nkfunc x { u32 insn_idx; char name[64] }
 //	                 ninsn  x 8-byte bpf_insn (kfunc call imm/off unpatched)
+//	type 4 SPEC      u64 kernel_key | spec blob (spec.go)
+//	                 the generative spec this recipe was materialized from
+//	                 and the KernelKey of the vmlinux.h it was compiled
+//	                 against.  Host-only: the executor skips it.  It is what
+//	                 lets a recipe-form program (a crash log, a repro.syz)
+//	                 be re-materialized against a different kernel
+//	                 (materialize.Stale), so the kernel-specific form stays
+//	                 recoverable.
 //
 // The C side mirrors these sizes verbatim (STRUCTOPS_* in the executor).
 const (
@@ -48,6 +56,7 @@ const (
 	recBTF      = 1
 	recInstance = 2
 	recProg     = 3
+	recSpec     = 4
 
 	recipeInstanceFlagLink = 1 << 0
 
@@ -64,6 +73,9 @@ type Recipe struct {
 	StructName string
 	Link       bool
 	Progs      []RecipeProg
+	// KernelKey / Spec are the SPEC record (zero / nil when absent).
+	KernelKey uint64
+	Spec      []byte
 }
 
 // RecipeProg is one struct_ops callback program.
@@ -388,7 +400,11 @@ func (r *Recipe) Marshal() []byte {
 	var w tlvWriter
 	w.u32(recipeMagic)
 	w.u32(recipeVersion)
-	w.u32(uint32(2 + len(r.Progs)))
+	nrec := 2 + len(r.Progs)
+	if len(r.Spec) != 0 {
+		nrec++
+	}
+	w.u32(uint32(nrec))
 	w.rec(recBTF, r.BTF)
 
 	var inst tlvWriter
@@ -415,7 +431,67 @@ func (r *Recipe) Marshal() []byte {
 		pw.Write(p.Insns)
 		w.rec(recProg, pw.Bytes())
 	}
+	if len(r.Spec) != 0 {
+		w.specRec(r.KernelKey, r.Spec)
+	}
 	return w.Bytes()
+}
+
+func (w *tlvWriter) specRec(kernelKey uint64, spec []byte) {
+	payload := make([]byte, 8+len(spec))
+	binary.LittleEndian.PutUint64(payload, kernelKey)
+	copy(payload[8:], spec)
+	w.rec(recSpec, payload)
+}
+
+// AttachSpec appends a SPEC record (kernelKey + spec) to a recipe that has
+// none: the materializer calls it on Compile's output so the exec/log form
+// of a program carries its own generative spec.  A recipe that already has
+// one is returned unchanged.
+func AttachSpec(recipe []byte, kernelKey uint64, spec []byte) ([]byte, error) {
+	if !IsRecipe(recipe) {
+		return nil, fmt.Errorf("recipe: AttachSpec on a non-recipe")
+	}
+	if _, _, ok := RecipeSpec(recipe); ok {
+		return recipe, nil
+	}
+	le := binary.LittleEndian
+	nrec := le.Uint32(recipe[8:])
+	out := make([]byte, len(recipe), len(recipe)+16+len(spec))
+	copy(out, recipe)
+	le.PutUint32(out[8:], nrec+1)
+	var w tlvWriter
+	w.specRec(kernelKey, spec)
+	return append(out, w.Bytes()...), nil
+}
+
+// RecipeSpec returns the SPEC record of a recipe, if it carries one.  It
+// walks only the record headers, so it is cheap to call per program.
+func RecipeSpec(recipe []byte) (kernelKey uint64, spec []byte, ok bool) {
+	le := binary.LittleEndian
+	if !IsRecipe(recipe) || le.Uint32(recipe[4:]) != recipeVersion {
+		return 0, nil, false
+	}
+	nrec := le.Uint32(recipe[8:])
+	pos := 12
+	for i := uint32(0); i < nrec; i++ {
+		if len(recipe)-pos < 8 {
+			return 0, nil, false
+		}
+		typ, n := le.Uint32(recipe[pos:]), int(le.Uint32(recipe[pos+4:]))
+		pos += 8
+		if len(recipe)-pos < n {
+			return 0, nil, false
+		}
+		if typ == recSpec {
+			if n < 8 {
+				return 0, nil, false
+			}
+			return le.Uint64(recipe[pos:]), recipe[pos+8 : pos+n], true
+		}
+		pos += (n + 3) &^ 3
+	}
+	return 0, nil, false
 }
 
 // ParseRecipe decodes a TLV recipe (the inverse of Marshal); used by tests.
@@ -477,6 +553,12 @@ func ParseRecipe(data []byte) (*Recipe, error) {
 			}
 			pr.Insns = p[q:]
 			r.Progs = append(r.Progs, pr)
+		case recSpec:
+			if n < 8 {
+				return nil, fmt.Errorf("recipe: bad SPEC size %d", n)
+			}
+			r.KernelKey = le.Uint64(p)
+			r.Spec = p[8:]
 		default:
 			return nil, fmt.Errorf("recipe: unknown record type %d", typ)
 		}

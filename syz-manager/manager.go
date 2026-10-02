@@ -48,6 +48,7 @@ import (
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
 	"github.com/google/syzkaller/pkg/structops"
+	"github.com/google/syzkaller/pkg/structops/materialize"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
@@ -1128,6 +1129,29 @@ func (mgr *Manager) minimizeCorpusLocked() {
 	mgr.corpusDB.BumpVersion(manager.CurrentDBVersion)
 }
 
+// structOpsMaterialize is the host-side spec->recipe step of the BPF
+// struct_ops carrier (pkg/structops/materialize).  The fuzzer and the
+// corpus hold struct_ops programs in their kernel-agnostic spec form; the
+// executor needs the recipe compiled against this kernel's BTF.  Wrapping
+// the request source here -- the boundary between the fuzzer and the
+// rpcserver -- hands the rpcserver a shadow request carrying a materialized
+// clone (so the executor, and the crash logs the rpcserver writes, get the
+// self-contained kernel-specific form that a repro needs) while the
+// original request, and so the corpus, keeps the spec.  A no-op when the
+// compile step is not configured.
+func (mgr *Manager) structOpsMaterialize(source queue.Source) queue.Source {
+	if !structops.Configured() {
+		return source
+	}
+	m := materialize.Default()
+	stat.New("struct_ops materialized", "Programs whose struct_ops specs were materialized for execution",
+		stat.Simple, stat.NoGraph, func() int { return int(m.Stats().Programs) })
+	stat.New("struct_ops materialize failures",
+		"struct_ops blobs that failed to decode/compile against this kernel (sent inert)",
+		stat.Simple, stat.NoGraph, func() int { return int(m.Stats().Failed) })
+	return m.Source(source)
+}
+
 func setGuiltyFiles(crash *dashapi.Crash, report *report.Report) {
 	if report.GuiltyFile != "" {
 		crash.GuiltyFiles = []string{report.GuiltyFile}
@@ -1233,7 +1257,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				go mgr.dashboardReproTasks()
 			}
 		}
-		source := queue.DefaultOpts(fuzzerObj, opts)
+		source := mgr.structOpsMaterialize(queue.DefaultOpts(fuzzerObj, opts))
 		mgr.serv.SetSource(source)
 		return nil
 	case ModeCorpusRun:
@@ -1241,7 +1265,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 			candidates: candidates,
 			rnd:        rand.New(rand.NewSource(time.Now().UnixNano())),
 		}
-		mgr.serv.SetSource(queue.DefaultOpts(ctx, opts))
+		mgr.serv.SetSource(mgr.structOpsMaterialize(queue.DefaultOpts(ctx, opts)))
 		return nil
 	case ModeRunTests:
 		return mgr.runTestsMode(features, enabledSyscalls, capabilities)
