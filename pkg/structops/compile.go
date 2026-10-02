@@ -58,14 +58,15 @@ type CompileConfig struct {
 }
 
 type compiler struct {
-	cfg     CompileConfig
-	incDir  string // -I dir: vmlinux.h + bpf/ shims + structops_shim.h
-	objDir  string
-	mu      sync.Mutex
-	cache   map[[32]byte][]byte
-	stats   CompileStats
-	initErr error
-	once    sync.Once
+	cfg           CompileConfig
+	incDir        string // -I dir: vmlinux.h + bpf/ shims + structops_shim.h
+	objDir        string
+	layoutChecked int // structs the Configure-time layout self-check compared
+	mu            sync.Mutex
+	cache         map[[32]byte][]byte
+	stats         CompileStats
+	initErr       error
+	once          sync.Once
 }
 
 // CompileStats counts what the compile step did (for logging/measurement).
@@ -79,10 +80,16 @@ var (
 	theCompiler *compiler
 )
 
-// Configure installs the host compile step.  Until it is called,
-// Compile returns ErrNotConfigured and the generator leaves the rendered
-// source in the blob (which the executor rejects at load with EINVAL).
-func Configure(cfg CompileConfig) {
+// Configure installs the host compile step: it lays out the include tree
+// (dumping vmlinux.h from the kernel build), then runs the layout
+// self-check (layout.go) and installs the compiler only if it passes.  An
+// error wrapping ErrLayoutMismatch means this vmlinux.h/clang pair would
+// compile programs with wrong field offsets; any other error means the
+// step cannot run here (no vmlinux, no clang/bpftool).  Until a Configure
+// succeeds, Compile returns ErrNotConfigured and the generator leaves the
+// rendered source in the blob (which the executor rejects at load with
+// EINVAL).
+func Configure(cfg CompileConfig) error {
 	if cfg.Clang == "" {
 		cfg.Clang = "clang"
 	}
@@ -95,9 +102,35 @@ func Configure(cfg CompileConfig) {
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = filepath.Join(os.TempDir(), fmt.Sprintf("syz-structops-%d", os.Getuid()))
 	}
+	c := &compiler{cfg: cfg, cache: make(map[[32]byte][]byte)}
+	if err := c.init(); err != nil {
+		return err
+	}
+	if c.cfg.KernelObj != "" {
+		names := layoutProbeTypes()
+		expected, err := kernelStructSizes(filepath.Join(c.cfg.KernelObj, "vmlinux"), names)
+		if err != nil {
+			return err
+		}
+		if c.layoutChecked, err = c.checkLayout(expected); err != nil {
+			return err
+		}
+	}
 	compilerMu.Lock()
 	defer compilerMu.Unlock()
-	theCompiler = &compiler{cfg: cfg, cache: make(map[[32]byte][]byte)}
+	theCompiler = c
+	return nil
+}
+
+// LayoutChecked returns how many kernel structs the Configure-time layout
+// self-check compared (0 if it could not run: no kernel_obj vmlinux).
+func LayoutChecked() int {
+	compilerMu.Lock()
+	defer compilerMu.Unlock()
+	if theCompiler == nil {
+		return 0
+	}
+	return theCompiler.layoutChecked
 }
 
 // Configured reports whether Configure has been called.
@@ -243,10 +276,10 @@ func (c *compiler) compile(src string) ([]byte, error) {
 	return recipe, nil
 }
 
-func (c *compiler) compileUncached(src, name string) ([]byte, error) {
-	obj := filepath.Join(c.objDir, name+".o")
-	defer os.Remove(obj)
-	cmd := exec.Command(c.cfg.Clang,
+// clangArgs is the compile command line for one translation unit read from
+// stdin into obj; the layout probe appends to it.
+func (c *compiler) clangArgs(obj string) []string {
+	return []string{
 		"-O2", "-g", "-target", "bpf", "-mcpu=v3",
 		"-DBPF_NO_PRESERVE_ACCESS_INDEX",
 		// The kernel is built with -fms-extensions and uses tagged anonymous
@@ -255,11 +288,19 @@ func (c *compiler) compileUncached(src, name string) ([]byte, error) {
 		// the flag clang reads `struct slock_owned;` as an empty declaration
 		// and lays struct sock out 64 bytes short, and with CO-RE off every
 		// field offset after it is wrong (verifier: "cannot access ptr
-		// member ... with off").
+		// member ... with off").  The Configure-time layout self-check
+		// (layout.go) catches a recurrence.
 		"-fms-extensions",
 		"-I", c.incDir,
 		"-include", filepath.Join(c.incDir, "structops_shim.h"),
-		"-x", "c", "-", "-c", "-o", obj)
+		"-x", "c", "-", "-c", "-o", obj,
+	}
+}
+
+func (c *compiler) compileUncached(src, name string) ([]byte, error) {
+	obj := filepath.Join(c.objDir, name+".o")
+	defer os.Remove(obj)
+	cmd := exec.Command(c.cfg.Clang, c.clangArgs(obj)...)
 	cmd.Stdin = bytes.NewReader([]byte(src))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

@@ -4,6 +4,8 @@
 package structops
 
 import (
+	"errors"
+	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -27,7 +29,12 @@ func TestCompileRecipe(t *testing.T) {
 			t.Skipf("%v not in PATH", tool)
 		}
 	}
-	Configure(CompileConfig{KernelObj: kobj, CacheDir: t.TempDir()})
+	if err := Configure(CompileConfig{KernelObj: kobj, CacheDir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if n := LayoutChecked(); n < len(layoutProbeCommon) {
+		t.Errorf("layout self-check compared only %d structs", n)
+	}
 	const seeds = 8
 	for _, surf := range []*Surface{TCPCong, MptcpSched} {
 		t.Run(surf.Tag(), func(t *testing.T) {
@@ -123,4 +130,62 @@ func checkRecipe(t *testing.T, p *Prog, surf *Surface, r *Recipe, src string) {
 			t.Errorf("callback %s has no prog", cb.Suffix)
 		}
 	}
+}
+
+// TestLayoutCheck runs the Configure-time layout self-check three ways:
+// as Configure runs it (must pass on a sane kernel/toolchain), against
+// deliberately wrong expected sizes (must name the struct and both sizes),
+// and without -fms-extensions (the historical cause: must fail).
+func TestLayoutCheck(t *testing.T) {
+	kobj := os.Getenv("SYZ_STRUCTOPS_KERNEL_OBJ")
+	if kobj == "" {
+		t.Skip("SYZ_STRUCTOPS_KERNEL_OBJ not set")
+	}
+	for _, tool := range []string{"clang", "bpftool"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%v not in PATH", tool)
+		}
+	}
+	c := &compiler{cfg: CompileConfig{KernelObj: kobj, CacheDir: t.TempDir(),
+		Clang: "clang", Strip: "llvm-strip", Bpftool: "bpftool"}}
+	if err := c.init(); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := kernelStructSizes(kobj+"/vmlinux", layoutProbeTypes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected["sock"] == 0 || expected["tcp_congestion_ops"] == 0 {
+		t.Fatalf("kernel BTF sizes missing: %v", expected)
+	}
+	n, err := c.checkLayout(expected)
+	if err != nil {
+		t.Fatalf("sane layout check failed: %v", err)
+	}
+	t.Logf("checked %d structs: %v", n, expected)
+
+	wrong := map[string]uint32{}
+	for k, v := range expected {
+		wrong[k] = v
+	}
+	wrong["sock"] += 64
+	_, err = c.checkLayout(wrong)
+	if !errors.Is(err, ErrLayoutMismatch) {
+		t.Fatalf("wrong expected size not detected: %v", err)
+	}
+	msg := err.Error()
+	for _, frag := range []string{"struct sock:", fmt.Sprint(expected["sock"]), fmt.Sprint(wrong["sock"])} {
+		if !strings.Contains(msg, frag) {
+			t.Errorf("mismatch report lacks %q:\n%s", frag, msg)
+		}
+	}
+	if strings.Contains(msg, "struct tcp_sock:") {
+		t.Errorf("mismatch report names an unaffected struct:\n%s", msg)
+	}
+
+	_, err = c.checkLayout(expected, "-fno-ms-extensions")
+	if !errors.Is(err, ErrLayoutMismatch) {
+		t.Fatalf("-fno-ms-extensions layout not detected (kernel without tagged anon members?): %v", err)
+	}
+	t.Logf("without -fms-extensions: %v", err)
 }
