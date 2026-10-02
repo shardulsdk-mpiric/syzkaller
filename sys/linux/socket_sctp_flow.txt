@@ -24,9 +24,17 @@
 # is sniffed off the wire during pair_init (SCTP_INIT_CAPTURE_VTAG) because it
 # is not exposed by any getsockopt.
 #
-# Increment 1 scope: NORMAL establish + vtag capture + M-CARRY inject + data
-# drive, on any stock CONFIG_IP_SCTP kernel. No NFQUEUE egress mutation
-# (M-WIRE), no feature-sockopt init flags, no kernel-side kcov -- increment 2.
+# syz_sctp_inject_typed$*() is the chunk-payload grammar on top of that edge:
+# the fuzzer builds a COMPLETE, typed chunk (header + per-type body, below)
+# and the executor adds only what the grammar cannot know -- ports, the
+# captured vtag, the sequence-number rebase, the 4-byte pad and the CRC32c.
+# See the "typed chunk-body inject" section.
+#
+# Scope: NORMAL establish + vtag/initial-TSN capture + M-CARRY inject + data
+# drive + the RECONF typed body, on any stock CONFIG_IP_SCTP kernel. No
+# NFQUEUE egress mutation (M-WIRE), no feature-sockopt init flags, no
+# kernel-side kcov; DATA / FORWARD-TSN / SACK typed bodies are the next
+# grammar increment.
 #
 # Executor side: executor/common_linux_sctp.h.
 
@@ -68,3 +76,230 @@ syz_sctp_drive_traffic(assoc sctp_assoc, data ptr[in, array[int8]], data_len len
 syz_sctp_inject_chunk$captured(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode const[SCTP_VTAG_CAPTURED]) (remote_cover)
 syz_sctp_inject_chunk$zero(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode const[SCTP_VTAG_ZERO]) (remote_cover)
 syz_sctp_inject_chunk$wrong(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode const[SCTP_VTAG_WRONG]) (remote_cover)
+
+# ---------------------------------------------------------------------------
+# Typed chunk-body inject: the chunk-payload grammar, increment 1 (RECONF).
+#
+# syz_sctp_inject_chunk$captured passes the vtag + CRC gates, but its opaque
+# chunk_payload almost never forms a valid DEEP chunk body, so coverage stalls
+# at the chunk-type dispatch layer: every per-type parser rejects the blob,
+# and most rejections (sctp_sf_violation_paramlen / _chunklen) tear the
+# association down. syz_sctp_inject_typed$* hands the executor a COMPLETE
+# chunk -- header and body -- built by the grammar below, so the body is
+# structurally valid by construction and stays valid under mutation (len[] /
+# offsetof[] are recomputed after every mutation; the fuzzer varies WHICH
+# params, HOW MANY, which stream ids, which sequence deltas -- the dimensions
+# the handlers branch on). The executor adds only what the grammar cannot
+# know: the association's ports, the captured vtag (always Vs here -- this is
+# the hot path; $zero/$wrong above remain the negative controls), the
+# sequence-number rebase selected by seq_mode, the 4-byte pad and the CRC32c.
+# It never parses the chunk beyond the rebase walk.
+#
+# (no_squash): the body is a ptr to a varlen union with >5 options, which
+# prog/any.go would otherwise flatten to an ANYBLOB on some mutations, losing
+# the typed structure (and the len[] recomputation) for that program.
+#
+# seq_mode -- the sequence-rebase primitive. The deep handlers compare 32-bit
+# sequence fields with values seeded from the two initial TSNs exchanged in
+# INIT / INIT-ACK: sctp_process_strreset_* check request_seq against
+# asoc->strreset_inseq (a 3-value window, net/sctp/stream.c), DATA/FWD-TSN
+# check the TSN against the tsnmap base, SACK/SHUTDOWN check cum_tsn_ack
+# against next_tsn. A structurally perfect body with a random value is
+# rejected ~always (3 in 2^32). pair_init captures both initial TSNs off the
+# wire (the sctp_inithdr field 12 bytes past the init_tag it already reads),
+# the grammar emits a SMALL DELTA, and the executor adds the selected base, so
+# the fuzzer explores the window edges (fresh / duplicate / BAD_SEQNO) instead
+# of one bit of a 2^32 space. Bases, for the server-directed inject (the
+# server's association is the one that parses the chunk):
+#   SCTP_SEQ_CLIENT_TSN  the client's initial TSN (sent in the INIT) = the
+#                        server association's peer.i.initial_tsn, which seeds
+#                        its tsnmap base and strreset_inseq. Rebases the first
+#                        u32 of the chunk value (DATA tsn, FWD-TSN new_cum_tsn,
+#                        ECNE/CWR lowest_tsn, ASCONF serial all sit there).
+#   SCTP_SEQ_SERVER_TSN  the server's initial TSN (sent in the INIT-ACK) = its
+#                        own c.initial_tsn, which seeds next_tsn,
+#                        ctsn_ack_point and strreset_outseq. Same first-u32
+#                        rule (SACK / SHUTDOWN cum_tsn_ack).
+#   SCTP_SEQ_RECONF      walk the RECONF parameter TLVs: request_seq (and the
+#                        OUT_REQ send_reset_at_tsn, compared with the peer
+#                        tsnmap ctsn) += CLIENT_TSN; a RESPONSE's response_seq
+#                        += SERVER_TSN. A per-param walk because the seq field
+#                        of each array element is at an offset no offsetof[]
+#                        in the outer struct can name.
+#   SCTP_SEQ_NONE        no rebase: the deltas go out as absolute values (the
+#                        rebase-off control).
+# Harness-only constants, mirrored as executor #defines; must stay in sync
+# with the .const.
+define SCTP_SEQ_NONE	0
+define SCTP_SEQ_CLIENT_TSN	1
+define SCTP_SEQ_SERVER_TSN	2
+define SCTP_SEQ_RECONF	3
+
+# Wire constants from include/linux/sctp.h (kernel-internal, not uapi): the
+# RECONF chunk type (enum sctp_cid) and the RFC 6525 §4 parameter types /
+# §4.4 result codes (SCTP_PARAM_RESET_* / SCTP_STRRESET_*). Given as defines,
+# like SCTP_VTAG_* above, so `make extract` stays reproducible without the
+# kernel-internal header; the values are the kernel's.
+define SCTP_CID_RECONF	0x82
+define SCTP_PARAM_RESET_OUT_REQUEST	0x000d
+define SCTP_PARAM_RESET_IN_REQUEST	0x000e
+define SCTP_PARAM_RESET_TSN_REQUEST	0x000f
+define SCTP_PARAM_RESET_RESPONSE	0x0010
+define SCTP_PARAM_RESET_ADD_OUT_STREAMS	0x0011
+define SCTP_PARAM_RESET_ADD_IN_STREAMS	0x0012
+define SCTP_STRRESET_NOTHING_TO_DO	0
+define SCTP_STRRESET_PERFORMED	1
+define SCTP_STRRESET_DENIED	2
+define SCTP_STRRESET_ERR_WRONG_SSN	3
+define SCTP_STRRESET_ERR_IN_PROGRESS	4
+define SCTP_STRRESET_ERR_BAD_SEQNO	5
+define SCTP_STRRESET_IN_PROGRESS	6
+sctp_strreset_results = SCTP_STRRESET_NOTHING_TO_DO, SCTP_STRRESET_PERFORMED, SCTP_STRRESET_DENIED, SCTP_STRRESET_ERR_WRONG_SSN, SCTP_STRRESET_ERR_IN_PROGRESS, SCTP_STRRESET_ERR_BAD_SEQNO, SCTP_STRRESET_IN_PROGRESS
+
+# chunk: the complete chunk (header + body). chunk_len: its byte size (the
+# executor copies exactly this many bytes, then pads the packet to 4; the
+# chunk header's own `length` is the grammar's, left untouched). seq_mode: a
+# per-variant const, like vtag_mode on syz_sctp_inject_chunk$*.
+syz_sctp_inject_typed$reconf(assoc sctp_assoc, chunk ptr[in, sctp_chunk_reconf], chunk_len len[chunk], seq_mode const[SCTP_SEQ_RECONF]) (remote_cover, no_squash)
+# Rebase-off control: the same typed body with its sequence deltas sent
+# verbatim, so the per-param processing answers SCTP_STRRESET_ERR_BAD_SEQNO
+# (the window check) -- the reachability proof that the rebase, not the
+# structure alone, carries the body into the stream-reset code.
+syz_sctp_inject_typed$reconf_rawseq(assoc sctp_assoc, chunk ptr[in, sctp_chunk_reconf], chunk_len len[chunk], seq_mode const[SCTP_SEQ_NONE]) (remote_cover, no_squash)
+
+# A rebased sequence delta: executor adds the selected captured base. The
+# in-window RECONF values are {-2, -1} (duplicate: the saved result is
+# re-sent), 0 (fresh: strreset_inseq advances), and 1 is the fresh value for
+# a second request param in the same chunk (inseq already advanced by the
+# first); everything else is SCTP_STRRESET_ERR_BAD_SEQNO. For OUT_REQ's
+# send_reset_at_tsn the same type gives -1 == ctsn (pass) vs >= 0 > ctsn
+# (SCTP_STRRESET_IN_PROGRESS) on an association that has carried no data.
+# Out-of-window values stay reachable through the 1-in-100 whole-range draw
+# of ranged ints (prog/rand.go randRangeInt).
+type sctp_reconf_seq int32be[-2:3]
+
+# A stream id for the reset lists: both ends of the loopback association
+# negotiate SCTP_DEFAULT_OUTSTREAMS (10) streams, so 0..9 pass the
+# `>= stream->incnt / outcnt` checks in stream.c and 10..11 take the
+# SCTP_STRRESET_ERR_WRONG_SSN branch.
+type sctp_stream_id int16be[0:11]
+
+# RE-CONFIG chunk (RFC 6525 §3.1, struct sctp_reconf_chunk): chunk header +
+# 1..3 parameters. sctp_verify_reconf (net/sctp/sm_make_chunk.c) rejects a
+# 4th param (`cnt++ > 2`), so the array is capped at 3; its per-type length
+# and ordering rules are on each param below. `length` excludes the align[4]
+# pad of the chunk via the offsetof + trailing void idiom (socket_netlink.txt
+# nlattr_t); each param's own pad is inside its struct, so the chunk length
+# counts param padding, as RFC 9260 §3.2 requires. Flags: RFC 6525 reserves
+# them and the kernel ignores them -- not worth a mutable byte.
+sctp_chunk_reconf {
+	type	const[SCTP_CID_RECONF, int8]
+	flags	const[0, int8]
+	length	offsetof[end, int16be]
+	params	array[sctp_reconf_param, 1:3]
+	end	void
+} [packed, align[4]]
+
+# The six RFC 6525 parameter types; RESPONSE has two legal sizes (with /
+# without the TSN-reset trailer), hence seven options. Ordering (the `last`
+# rules in sctp_verify_reconf): OUT_REQ may only follow RESPONSE or IN_REQ;
+# IN_REQ only OUT_REQ; RESPONSE only RESPONSE or OUT_REQ; TSN_REQ must be
+# alone; ADD_IN only after ADD_OUT and vice versa. The grammar leaves the
+# order free: a legal pair (e.g. OUT_REQ + IN_REQ, RFC 6525 §6.1's combined
+# reset; ADD_OUT + ADD_IN) is reached by construction, an illegal one is the
+# `return false` -> sctp_sf_violation_paramlen branch (a teardown, so the
+# fuzzer is steered off it by the lost association rather than by a rule).
+sctp_reconf_param [
+	outreq	sctp_strreset_outreq
+	inreq	sctp_strreset_inreq
+	tsnreq	sctp_strreset_tsnreq
+	resp	sctp_strreset_resp
+	resptsn	sctp_strreset_resptsn
+	addout	sctp_strreset_addstrm_out
+	addin	sctp_strreset_addstrm_in
+] [varlen]
+
+# Outgoing SSN Reset Request (RFC 6525 §4.1, struct sctp_strreset_outreq):
+# verify needs length >= 16 (header + 3 u32), the stream list is any count of
+# u16 (0 = all streams). sctp_process_strreset_outreq: send_reset_at_tsn >
+# peer ctsn -> IN_PROGRESS; then the request_seq window; then each stream id
+# < incnt; response_seq is consulted only against the server's own
+# outstanding IN_REQ (none on a stock association) -- left opaque.
+sctp_strreset_outreq {
+	ptype			const[SCTP_PARAM_RESET_OUT_REQUEST, int16be]
+	plen			offsetof[pend, int16be]
+	request_seq		sctp_reconf_seq
+	response_seq		int32be
+	send_reset_at_tsn	sctp_reconf_seq
+	streams			array[sctp_stream_id, 0:4]
+	pend			void
+} [packed, align[4]]
+
+# Incoming SSN Reset Request (RFC 6525 §4.2, struct sctp_strreset_inreq):
+# verify needs length >= 8. sctp_process_strreset_inreq: request_seq window;
+# each stream id < outcnt; outqueue-empty check; then the kernel builds its
+# own OUT_REQ back to the client.
+sctp_strreset_inreq {
+	ptype		const[SCTP_PARAM_RESET_IN_REQUEST, int16be]
+	plen		offsetof[pend, int16be]
+	request_seq	sctp_reconf_seq
+	streams		array[sctp_stream_id, 0:4]
+	pend		void
+} [packed, align[4]]
+
+# SSN/TSN Reset Request (RFC 6525 §4.3, struct sctp_strreset_tsnreq): verify
+# needs length == 8 and this param alone in the chunk.
+sctp_strreset_tsnreq {
+	ptype		const[SCTP_PARAM_RESET_TSN_REQUEST, int16be]
+	plen		const[8, int16be]
+	request_seq	sctp_reconf_seq
+} [packed]
+
+# Re-configuration Response (RFC 6525 §4.4, struct sctp_strreset_resp /
+# _resptsn): verify needs length == 12 or == 20. sctp_process_strreset_resp
+# looks response_seq up among the server's own outstanding requests
+# (strreset_outseq-based, hence the SERVER_TSN rebase) and returns early when
+# there is none; result selects the PERFORMED / DENIED / failed branches.
+sctp_strreset_resp {
+	ptype		const[SCTP_PARAM_RESET_RESPONSE, int16be]
+	plen		const[12, int16be]
+	response_seq	sctp_reconf_seq
+	result		flags[sctp_strreset_results, int32be]
+} [packed]
+
+sctp_strreset_resptsn {
+	ptype			const[SCTP_PARAM_RESET_RESPONSE, int16be]
+	plen			const[20, int16be]
+	response_seq		sctp_reconf_seq
+	result			flags[sctp_strreset_results, int32be]
+	senders_next_tsn	int32be
+	receivers_next_tsn	int32be
+} [packed]
+
+# Add Outgoing / Incoming Streams Request (RFC 6525 §4.5 / §4.6, struct
+# sctp_strreset_addstrm): verify needs length == 12. After the request_seq
+# window, number_of_streams must be != 0 and incnt/outcnt + it <= 65535
+# (SCTP_MAX_STREAM); the range keeps the valid branch common while 0 is
+# generated; the overflow branch is left to the 1-in-100 whole-range draw.
+sctp_strreset_addstrm_out {
+	ptype			const[SCTP_PARAM_RESET_ADD_OUT_STREAMS, int16be]
+	plen			const[12, int16be]
+	request_seq		sctp_reconf_seq
+	number_of_streams	int16be[0:16]
+	reserved		const[0, int16be]
+} [packed]
+
+sctp_strreset_addstrm_in {
+	ptype			const[SCTP_PARAM_RESET_ADD_IN_STREAMS, int16be]
+	plen			const[12, int16be]
+	request_seq		sctp_reconf_seq
+	number_of_streams	int16be[0:16]
+	reserved		const[0, int16be]
+} [packed]
+
+# Increment 2 of the grammar (design-noted, not implemented here): typed
+# DATA (16-byte sctp_datahdr + flags enum + user bytes, tsn via
+# SCTP_SEQ_CLIENT_TSN), FORWARD-TSN (new_cum_tsn via CLIENT_TSN + a
+# {stream, ssn} skip list) and SACK (cum_tsn_ack via SERVER_TSN + gap-ack /
+# dup-TSN arrays with len[] counts) bodies as sibling $variants of
+# syz_sctp_inject_typed; then an opaque catch-all and bundling.
