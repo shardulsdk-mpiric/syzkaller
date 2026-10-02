@@ -116,7 +116,9 @@ func TestStructOpsGenAndRender(t *testing.T) {
 			"BPF_PROG(" + name + "_get_send, struct mptcp_sock *msk)",
 			"BPF_PROG(" + name + "_init, struct mptcp_sock *msk)",
 			"BPF_PROG(" + name + "_release, struct mptcp_sock *msk)",
-			"bpf_mptcp_subflow_ctx(msk->first)",
+			"bpf_iter_mptcp_subflow_new(&it, (struct sock *)msk)",
+			"subflow = bpf_iter_mptcp_subflow_next(&it)",
+			"bpf_iter_mptcp_subflow_destroy(&it)",
 			"mptcp_subflow_set_scheduled(subflow, true)",
 			"__ksym;",
 			".name\t\t= \"" + name + "\",",
@@ -360,7 +362,7 @@ func TestStructOpsKfuncCalls(t *testing.T) {
 	// membership check here is sufficient to confirm "typed,
 	// in-scope" -- a non-member argument is necessarily wrong.
 	fixedArgs := map[string]bool{
-		"msk": true, "msk->first": true, "subflow": true,
+		"msk": true, "(struct sock *)msk": true, "subflow": true,
 		"true": true, "false": true,
 	}
 
@@ -482,7 +484,7 @@ func TestStructOpsKfuncCalls(t *testing.T) {
 
 		// The fixed prologue/epilogue must survive untouched.
 		for _, frag := range []string{
-			"bpf_mptcp_subflow_ctx(msk->first)",
+			"subflow = bpf_iter_mptcp_subflow_next(&it)",
 			"mptcp_subflow_set_scheduled(subflow, true)",
 			"return 0;",
 		} {
@@ -584,17 +586,20 @@ func TestStructOpsSubflowIter(t *testing.T) {
 
 		// Rendered C: the iterator must be the complete triple.  Every
 		// modelled SubflowIter renders exactly one `_new`, one
-		// `_destroy` and one `_next` (the `while` condition).  A
-		// partial iterator -- any of the three missing -- is a
+		// `_destroy` and one `_next` (the `while` condition), on top of
+		// the ONE fixed prologue triple (`&it`) every get_send carries.
+		// A partial iterator -- any of the three missing -- is a
 		// verifier reject.
 		src := p.Render()
+		const prologueIters = 1
+		want := nIter + prologueIters
 		nNew := strings.Count(src, "bpf_iter_mptcp_subflow_new(&")
 		nNext := strings.Count(src, "bpf_iter_mptcp_subflow_next(&")
 		nDestroy := strings.Count(src, "bpf_iter_mptcp_subflow_destroy(&")
-		if nNew != nIter || nNext != nIter || nDestroy != nIter {
-			t.Errorf("seed %d: %d iterators modelled but rendered "+
-				"new=%d next=%d destroy=%d -- not a complete triple\n%s",
-				seed, nIter, nNew, nNext, nDestroy, src)
+		if nNew != want || nNext != want || nDestroy != want {
+			t.Errorf("seed %d: %d iterators modelled (+%d prologue) but "+
+				"rendered new=%d next=%d destroy=%d -- not a complete triple\n%s",
+				seed, nIter, prologueIters, nNew, nNext, nDestroy, src)
 		}
 
 		// The `while` condition must be the KF_RET_NULL NULL-check on
@@ -1418,8 +1423,11 @@ func TestStructOpsGolden(t *testing.T) {
 		{
 			surf: MptcpSched,
 			// The fork's production entry point (genStructOpsProg).
+			// Re-pinned 2026-10 with the iterator-prologue / current-kfunc
+			// surface (see the "Re-pin" note in structops.go); the fork's
+			// hash was eccdcc55d70fcb5ecd02bd69c2a356e8bd526dc6c1f861ac9eda86d647148579.
 			gen:  generateMptcp,
-			want: "eccdcc55d70fcb5ecd02bd69c2a356e8bd526dc6c1f861ac9eda86d647148579",
+			want: "a2a20c95c8619ab36d9a38fba6a2a0f85051937202413e4e0691c8cd811b75c1",
 		},
 		{
 			surf: TCPCong,
