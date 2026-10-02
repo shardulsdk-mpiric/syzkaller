@@ -46,8 +46,8 @@
 // not crypto.
 //
 // syz_sctp_inject_typed() is the chunk-payload grammar's entry point: the
-// fuzzer builds a COMPLETE chunk (header + typed body; RECONF in this
-// increment) in sys/linux/socket_sctp_flow.txt and this side adds only what
+// fuzzer builds a COMPLETE chunk (header + typed body; RECONF, DATA,
+// FORWARD-TSN and SACK) in sys/linux/socket_sctp_flow.txt and this side adds only what
 // the grammar cannot know -- ports, the captured vtag, the sequence-number
 // rebase (seq_mode), the 4-byte pad and the CRC32c. The rebase is the one
 // disciplined piece of chunk awareness here: the deep handlers compare
@@ -56,9 +56,10 @@
 // adds the selected base to the small delta the grammar emitted.
 //
 // Scope: NORMAL establish + vtag / initial-TSN capture + M-CARRY inject +
-// data drive + typed RECONF. No NFQUEUE egress mutation (M-WIRE), no
-// feature-sockopt init flags (RECONF / idata / PR-SCTP enable), no
-// kernel-side kcov. This file runs on any stock CONFIG_IP_SCTP kernel.
+// data drive + typed RECONF / DATA / FORWARD-TSN / SACK + the stream-reset
+// enable init flag. No NFQUEUE egress mutation (M-WIRE), no other
+// feature-sockopt init flags (idata / PR-SCTP policies), no kernel-side kcov.
+// This file runs on any stock CONFIG_IP_SCTP kernel.
 
 #ifndef EXECUTOR_COMMON_LINUX_SCTP_H
 #define EXECUTOR_COMMON_LINUX_SCTP_H
@@ -83,10 +84,36 @@
 // the real header when the generated reproducer is actually compiled -- the
 // same reasoning as the IPPROTO_MPTCP note in common_linux_mptcp.h.
 
-// Harness-only init flag (mirrored in sys/linux/socket_sctp_flow.txt + .const):
-// sniff the INIT/INIT-ACK off loopback and store both directions' vtag on the
-// slot, so syz_sctp_inject_chunk can stamp the captured tag.
+// Harness-only init flags (mirrored in sys/linux/socket_sctp_flow.txt + .const).
+// SCTP_INIT_CAPTURE_VTAG: sniff the INIT/INIT-ACK off loopback and store both
+// directions' vtag on the slot, so syz_sctp_inject_chunk can stamp the captured
+// tag. SCTP_INIT_ENABLE_STRRESET: setsockopt SCTP_ENABLE_STREAM_RESET on both
+// established ends, so an in-window RECONF request the grammar injects is
+// PERFORMED by sctp_process_strreset_* (net/sctp/stream.c) instead of being
+// answered SCTP_STRRESET_DENIED after the request_seq window check.
 #define SCTP_INIT_CAPTURE_VTAG 1
+#define SCTP_INIT_ENABLE_STRRESET 2
+
+// SCTP_ENABLE_STREAM_RESET + its SCTP_ENABLE_*_REQ mask are uapi (RFC 6525
+// socket API, <linux/sctp.h>), but that header is deliberately not included
+// here (nothing else in this file needs it) and <netinet/in.h> does not define
+// them on any glibc in current use, so a guarded fallback cannot collide with
+// anything -- the SOL_MPTCP case in common_linux_mptcp.h, not the IPPROTO_SCTP
+// one. The sockopt level is IPPROTO_SCTP (== SOL_SCTP, 132), which
+// <netinet/in.h> does provide. The uapi struct sctp_assoc_value is mirrored
+// under a harness-local name: assoc_id is sctp_assoc_t (__s32), spelled as a
+// plain int because the executor defines only the uintN names and <stdint.h>
+// spellings are rewritten by pkg/csource; int is 32-bit on every Linux arch.
+#ifndef SCTP_ENABLE_STREAM_RESET
+#define SCTP_ENABLE_STREAM_RESET 118
+#endif
+#ifndef SCTP_ENABLE_STRRESET_MASK
+#define SCTP_ENABLE_STRRESET_MASK 0x07
+#endif
+struct sctp_inj_assoc_value {
+	int assoc_id;
+	uint32 assoc_value;
+};
 
 // Harness-only vtag-mode selectors for syz_sctp_inject_chunk (mirrored in the
 // .txt + .const). CAPTURED echoes the server's tag (passes sctp_vtag_verify);
@@ -315,6 +342,32 @@ static long syz_sctp_pair_init(volatile long a0)
 			goto fail;
 		}
 		syz_sctp_assoc_pool[slot].client_port_h = ntohs(cli_addr.sin_port);
+	}
+
+	if (init_flags & SCTP_INIT_ENABLE_STRRESET) {
+		// Both ends: the server association parses the injected RECONF
+		// and performs an OUT_REQ / TSN_REQ / ADD_STREAMS itself, and
+		// answers an IN_REQ with an OUT_REQ of its own that the CLIENT
+		// association must then be allowed to perform. On a TCP-style
+		// socket in ESTABLISHED, sctp_setsockopt_enable_strreset writes
+		// the association's own strreset_enable (sctp_id2assoc returns
+		// its one association), so this lands on the live association,
+		// not just the endpoint default. All three request bits, so every
+		// request kind the grammar emits can perform. A flag the caller
+		// asked for that did not apply is a failed init, not a silent
+		// downgrade.
+		struct sctp_inj_assoc_value sv;
+		memset(&sv, 0, sizeof(sv));
+		sv.assoc_id = 0;
+		sv.assoc_value = SCTP_ENABLE_STRRESET_MASK;
+		if (setsockopt(server_fd, IPPROTO_SCTP, SCTP_ENABLE_STREAM_RESET, &sv, sizeof(sv)) < 0) {
+			debug("syz_sctp_pair_init: server SCTP_ENABLE_STREAM_RESET: %d\n", errno);
+			goto fail;
+		}
+		if (setsockopt(client_fd, IPPROTO_SCTP, SCTP_ENABLE_STREAM_RESET, &sv, sizeof(sv)) < 0) {
+			debug("syz_sctp_pair_init: client SCTP_ENABLE_STREAM_RESET: %d\n", errno);
+			goto fail;
+		}
 	}
 
 	if (cap_fd >= 0) {
