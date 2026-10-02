@@ -190,8 +190,8 @@ diff: descriptions target
 # Mpiric's working driver for pkg/manager/diff (tools/syz-diff cannot run: it never
 # sets diff.Config.PatchedOnly).  Built like syz-diff so the binary carries the same
 # git/descriptions revision as the executor it hands to the VMs.
-mpiric-diff: descriptions target
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/mpiric-diff github.com/google/syzkaller/tools/mpiric-diff
+syz-diffrepro: descriptions target
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-diffrepro github.com/google/syzkaller/tools/syz-diffrepro
 
 prog2c: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-prog2c github.com/google/syzkaller/tools/syz-prog2c
