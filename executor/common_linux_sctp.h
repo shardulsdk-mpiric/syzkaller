@@ -45,10 +45,20 @@
 // 0x82f63b78) is the one new primitive over the MPTCP harness -- a checksum,
 // not crypto.
 //
-// Scope of this increment: NORMAL establish + vtag capture + M-CARRY inject +
-// data drive. No NFQUEUE egress mutation (M-WIRE), no feature-sockopt init
-// flags (RECONF / idata / PR-SCTP), no kernel-side kcov -- those are
-// increment 2. This file runs on any stock CONFIG_IP_SCTP kernel.
+// syz_sctp_inject_typed() is the chunk-payload grammar's entry point: the
+// fuzzer builds a COMPLETE chunk (header + typed body; RECONF in this
+// increment) in sys/linux/socket_sctp_flow.txt and this side adds only what
+// the grammar cannot know -- ports, the captured vtag, the sequence-number
+// rebase (seq_mode), the 4-byte pad and the CRC32c. The rebase is the one
+// disciplined piece of chunk awareness here: the deep handlers compare
+// sequence fields with values seeded from the INIT / INIT-ACK initial TSNs,
+// which pair_init captures off the wire next to the vtags, and the executor
+// adds the selected base to the small delta the grammar emitted.
+//
+// Scope: NORMAL establish + vtag / initial-TSN capture + M-CARRY inject +
+// data drive + typed RECONF. No NFQUEUE egress mutation (M-WIRE), no
+// feature-sockopt init flags (RECONF / idata / PR-SCTP enable), no
+// kernel-side kcov. This file runs on any stock CONFIG_IP_SCTP kernel.
 
 #ifndef EXECUTOR_COMMON_LINUX_SCTP_H
 #define EXECUTOR_COMMON_LINUX_SCTP_H
@@ -85,14 +95,39 @@
 #define SCTP_VTAG_ZERO 1
 #define SCTP_VTAG_WRONG 2
 
+// Harness-only sequence-rebase selectors for syz_sctp_inject_typed (mirrored
+// in the .txt + .const). The base is added, mod 2^32, to the delta the grammar
+// put in the field; which field depends on the mode. Bases are named for the
+// loopback endpoint whose INIT / INIT-ACK carried them; for the server-directed
+// inject the SERVER association is the parser, so CLIENT_TSN is its
+// peer.i.initial_tsn (tsnmap base, strreset_inseq) and SERVER_TSN its own
+// c.initial_tsn (next_tsn, ctsn_ack_point, strreset_outseq).
+#define SCTP_SEQ_NONE 0 // send the grammar's values verbatim
+#define SCTP_SEQ_CLIENT_TSN 1 // first u32 of the chunk value += client initial TSN
+#define SCTP_SEQ_SERVER_TSN 2 // first u32 of the chunk value += server initial TSN
+#define SCTP_SEQ_RECONF 3 // per-param walk of a RECONF body (see sctp_rebase_chunk)
+
 #define SCTP_ASSOC_POOL_SIZE 64
 
 // Cap on the injected chunk payload, keeping the craft buffer stack-bounded.
 #define SCTP_INJECT_MAX_PAYLOAD 1024
 
-// SCTP chunk types read off the wire during capture (RFC 9260 §3.2).
+// SCTP chunk types read off the wire during capture (RFC 9260 §3.2) and the
+// RE-CONFIG chunk + RFC 6525 §4 parameter types the rebase walk recognises
+// (values from include/linux/sctp.h, which is not uapi; mirrored in the .txt).
 #define SCTP_CID_INIT 1
 #define SCTP_CID_INIT_ACK 2
+#define SCTP_CID_RECONF 0x82
+#define SCTP_PARAM_RESET_OUT_REQUEST 0x000d
+#define SCTP_PARAM_RESET_IN_REQUEST 0x000e
+#define SCTP_PARAM_RESET_TSN_REQUEST 0x000f
+#define SCTP_PARAM_RESET_RESPONSE 0x0010
+#define SCTP_PARAM_RESET_ADD_OUT_STREAMS 0x0011
+#define SCTP_PARAM_RESET_ADD_IN_STREAMS 0x0012
+
+// Cap on a typed chunk (header + body) for syz_sctp_inject_typed; 4-aligned so
+// the padded packet still fits the craft buffer.
+#define SCTP_INJECT_MAX_CHUNK (4 + SCTP_INJECT_MAX_PAYLOAD)
 
 struct syz_sctp_assoc_slot {
 	bool in_use;
@@ -121,23 +156,44 @@ struct syz_sctp_assoc_slot {
 	uint32 vtag_server;
 	uint32 vtag_client;
 	bool vtag_valid;
+
+	// Captured alongside the vtags (same INIT / INIT-ACK sniff): the initial
+	// TSN each end advertised in its sctp_inithdr, 12 bytes past the init_tag.
+	//   init_tsn_client = the client's (INIT). On the server association it
+	//                     seeds peer.i.initial_tsn -> the tsnmap base and
+	//                     strreset_inseq: the base for inbound DATA / FWD-TSN
+	//                     TSNs and RECONF request_seq.
+	//   init_tsn_server = the server's (INIT-ACK). It seeds the server's own
+	//                     c.initial_tsn -> next_tsn, ctsn_ack_point,
+	//                     strreset_outseq: the base for SACK / SHUTDOWN
+	//                     cum_tsn_ack and RECONF response_seq.
+	// init_tsn_valid means BOTH were captured (a rebase needs the one its
+	// mode names, and the walk may need either). Cleared on slot reuse.
+	uint32 init_tsn_client;
+	uint32 init_tsn_server;
+	bool init_tsn_valid;
 };
 
 // All four pseudo-syscalls operate on the pool, so it is present whenever any
 // one of them is compiled (the per-call csource smoke builds one at a time).
 #if SYZ_EXECUTOR || __NR_syz_sctp_pair_init || __NR_syz_sctp_pair_close || \
-    __NR_syz_sctp_drive_traffic || __NR_syz_sctp_inject_chunk
+    __NR_syz_sctp_drive_traffic || __NR_syz_sctp_inject_chunk ||           \
+    __NR_syz_sctp_inject_typed
 static struct syz_sctp_assoc_slot syz_sctp_assoc_pool[SCTP_ASSOC_POOL_SIZE];
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_sctp_pair_init
 // Parse an AF_PACKET(SOCK_DGRAM) loopback frame (link header already stripped,
 // so it starts at the IP header) for an SCTP INIT / INIT-ACK and extract its
-// init_tag. The common header is 12 bytes (src port, dst port, vtag, checksum);
-// the first chunk header is 4 bytes (type, flags, length); for INIT/INIT-ACK
-// the chunk value begins with the 32-bit init_tag. Returns 1 and fills
-// *chunk_type_out / *init_tag_out (host order) on a hit, 0 otherwise.
-static int sctp_parse_init_tag(const uint8* pkt, int len, uint8* chunk_type_out, uint32* init_tag_out)
+// init_tag and initial_tsn. The common header is 12 bytes (src port, dst port,
+// vtag, checksum); the first chunk header is 4 bytes (type, flags, length);
+// for INIT/INIT-ACK the chunk value is a 16-byte struct sctp_inithdr
+// { init_tag; a_rwnd; num_outbound_streams; num_inbound_streams; initial_tsn }
+// (RFC 9260 §3.3.2 / §3.3.3, all mandatory, so a real INIT is never shorter).
+// Returns 1 and fills *chunk_type_out / *init_tag_out / *initial_tsn_out (host
+// order) on a hit, 0 otherwise.
+static int sctp_parse_init_hdr(const uint8* pkt, int len, uint8* chunk_type_out, uint32* init_tag_out,
+			       uint32* initial_tsn_out)
 {
 	if (len < (int)sizeof(struct iphdr))
 		return 0;
@@ -145,17 +201,19 @@ static int sctp_parse_init_tag(const uint8* pkt, int len, uint8* chunk_type_out,
 	if (ip->protocol != IPPROTO_SCTP)
 		return 0;
 	int ihl = ip->ihl * 4;
-	// common header (12) + chunk header (4) + init_tag (4).
-	if (ihl < (int)sizeof(struct iphdr) || len < ihl + 12 + 4 + 4)
+	// common header (12) + chunk header (4) + sctp_inithdr (16).
+	if (ihl < (int)sizeof(struct iphdr) || len < ihl + 12 + 4 + 16)
 		return 0;
 	const uint8* chunk = pkt + ihl + 12;
 	uint8 ctype = chunk[0];
 	if (ctype != SCTP_CID_INIT && ctype != SCTP_CID_INIT_ACK)
 		return 0;
-	uint32 tag_be = 0;
+	uint32 tag_be = 0, tsn_be = 0;
 	memcpy(&tag_be, chunk + 4, sizeof(tag_be));
+	memcpy(&tsn_be, chunk + 4 + 12, sizeof(tsn_be));
 	*chunk_type_out = ctype;
 	*init_tag_out = ntohl(tag_be);
+	*initial_tsn_out = ntohl(tsn_be);
 	return 1;
 }
 
@@ -269,26 +327,34 @@ static long syz_sctp_pair_init(volatile long a0)
 			if (cn <= 0)
 				break;
 			uint8 ctype = 0;
-			uint32 tag = 0;
-			if (!sctp_parse_init_tag((const uint8*)cbuf, (int)cn, &ctype, &tag))
+			uint32 tag = 0, tsn = 0;
+			if (!sctp_parse_init_hdr((const uint8*)cbuf, (int)cn, &ctype, &tag, &tsn))
 				continue;
 			if (ctype == SCTP_CID_INIT_ACK) {
 				syz_sctp_assoc_pool[slot].vtag_server = tag;
+				syz_sctp_assoc_pool[slot].init_tsn_server = tsn;
 				have_server = true;
 			} else if (ctype == SCTP_CID_INIT) {
 				syz_sctp_assoc_pool[slot].vtag_client = tag;
+				syz_sctp_assoc_pool[slot].init_tsn_client = tsn;
 				have_client = true;
 			}
 		}
 		close(cap_fd);
 		cap_fd = -1;
 		// Vs (the server's tag) is the load-bearing one for the server-
-		// directed inject; mark valid once it is captured.
+		// directed inject; mark valid once it is captured. The sequence
+		// rebase may need either initial TSN, so it is valid only with both.
 		syz_sctp_assoc_pool[slot].vtag_valid = have_server;
-		debug("syz_sctp_pair_init: captured vtag_server=0x%x vtag_client=0x%x valid=%d\n",
+		syz_sctp_assoc_pool[slot].init_tsn_valid = have_server && have_client;
+		debug("syz_sctp_pair_init: captured vtag_server=0x%x vtag_client=0x%x valid=%d "
+		      "init_tsn_server=0x%x init_tsn_client=0x%x tsn_valid=%d\n",
 		      syz_sctp_assoc_pool[slot].vtag_server,
 		      syz_sctp_assoc_pool[slot].vtag_client,
-		      syz_sctp_assoc_pool[slot].vtag_valid);
+		      syz_sctp_assoc_pool[slot].vtag_valid,
+		      syz_sctp_assoc_pool[slot].init_tsn_server,
+		      syz_sctp_assoc_pool[slot].init_tsn_client,
+		      syz_sctp_assoc_pool[slot].init_tsn_valid);
 	}
 
 	// in_use was published by the atomic claim; fill the rest before returning.
@@ -345,6 +411,9 @@ static long syz_sctp_pair_close(volatile long a0)
 	syz_sctp_assoc_pool[slot].vtag_server = 0;
 	syz_sctp_assoc_pool[slot].vtag_client = 0;
 	syz_sctp_assoc_pool[slot].vtag_valid = false;
+	syz_sctp_assoc_pool[slot].init_tsn_client = 0;
+	syz_sctp_assoc_pool[slot].init_tsn_server = 0;
+	syz_sctp_assoc_pool[slot].init_tsn_valid = false;
 	__atomic_store_n(&syz_sctp_assoc_pool[slot].in_use, false, __ATOMIC_RELEASE);
 	return 0;
 }
@@ -390,7 +459,7 @@ static long syz_sctp_drive_traffic(volatile long a0, volatile long a1, volatile 
 }
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_sctp_inject_chunk
+#if SYZ_EXECUTOR || __NR_syz_sctp_inject_chunk || __NR_syz_sctp_inject_typed
 // SCTP packet CRC32c (RFC 9260 Appendix A): Castagnoli polynomial, reflected
 // form 0x82f63b78, init 0xffffffff, final XOR 0xffffffff -- NOT the Ethernet
 // crc32. The kernel (sctp_compute_cksum, include/net/sctp/checksum.h) computes
@@ -425,6 +494,43 @@ struct sctp_inj_chunk {
 	uint16 length; // network order; header(4) + payload, unpadded
 };
 
+// Finish and send a crafted packet: stamp the association's ports + vtag_h on
+// the common header (the first 12 bytes of pkt; the caller has already placed
+// the chunk(s) after it and 4-byte padded `total`), CRC32c over the whole
+// packet with the checksum zeroed (stored little-endian), and inject it toward
+// the server via a raw IPPROTO_SCTP socket (the kernel adds the IP header and
+// does NOT compute the SCTP checksum for raw sends, so we must). Returns 0 on
+// a successful send, -1 otherwise.
+static long sctp_inject_send(const struct syz_sctp_assoc_slot* assoc, uint8* pkt, int total, uint32 vtag_h)
+{
+	struct sctp_inj_common* ch = (struct sctp_inj_common*)pkt;
+	ch->src_port = htons(assoc->client_port_h);
+	ch->dst_port = htons(assoc->server_port_h);
+	ch->vtag = htonl(vtag_h);
+	ch->checksum = 0;
+	ch->checksum = htole32(sctp_crc32c(pkt, total));
+
+	int rs = socket(AF_INET, SOCK_RAW, IPPROTO_SCTP);
+	if (rs < 0) {
+		debug("sctp_inject_send: raw socket: %d\n", errno);
+		return -1;
+	}
+	struct sockaddr_in dst;
+	memset(&dst, 0, sizeof(dst));
+	dst.sin_family = AF_INET;
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	dst.sin_port = 0; // ports live in the SCTP header; raw SCTP ignores this
+	ssize_t n = sendto(rs, pkt, (size_t)total, 0, (struct sockaddr*)&dst, sizeof(dst));
+	close(rs);
+	if (n < 0) {
+		debug("sctp_inject_send: sendto: %d\n", errno);
+		return -1;
+	}
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_sctp_inject_chunk
 // Craft one SCTP packet (common header + a single chunk carrying chunk_payload)
 // stamping the vtag selected by vtag_mode, compute CRC32c, and inject it toward
 // the server via a raw IPPROTO_SCTP socket (the kernel adds the IP header and
@@ -480,38 +586,140 @@ static long syz_sctp_inject_chunk(volatile long a0, volatile long a1, volatile l
 	int padded_payload = ((int)payload_len + 3) & ~3; // <= SCTP_PAD4(1024) = 1024, fits pkt[]
 	int total = 12 + 4 + padded_payload;
 	memset(pkt, 0, (size_t)total);
-	struct sctp_inj_common* ch = (struct sctp_inj_common*)pkt;
 	struct sctp_inj_chunk* ck = (struct sctp_inj_chunk*)(pkt + 12);
-	ch->src_port = htons(assoc->client_port_h);
-	ch->dst_port = htons(assoc->server_port_h);
-	ch->vtag = htonl(vtag_h);
-	ch->checksum = 0;
 	ck->type = chunk_type;
 	ck->flags = 0;
 	ck->length = htons((uint16)(4 + payload_len));
 	if (payload_len > 0 && payload != NULL)
 		memcpy(pkt + 12 + 4, payload, payload_len);
-	// CRC32c over the whole packet with checksum zeroed, stored little-endian.
-	ch->checksum = htole32(sctp_crc32c(pkt, total));
-
-	int rs = socket(AF_INET, SOCK_RAW, IPPROTO_SCTP);
-	if (rs < 0) {
-		debug("syz_sctp_inject_chunk: raw socket: %d\n", errno);
+	if (sctp_inject_send(assoc, pkt, total, vtag_h) < 0)
 		return -1;
-	}
-	struct sockaddr_in dst;
-	memset(&dst, 0, sizeof(dst));
-	dst.sin_family = AF_INET;
-	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	dst.sin_port = 0; // ports live in the SCTP header; raw SCTP ignores this
-	ssize_t n = sendto(rs, pkt, (size_t)total, 0, (struct sockaddr*)&dst, sizeof(dst));
-	close(rs);
-	if (n < 0) {
-		debug("syz_sctp_inject_chunk: sendto: %d\n", errno);
-		return -1;
-	}
 	debug("syz_sctp_inject_chunk: slot %ld type=%u vtag_mode=%lu vtag=0x%x len=%d\n",
 	      slot, chunk_type, vtag_mode, vtag_h, total);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_sctp_inject_typed
+// field = (field + base) mod 2^32, on a big-endian u32 at p (unaligned-safe).
+static void sctp_rebase_be32(uint8* p, uint32 base)
+{
+	uint32 v = 0;
+	memcpy(&v, p, sizeof(v));
+	v = htonl(ntohl(v) + base);
+	memcpy(p, &v, sizeof(v));
+}
+
+// Apply seq_mode to a complete chunk (header + body) of chunk_len bytes: turn
+// the small deltas the grammar emitted into in-window absolute sequence
+// numbers by adding the captured initial TSN the kernel compares them with.
+// CLIENT_TSN / SERVER_TSN rebase the first u32 of the chunk value -- where
+// DATA tsn, FWD-TSN new_cum_tsn, SACK / SHUTDOWN cum_tsn_ack, ECNE / CWR
+// lowest_tsn and ASCONF serial all sit. RECONF walks the parameter TLVs the
+// way sctp_walk_params (include/net/sctp/sctp.h) does -- 4-byte param header,
+// advance by PAD4(length), stop when a header or its length would overrun --
+// and rebases each request param's request_seq onto the client TSN (the
+// server association's strreset_inseq is seeded from peer.i.initial_tsn =
+// the client's), OUT_REQ's send_reset_at_tsn likewise (compared with the peer
+// tsnmap ctsn, same space), and a RESPONSE's response_seq onto the server TSN
+// (strreset_outseq = c.initial_tsn). Nothing else in the chunk is touched; a
+// malformed walk simply stops early, the kernel then rejects it as it would.
+static void sctp_rebase_chunk(uint8* chunk, int chunk_len, unsigned long seq_mode,
+			      const struct syz_sctp_assoc_slot* assoc)
+{
+	if (seq_mode == SCTP_SEQ_CLIENT_TSN || seq_mode == SCTP_SEQ_SERVER_TSN) {
+		if (chunk_len >= 4 + 4)
+			sctp_rebase_be32(chunk + 4, seq_mode == SCTP_SEQ_CLIENT_TSN ? assoc->init_tsn_client : assoc->init_tsn_server);
+		return;
+	}
+	if (seq_mode != SCTP_SEQ_RECONF)
+		return; // SCTP_SEQ_NONE (and any other value): verbatim
+	int off = 4;
+	while (off + 4 <= chunk_len) {
+		uint16 ptype_be = 0, plen_be = 0;
+		memcpy(&ptype_be, chunk + off, sizeof(ptype_be));
+		memcpy(&plen_be, chunk + off + 2, sizeof(plen_be));
+		uint16 ptype = ntohs(ptype_be);
+		int plen = ntohs(plen_be);
+		if (plen < 4 || off + plen > chunk_len)
+			break;
+		switch (ptype) {
+		case SCTP_PARAM_RESET_OUT_REQUEST:
+			// request_seq at +4, response_seq at +8 (opaque), send_reset_at_tsn at +12.
+			if (plen >= 16) {
+				sctp_rebase_be32(chunk + off + 4, assoc->init_tsn_client);
+				sctp_rebase_be32(chunk + off + 12, assoc->init_tsn_client);
+			}
+			break;
+		case SCTP_PARAM_RESET_IN_REQUEST:
+		case SCTP_PARAM_RESET_TSN_REQUEST:
+		case SCTP_PARAM_RESET_ADD_OUT_STREAMS:
+		case SCTP_PARAM_RESET_ADD_IN_STREAMS:
+			if (plen >= 8)
+				sctp_rebase_be32(chunk + off + 4, assoc->init_tsn_client);
+			break;
+		case SCTP_PARAM_RESET_RESPONSE:
+			if (plen >= 8)
+				sctp_rebase_be32(chunk + off + 4, assoc->init_tsn_server);
+			break;
+		default:
+			break;
+		}
+		off += (plen + 3) & ~3;
+	}
+}
+
+// Inject one COMPLETE chunk (header + body) built by the grammar
+// (sys/linux/socket_sctp_flow.txt, syz_sctp_inject_typed$*). The fuzzer owns
+// type / flags / length and the typed body; this side adds the ports, the
+// captured vtag Vs (the typed path is the hot path -- the vtag negative
+// controls stay on syz_sctp_inject_chunk$zero / $wrong), the sequence rebase
+// selected by seq_mode, the 4-byte pad (zero bytes, not counted in the chunk
+// header's length, which is sent exactly as the grammar built it -- a
+// deliberate length mutation is a wanted malformed case) and the CRC32c.
+// Exactly chunk_len bytes of the chunk are copied; a chunk shorter than its
+// own header cannot be typed and is refused.
+static long syz_sctp_inject_typed(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+{
+	long slot = a0;
+	const void* chunk = (const void*)a1;
+	size_t chunk_len = (size_t)a2;
+	unsigned long seq_mode = (unsigned long)a3;
+	uint8 pkt[12 + SCTP_INJECT_MAX_CHUNK];
+
+	if (slot < 0 || slot >= SCTP_ASSOC_POOL_SIZE) {
+		debug("syz_sctp_inject_typed: slot %ld out of range\n", slot);
+		return -1;
+	}
+	struct syz_sctp_assoc_slot* assoc = &syz_sctp_assoc_pool[slot];
+	if (!__atomic_load_n(&assoc->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_sctp_inject_typed: slot %ld not in use\n", slot);
+		return -1;
+	}
+	if (!assoc->vtag_valid) {
+		debug("syz_sctp_inject_typed: slot %ld no captured vtag (init without CAPTURE_VTAG?)\n", slot);
+		return -1;
+	}
+	if (seq_mode != SCTP_SEQ_NONE && !assoc->init_tsn_valid) {
+		debug("syz_sctp_inject_typed: slot %ld seq_mode=%lu but no captured initial TSNs\n", slot, seq_mode);
+		return -1;
+	}
+	if (chunk == NULL || chunk_len < sizeof(struct sctp_inj_chunk)) {
+		debug("syz_sctp_inject_typed: slot %ld chunk_len %zu shorter than a chunk header\n", slot, chunk_len);
+		return -1;
+	}
+	if (chunk_len > SCTP_INJECT_MAX_CHUNK)
+		chunk_len = SCTP_INJECT_MAX_CHUNK;
+
+	int padded_chunk = ((int)chunk_len + 3) & ~3; // <= SCTP_INJECT_MAX_CHUNK (4-aligned), fits pkt[]
+	int total = 12 + padded_chunk;
+	memset(pkt, 0, (size_t)total);
+	memcpy(pkt + 12, chunk, chunk_len);
+	sctp_rebase_chunk(pkt + 12, (int)chunk_len, seq_mode, assoc);
+	if (sctp_inject_send(assoc, pkt, total, assoc->vtag_server) < 0)
+		return -1;
+	debug("syz_sctp_inject_typed: slot %ld type=%u seq_mode=%lu vtag=0x%x len=%d\n",
+	      slot, pkt[12], seq_mode, assoc->vtag_server, total);
 	return 0;
 }
 #endif

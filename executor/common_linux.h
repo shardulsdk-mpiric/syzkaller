@@ -3461,7 +3461,8 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 // SCTP association pair + vtag-capture + chunk-inject pseudo-syscalls (see
 // executor/common_linux_sctp.h).
 #if SYZ_EXECUTOR || __NR_syz_sctp_pair_init || __NR_syz_sctp_pair_close || \
-    __NR_syz_sctp_drive_traffic || __NR_syz_sctp_inject_chunk
+    __NR_syz_sctp_drive_traffic || __NR_syz_sctp_inject_chunk ||           \
+    __NR_syz_sctp_inject_typed
 #include "common_linux_sctp.h"
 #endif
 

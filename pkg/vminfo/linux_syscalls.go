@@ -116,6 +116,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_sctp_pair_close":           linuxSctpSupported,
 	"syz_sctp_drive_traffic":        linuxSctpSupported,
 	"syz_sctp_inject_chunk":         linuxSctpSupported,
+	"syz_sctp_inject_typed":         linuxSctpSupported,
 	"syz_bpf_struct_ops_load":       linuxSyzBpfStructOpsSupported,
 	"syz_sched_ext_exercise":        linuxSyzSchedExtExerciseSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
