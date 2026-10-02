@@ -15,13 +15,14 @@
 # syz_sctp_drive_traffic() sctp_sendmsg()s on the association, reaching the
 # DATA / reassembly path.
 #
-# syz_sctp_inject_chunk() is the edge (M-CARRY): it crafts a full SCTP packet
+# syz_sctp_inject_chunk$*() is the edge (M-CARRY): it crafts a full SCTP packet
 # (common header + one attacker-shaped chunk) stamping a chosen vtag + a
 # recomputed CRC32c and injects it via a raw IPPROTO_SCTP socket toward the
-# server. With vtag_mode=CAPTURED the kernel's sctp_vtag_verify passes and the
-# chunk reaches its handler; ZERO/WRONG are negative controls. The vtag is
-# sniffed off the wire during pair_init (SCTP_INIT_CAPTURE_VTAG) because it is
-# not exposed by any getsockopt.
+# server. The vtag mode is fixed per $variant: $captured echoes the server's
+# captured tag, so the kernel's sctp_vtag_verify passes and the chunk reaches
+# its handler; $zero / $wrong are negative controls the gate rejects. The vtag
+# is sniffed off the wire during pair_init (SCTP_INIT_CAPTURE_VTAG) because it
+# is not exposed by any getsockopt.
 #
 # Increment 1 scope: NORMAL establish + vtag capture + M-CARRY inject + data
 # drive, on any stock CONFIG_IP_SCTP kernel. No NFQUEUE egress mutation
@@ -43,14 +44,17 @@ resource sctp_assoc[intptr]: 0xffffffffffffffff
 define SCTP_INIT_CAPTURE_VTAG	1
 sctp_init_flags = SCTP_INIT_CAPTURE_VTAG
 
-# vtag_mode for syz_sctp_inject_chunk. CAPTURED echoes the server's captured
+# vtag_mode for syz_sctp_inject_chunk$*. CAPTURED echoes the server's captured
 # tag (passes sctp_vtag_verify); ZERO and WRONG are negative controls the gate
 # rejects. Harness-only constants, mirrored as executor #defines; must stay in
-# sync with the .const.
+# sync with the .const. Each value is bound to its own $variant below (not a
+# flags[] arg) so the fuzzer does not spend ~2/3 of injects on the two modes
+# sctp_vtag_verify drops before any handler runs: coverage guidance keeps the
+# $captured programs that reach handlers and mutates them, while $zero/$wrong
+# remain selectable negative controls.
 define SCTP_VTAG_CAPTURED	0
 define SCTP_VTAG_ZERO	1
 define SCTP_VTAG_WRONG	2
-sctp_vtag_modes = SCTP_VTAG_CAPTURED, SCTP_VTAG_ZERO, SCTP_VTAG_WRONG
 
 syz_sctp_pair_init(flags flags[sctp_init_flags]) sctp_assoc (remote_cover)
 syz_sctp_pair_close(assoc sctp_assoc)
@@ -59,5 +63,8 @@ syz_sctp_drive_traffic(assoc sctp_assoc, data ptr[in, array[int8]], data_len len
 # chunk_type: the SCTP chunk type byte the crafted chunk carries (fuzzer-mutated
 # across the DATA/SACK/RECONF/FORWARD-TSN/... surface). chunk_payload: the
 # chunk value bytes. vtag_mode selects the verification tag stamped on the
-# common header.
-syz_sctp_inject_chunk(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode flags[sctp_vtag_modes]) (remote_cover)
+# common header; it is a per-variant const (same executor entry point for all
+# three, which reads the value as its last argument).
+syz_sctp_inject_chunk$captured(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode const[SCTP_VTAG_CAPTURED]) (remote_cover)
+syz_sctp_inject_chunk$zero(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode const[SCTP_VTAG_ZERO]) (remote_cover)
+syz_sctp_inject_chunk$wrong(assoc sctp_assoc, chunk_type int8, chunk_payload ptr[in, array[int8]], payload_len len[chunk_payload], vtag_mode const[SCTP_VTAG_WRONG]) (remote_cover)
