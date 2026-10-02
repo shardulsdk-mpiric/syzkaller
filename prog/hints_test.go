@@ -913,3 +913,22 @@ func compSet(vals ...uint64) map[uint64]map[uint64]bool {
 	}
 	return m
 }
+
+// A ranged int that ends at -1 (RangeEnd == math.MaxUint64, e.g.
+// int32be[-3:-1]) must yield exactly its values as useless hints: the value
+// loop used to compare v <= RangeEnd, which never fails once v wraps.
+func TestUselessHintsRangeEndingAtMax(t *testing.T) {
+	typ := &IntType{RangeBegin: math.MaxUint64 - 2, RangeEnd: math.MaxUint64}
+	got := typ.calcUselessHints()[len(specialInts):]
+	want := []uint64{math.MaxUint64 - 2, math.MaxUint64 - 1, math.MaxUint64}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	// Alignment: 0xfffffffffffffff0..0xffffffffffffffff step 8 is two values.
+	typ = &IntType{RangeBegin: math.MaxUint64 - 15, RangeEnd: math.MaxUint64, Align: 8}
+	got = typ.calcUselessHints()[len(specialInts):]
+	want = []uint64{math.MaxUint64 - 15, math.MaxUint64 - 7}
+	if !slices.Equal(got, want) {
+		t.Fatalf("aligned: got %v, want %v", got, want)
+	}
+}
