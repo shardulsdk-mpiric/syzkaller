@@ -18,7 +18,13 @@ set -u
 mode="${1:-}"
 
 # Private/embargoed paths (matched against repo-relative, forward-slash names).
-PROTECTED_RE='^\.claude/(tasks|mptcp|maintainers|private)/|^\.claude/users/[^/]+/(tasks|notes)/'
+# In this fork `.claude/` is tracked, public shared substrate (CLAUDE.md,
+# onboarding, extension_overview, and the shared task registry under
+# `.claude/tasks/`): see `.claude/README.md`. So `.claude/tasks/index.md`,
+# `README.md` and public `<name>/CLAUDE.md` briefs are allowed; only per-user
+# working memory and per-task `local/` scratch are private. The content sentinel
+# below still scans every added file regardless of path.
+PROTECTED_RE='^\.claude/(mptcp|maintainers|private)/|^\.claude/users/[^/]+/(tasks|notes)/|^\.claude/tasks/([^/]+/)?local/'
 # Reproducer / PoC / trigger filenames, anywhere in the tree.
 NAME_RE='(^|/)(repro|reproducer|poc|exploit|trigger)[^/]*\.(c|h|txt|sh|py|prog|syz)$'
 # Content sentinel -- assembled so this script does not contain the literal.

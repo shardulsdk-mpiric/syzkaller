@@ -30,3 +30,10 @@ executor/syscalls.h
 .gemini/
 gha-creds-*.json
 .agents/
+
+# .claude per-user / per-machine working state (the shared docs under .claude/
+# are tracked explicitly; see .claude/README.md)
+.claude/users/
+.claude/settings.local.json
+.claude/tasks/*/local/
+.claude/**/scratch/
