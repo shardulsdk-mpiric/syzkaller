@@ -31,10 +31,10 @@
 # See the "typed chunk-body inject" section.
 #
 # Scope: NORMAL establish + vtag/initial-TSN capture + M-CARRY inject + data
-# drive + the RECONF typed body, on any stock CONFIG_IP_SCTP kernel. No
-# NFQUEUE egress mutation (M-WIRE), no feature-sockopt init flags, no
-# kernel-side kcov; DATA / FORWARD-TSN / SACK typed bodies are the next
-# grammar increment.
+# drive + the RECONF / DATA / FORWARD-TSN / SACK typed bodies + the
+# stream-reset-enable init flag, on any stock CONFIG_IP_SCTP kernel. No
+# NFQUEUE egress mutation (M-WIRE), no kernel-side kcov; an opaque typed
+# catch-all and chunk bundling are the next grammar increment.
 #
 # Executor side: executor/common_linux_sctp.h.
 
@@ -50,7 +50,22 @@ resource sctp_assoc[intptr]: 0xffffffffffffffff
 # stays reproducible instead of failing "defined for none of the arches". Must
 # match the executor #define + the .const.
 define SCTP_INIT_CAPTURE_VTAG	1
-sctp_init_flags = SCTP_INIT_CAPTURE_VTAG
+# SCTP_INIT_ENABLE_STRRESET: after the handshake, setsockopt
+# SCTP_ENABLE_STREAM_RESET (assoc_value = SCTP_ENABLE_STRRESET_MASK, all
+# three request kinds) on BOTH ends. Each sctp_process_strreset_* in
+# net/sctp/stream.c answers SCTP_STRRESET_DENIED unless the receiving
+# association's strreset_enable carries the matching bit -- the check sits
+# AFTER the request_seq window, so without this flag an in-window RECONF
+# request reaches the handler but never performs (no stream SSN/MID reset,
+# no reply OUT_REQ for an IN_REQ, no stream add). The server end is the one
+# that parses the inject; the client end performs the OUT_REQ the server
+# sends back for an IN_REQ. Set on the established TCP-style sockets, where
+# the kernel writes the association's own strreset_enable directly
+# (sctp_setsockopt_enable_strreset -> sctp_id2assoc). RECONF dispatch itself
+# is not gated by net.sctp.reconf_enable (sctp_chunk_event_lookup), so no
+# sysctl is needed. Harness-only constant, mirrored in the executor + .const.
+define SCTP_INIT_ENABLE_STRRESET	2
+sctp_init_flags = SCTP_INIT_CAPTURE_VTAG, SCTP_INIT_ENABLE_STRRESET
 
 # vtag_mode for syz_sctp_inject_chunk$*. CAPTURED echoes the server's captured
 # tag (passes sctp_vtag_verify); ZERO and WRONG are negative controls the gate
@@ -297,9 +312,183 @@ sctp_strreset_addstrm_in {
 	reserved		const[0, int16be]
 } [packed]
 
-# Increment 2 of the grammar (design-noted, not implemented here): typed
-# DATA (16-byte sctp_datahdr + flags enum + user bytes, tsn via
-# SCTP_SEQ_CLIENT_TSN), FORWARD-TSN (new_cum_tsn via CLIENT_TSN + a
-# {stream, ssn} skip list) and SACK (cum_tsn_ack via SERVER_TSN + gap-ack /
-# dup-TSN arrays with len[] counts) bodies as sibling $variants of
-# syz_sctp_inject_typed; then an opaque catch-all and bundling.
+# ---------------------------------------------------------------------------
+# Typed chunk-body inject, increment 2: DATA / FORWARD-TSN / SACK.
+#
+# Sibling $variants of syz_sctp_inject_typed on the same executor entry point;
+# no new executor mode: each body's rebased sequence field is the FIRST u32 of
+# the chunk value, which is exactly what SCTP_SEQ_CLIENT_TSN / SERVER_TSN add
+# the captured base to. Every chunk below is a complete, valid-by-construction
+# body whose length and count fields are len[] / offsetof[] (recomputed after
+# every mutation), so the fuzzer varies the dimensions the handlers branch on
+# -- sequence deltas, stream ids, SSNs, flags, how many blocks / skips -- and
+# not the framing the parsers reject outright.
+#
+# A loopback fact that shapes the TSN deltas: the server SACKs whatever
+# cumulative TSN an injected DATA / FORWARD-TSN advances it to, and the real
+# CLIENT then checks that SACK's cum_tsn_ack against its own next_tsn
+# (sctp_sf_eat_sack_6_2: TSN_lte(next_tsn, ctsn) -> sctp_sf_violation_ctsn ->
+# ABORT). So a delta that advances the server's ctsn to or past the client's
+# next_tsn (client initial TSN + chunks the client has sent) tears the
+# association down a SACK later -- the injected chunk's handler still runs
+# in full, but later calls in the program lose the association. Deltas that
+# leave a GAP (DATA) or that do not advance the ctsn (FWD-TSN) do not.
+# syz_sctp_drive_traffic before the inject moves the client's next_tsn up and
+# widens the safe range by one per DATA chunk sent.
+#
+# Wire constants from include/linux/sctp.h (kernel-internal): the DATA / SACK /
+# FORWARD-TSN chunk types (enum sctp_cid) and the DATA flag bits (RFC 9260
+# §3.3.1 U/B/E + §3.3.1's I bit, RFC 7053). Given as defines so `make extract`
+# stays reproducible, like SCTP_CID_RECONF above.
+define SCTP_CID_DATA	0
+define SCTP_CID_SACK	3
+define SCTP_CID_FWD_TSN	0xc0
+define SCTP_DATA_MIDDLE_FRAG	0x00
+define SCTP_DATA_LAST_FRAG	0x01
+define SCTP_DATA_FIRST_FRAG	0x02
+define SCTP_DATA_NOT_FRAG	0x03
+define SCTP_DATA_UNORDERED	0x04
+define SCTP_DATA_SACK_IMM	0x08
+sctp_data_flags = SCTP_DATA_MIDDLE_FRAG, SCTP_DATA_LAST_FRAG, SCTP_DATA_FIRST_FRAG, SCTP_DATA_NOT_FRAG, SCTP_DATA_UNORDERED, SCTP_DATA_SACK_IMM
+
+# DATA: tsn += the CLIENT's initial TSN (= the server association's tsnmap
+# base_tsn, seeded from peer.i.initial_tsn). FORWARD-TSN: new_cum_tsn += the
+# same base. SACK: cum_tsn_ack += the SERVER's initial TSN (= its own next_tsn
+# / ctsn_ack_point + 1 seed, from c.initial_tsn). (no_squash) as for $reconf:
+# each body is a varlen struct, which prog/any.go would otherwise flatten to
+# an ANYBLOB on some mutations and lose the len[] recomputation.
+syz_sctp_inject_typed$data(assoc sctp_assoc, chunk ptr[in, sctp_chunk_data], chunk_len len[chunk], seq_mode const[SCTP_SEQ_CLIENT_TSN]) (remote_cover, no_squash)
+syz_sctp_inject_typed$fwdtsn(assoc sctp_assoc, chunk ptr[in, sctp_chunk_fwdtsn], chunk_len len[chunk], seq_mode const[SCTP_SEQ_CLIENT_TSN]) (remote_cover, no_squash)
+syz_sctp_inject_typed$sack(assoc sctp_assoc, chunk ptr[in, sctp_chunk_sack], chunk_len len[chunk], seq_mode const[SCTP_SEQ_SERVER_TSN]) (remote_cover, no_squash)
+
+# DATA tsn delta over the client's initial TSN. sctp_tsnmap_check
+# (net/sctp/tsnmap.c) on the server's peer tsnmap: <= its cumulative ack
+# point (initial TSN - 1 + N chunks the client sent) is a duplicate
+# (SCTP_IERROR_DUP_TSN, reported in the next SACK's dup list); == ack point
+# + 1 is the contiguous fresh TSN (delivered, then the SACK echo aborts the
+# association from the client side, see above); larger values up to the
+# 4096-TSN map are fresh-with-a-gap: delivered out of order, held in the
+# tsnmap / ulpq, and SACKed back with gap-ack blocks the client processes
+# (sctp_outq_sack on TSNs it never sent). The range keeps gap-fresh the
+# common case; >= base + 4096 (SCTP_IERROR_HIGH_TSN, silent discard) stays
+# reachable through the 1-in-100 whole-range draw of ranged ints.
+type sctp_data_tsn int32be[0:64]
+
+# DATA (RFC 9260 §3.3.1, struct sctp_data_chunk = chunk header + 16-byte
+# sctp_datahdr + user data). Gates in order (sctp_sf_eat_data_6_2 ->
+# sctp_eat_data, net/sctp/sm_statefuns.c): length >= 20
+# (sctp_chunk_length_valid vs sctp_datachk_len; the non-interleave vtable on a
+# stock association, so an I-DATA-typed chunk is NOT what this is); the tsn
+# window above; datalen != 0 (an empty DATA is SCTP_IERROR_NO_DATA -> ABORT,
+# hence the 1-byte minimum -- valid by construction); the rwnd spill check
+# (64 bytes is far under the default rwnd); stream < incnt
+# (sctp_stream_id: 0..9 pass on the 10-stream loopback association, 10..11
+# take the SCTP_ERROR_INV_STRM op-error branch, SCTP_IERROR_BAD_STREAM, which
+# is NOT a teardown); then validate_data (net/sctp/stream_interleave.c): an
+# ordered chunk's ssn must be >= the stream's expected incoming SSN (0 on a
+# fresh stream, +1 per ordered message delivered -- drive_traffic advances
+# stream 0's), else SCTP_IERROR_PROTO_VIOLATION (abort); the UNORDERED flag
+# skips that check. ssn above the expected value parks the chunk in the ulpq
+# ordering queue (sctp_ulpq_store_ordered) until a FORWARD-TSN skip or the
+# missing SSNs arrive -- the reordering / reassembly state the grammar is
+# after. flags: B/E (FIRST/LAST; NOT_FRAG = both, MIDDLE = neither) drive
+# sctp_ulpq_reasm fragment assembly, U the unordered path, I an immediate
+# SACK. ppid is byte-order-opaque to the kernel (passed through to the user).
+sctp_chunk_data {
+	type		const[SCTP_CID_DATA, int8]
+	flags		flags[sctp_data_flags, int8]
+	length		offsetof[end, int16be]
+	tsn		sctp_data_tsn
+	stream		sctp_stream_id
+	ssn		int16be[0:16]
+	ppid		int32
+	user_data	array[int8, 1:64]
+	end		void
+} [packed, align[4]]
+
+# FORWARD-TSN new_cum_tsn delta over the client's initial TSN. The only hard
+# gate is sctp_tsnmap_check < 0 (>= base + 4096, discard; whole-range draw);
+# a delta at or below the server's cumulative ack point passes the check as
+# "old" and sctp_tsnmap_skip then leaves the map alone, while a larger one
+# advances the ack point to it (base_tsn += gap, map shifted) -- and is then
+# SACKed to the client, which aborts unless it has itself sent past that TSN
+# (see the loopback note above). Either way the skip list is still processed
+# (SCTP_CMD_PROCESS_FWDTSN is queued whenever there is one), so the no-advance
+# values below are the cheap way to drive sctp_ulpq_skip without spending the
+# association.
+type sctp_fwdtsn_delta int32be[-2:4]
+
+# FORWARD-TSN (RFC 3758 §3.2, struct sctp_fwdtsn_chunk + sctp_fwdtsn_skip[]).
+# sctp_sf_eat_fwd_tsn: peer.prsctp_capable (negotiated for real during the
+# handshake because net.sctp.prsctp_enable defaults to 1 on both loopback
+# ends -- no sockopt needed), else sctp_sf_unk_chunk; length >= 8
+# (sctp_ftsnchk_len); the tsn check above; then validate_ftsn
+# (stream_interleave.c): sctp_walk_fwdtsn strides sizeof(sctp_fwdtsn_skip) = 4
+# across length - 8, ignoring a trailing partial entry (the typed array
+# yields exactly 8 + 4k, so no byte is ignored), and EVERY skip->stream must
+# be < incnt or the chunk is discarded (not a teardown): sctp_stream_id's
+# 10..11 are that branch. Per accepted skip, sctp_ulpq_skip: an ssn below the
+# stream's expected SSN is ignored, otherwise the expected SSN jumps to
+# ssn + 1 and sctp_ulpq_reap_ordered releases anything parked behind it
+# (the DATA ssn range above is sized to feed this).
+sctp_chunk_fwdtsn {
+	type		const[SCTP_CID_FWD_TSN, int8]
+	flags		const[0, int8]
+	length		offsetof[end, int16be]
+	new_cum_tsn	sctp_fwdtsn_delta
+	skips		array[sctp_fwdtsn_skip, 0:4]
+	end		void
+} [packed, align[4]]
+
+sctp_fwdtsn_skip {
+	stream	sctp_stream_id
+	ssn	int16be[0:16]
+} [packed]
+
+# SACK cum_tsn_ack delta over the SERVER's initial TSN. The server association
+# (the parser) has sent no DATA of its own, so next_tsn == its initial TSN and
+# ctsn_ack_point == initial TSN - 1 (net/sctp/associola.c). sctp_sf_eat_sack_6_2:
+# TSN_lte(next_tsn, ctsn), i.e. delta >= 0, is sctp_sf_violation_ctsn (ABORT
+# -- left to the whole-range draw); TSN_lt(ctsn, ctsn_ack_point), delta <= -2,
+# is a silent DISCARD; delta == -1 is the one value that proceeds to
+# SCTP_CMD_PROCESS_SACK -> sctp_outq_sack (net/sctp/outqueue.c): a_rwnd becomes
+# the peer rwnd (0 = zero_window_announced), the gap-ack blocks feed
+# highest_sacked / unack_data / sctp_check_transmitted on the (empty) retransmit
+# queues, the dup list is skipped over. Two in-window values are kept so the
+# discard branch is generated, not only the processed one.
+type sctp_sack_ctsn int32be[-3:-1]
+
+# SACK (RFC 9260 §3.3.4, struct sctp_sack_chunk = chunk header + 16-byte
+# sctp_sackhdr + num_gap_ack_blocks x {start, end} + num_dup_tsns x u32).
+# Gates: length >= 20 (sctp_chunk_length_valid); sctp_sm_pull_sack recomputes
+# 16 + (num_gap_ack_blocks + num_dup_tsns) * 4 and discards the chunk if that
+# exceeds the chunk value -- the two counts are len[] of their arrays, so they
+# agree by construction and stay agreed under mutation; then the cum_tsn_ack
+# window above. A gap-ack block is a pair of u16 offsets from cum_tsn_ack
+# (sctp_acked: start <= tsn - ctsn <= end); 1..16 keeps them in the shape the
+# arithmetic expects while leaving start > end and overlaps reachable. dup
+# TSNs are absolute values in the server's own TSN space (not rebased: only
+# the first u32 is) and the kernel does not act on them beyond the length
+# math, so they are left free.
+sctp_chunk_sack {
+	type		const[SCTP_CID_SACK, int8]
+	flags		const[0, int8]
+	length		offsetof[end, int16be]
+	cum_tsn_ack	sctp_sack_ctsn
+	a_rwnd		int32be
+	num_gap		len[gap_blocks, int16be]
+	num_dup		len[dup_tsns, int16be]
+	gap_blocks	array[sctp_gap_ack_block, 0:4]
+	dup_tsns	array[int32be, 0:4]
+	end		void
+} [packed, align[4]]
+
+sctp_gap_ack_block {
+	start	int16be[1:16]
+	end	int16be[1:16]
+} [packed]
+
+# Increment 3 of the grammar (design-noted, not implemented here): an opaque
+# typed catch-all (free chunk type + flags + opaque body, keeping
+# sctp_sf_unk_chunk and the flat chunks reachable through the typed path) and
+# chunk bundling (several typed chunks in one packet).
