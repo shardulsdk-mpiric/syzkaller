@@ -73,6 +73,7 @@
 #define STRUCTOPS_REC_BTF 1u
 #define STRUCTOPS_REC_INSTANCE 2u
 #define STRUCTOPS_REC_PROG 3u
+#define STRUCTOPS_REC_SPEC 4u // host-only generative spec; skipped here
 #define STRUCTOPS_INSTANCE_FLAG_LINK 1u
 #define STRUCTOPS_STRUCT_NAME_LEN 64
 #define STRUCTOPS_MEMBER_LEN 32
@@ -608,6 +609,10 @@ static int structops_parse_recipe(const uint8* blob, uint32 len, struct structop
 			r->nprogs++;
 			break;
 		}
+		case STRUCTOPS_REC_SPEC:
+			// The generative spec the host materialized this recipe from
+			// (pkg/structops/spec.go); meaningful only host-side.
+			break;
 		default:
 			return -1;
 		}

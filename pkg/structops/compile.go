@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"embed"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io/fs"
@@ -36,7 +37,13 @@ import (
 // which syzbot-style reproducers already are.
 //
 // Results are cached by sha256 of the source (the render is deterministic
-// per seed, and the same program is re-executed many times in triage).
+// per spec, and the same program is re-executed many times in triage):
+// in memory for the hot set, and on disk under the per-kernel cache root
+// so a manager restart on the same kernel re-materializes its corpus
+// without recompiling it.  The spec-storage design (the corpus persists
+// the generative spec, not the recipe) rides on this cache: generation
+// compiles once to validate + warm it, and the per-exec materialize step
+// (pkg/structops/materialize) is then a lookup.
 
 //go:embed include
 var shimFS embed.FS
@@ -61,7 +68,8 @@ type compiler struct {
 	cfg           CompileConfig
 	incDir        string // -I dir: vmlinux.h + bpf/ shims + structops_shim.h
 	objDir        string
-	layoutChecked int // structs the Configure-time layout self-check compared
+	kernelKey     uint64 // sha256(vmlinux.h contents) prefix, see KernelKey
+	layoutChecked int    // structs the Configure-time layout self-check compared
 	mu            sync.Mutex
 	cache         map[[32]byte][]byte
 	stats         CompileStats
@@ -71,9 +79,14 @@ type compiler struct {
 
 // CompileStats counts what the compile step did (for logging/measurement).
 type CompileStats struct {
-	Compiled, CacheHits, Failed int
-	CompileTime                 time.Duration
+	Compiled, CacheHits, DiskHits, Failed int
+	CompileTime                           time.Duration
 }
+
+// memCacheEntries bounds the in-memory recipe cache (a recipe is 60-160KB,
+// BTF-dominated); the on-disk cache under objDir backs it, so a flush only
+// costs a file read per program.
+const memCacheEntries = 1024
 
 var (
 	compilerMu  sync.Mutex
@@ -138,6 +151,21 @@ func Configured() bool {
 	compilerMu.Lock()
 	defer compilerMu.Unlock()
 	return theCompiler != nil
+}
+
+// KernelKey identifies the kernel BTF the compile step targets: the first
+// 8 bytes of sha256 over the vmlinux.h it compiles against (a content hash,
+// so a rebuild with identical types keeps the key).  Recipes record it
+// (recipe.go SPEC record) so a recipe compiled for another kernel can be
+// told apart from one compiled for this kernel and re-materialized.  Zero
+// before Configure.
+func KernelKey() uint64 {
+	compilerMu.Lock()
+	defer compilerMu.Unlock()
+	if theCompiler == nil {
+		return 0
+	}
+	return theCompiler.kernelKey
 }
 
 // ErrNotConfigured is returned by Compile before Configure.
@@ -217,7 +245,8 @@ func (c *compiler) doInit() error {
 	}
 	dst := filepath.Join(c.incDir, "vmlinux.h")
 	if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
-		return nil // already dumped for this kernel
+		// Already dumped for this kernel.
+		return c.setKernelKey(dst)
 	}
 	var data []byte
 	if c.cfg.VmlinuxH != "" {
@@ -241,7 +270,20 @@ func (c *compiler) doInit() error {
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("structops: %w", err)
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	return c.setKernelKey(dst)
+}
+
+func (c *compiler) setKernelKey(vmlinuxH string) error {
+	data, err := os.ReadFile(vmlinuxH)
+	if err != nil {
+		return fmt.Errorf("structops: %w", err)
+	}
+	h := sha256.Sum256(data)
+	c.kernelKey = binary.LittleEndian.Uint64(h[:8])
+	return nil
 }
 
 func (c *compiler) compile(src string) ([]byte, error) {
@@ -249,6 +291,7 @@ func (c *compiler) compile(src string) ([]byte, error) {
 		return nil, err
 	}
 	key := sha256.Sum256([]byte(src))
+	name := hex.EncodeToString(key[:8])
 	c.mu.Lock()
 	if r, ok := c.cache[key]; ok {
 		c.stats.CacheHits++
@@ -257,9 +300,15 @@ func (c *compiler) compile(src string) ([]byte, error) {
 	}
 	c.mu.Unlock()
 
-	start := time.Now()
-	recipe, err := c.compileUncached(src, hex.EncodeToString(key[:8]))
-	elapsed := time.Since(start)
+	diskPath := filepath.Join(c.objDir, name+".recipe")
+	recipe, err := os.ReadFile(diskPath)
+	fromDisk := err == nil && IsRecipe(recipe)
+	var elapsed time.Duration
+	if !fromDisk {
+		start := time.Now()
+		recipe, err = c.compileUncached(src, name)
+		elapsed = time.Since(start)
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -268,9 +317,19 @@ func (c *compiler) compile(src string) ([]byte, error) {
 		c.stats.Failed++
 		return nil, err
 	}
-	c.stats.Compiled++
-	if len(c.cache) >= 4096 {
-		c.cache = make(map[[32]byte][]byte) // bounded; a flush is cheap
+	if fromDisk {
+		c.stats.DiskHits++
+	} else {
+		c.stats.Compiled++
+		// Persist for the next manager run on this kernel (the cache root
+		// is keyed by the vmlinux identity); best effort.
+		tmp := diskPath + ".tmp"
+		if os.WriteFile(tmp, recipe, 0644) == nil {
+			os.Rename(tmp, diskPath)
+		}
+	}
+	if len(c.cache) >= memCacheEntries {
+		c.cache = make(map[[32]byte][]byte) // bounded; disk backs it
 	}
 	c.cache[key] = recipe
 	return recipe, nil

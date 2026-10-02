@@ -8,18 +8,27 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/structops"
+	"github.com/google/syzkaller/pkg/structops/materialize"
 	"github.com/google/syzkaller/prog"
 )
 
 // TestStructOpsBlobGeneration checks the SpecialTypes wiring end to end
 // through the fuzzer's own generator and mutator: generating
-// syz_bpf_struct_ops_load$X yields a blob that is a rendered struct_ops
-// translation unit for surface X, and mutating the program re-generates
-// the blob (it is never byte-flipped into a non-TU).
+// syz_bpf_struct_ops_load$X yields a blob that is the generative spec of a
+// struct_ops program for surface X (which decodes and renders to the
+// surface's translation unit), and mutating the program re-generates the
+// blob (it is never byte-flipped into a non-spec).
 func TestStructOpsBlobGeneration(t *testing.T) {
 	target, err := prog.GetTarget("linux", "amd64")
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The materializer recognizes blobs by the object struct type name.
+	for name := range target.SpecialTypes {
+		if strings.HasPrefix(name, "bpf_struct_ops") && !strings.HasPrefix(name, materialize.ObjTypePrefix) {
+			t.Errorf("SpecialTypes %q does not carry materialize.ObjTypePrefix %q", name, materialize.ObjTypePrefix)
+		}
 	}
 	for _, tc := range []struct {
 		call  string
@@ -59,7 +68,15 @@ func TestStructOpsBlobGeneration(t *testing.T) {
 						continue
 					}
 					found = true
-					blob := structOpsBlob(t, c)
+					raw := structOpsBlob(t, c)
+					if !structops.IsSpec([]byte(raw)) {
+						t.Fatalf("%s: blob is not a spec (%d bytes)", stage, len(raw))
+					}
+					sop, err := structops.DecodeSpec([]byte(raw))
+					if err != nil {
+						t.Fatalf("%s: %v", stage, err)
+					}
+					blob := sop.Render()
 					for _, frag := range tc.frags {
 						if !strings.Contains(blob, frag) {
 							t.Errorf("%s: blob lacks %q\n---\n%s", stage, frag, blob)

@@ -59,6 +59,30 @@ func TestCompileRecipe(t *testing.T) {
 				if err != nil || string(again) != string(blob) {
 					t.Fatalf("seed %d: cache miss/mismatch: %v", seed, err)
 				}
+				// Spec storage: the spec re-renders to the same source, so
+				// materializing it is this same cache entry.
+				spec := EncodeSpec(p, seed)
+				q, err := DecodeSpec(spec)
+				if err != nil {
+					t.Fatalf("seed %d: %v", seed, err)
+				}
+				if q.Render() != src {
+					t.Fatalf("seed %d: spec re-render differs from the compiled source", seed)
+				}
+				hits := Stats().CacheHits
+				viaSpec, err := Compile(q.Render())
+				if err != nil || string(viaSpec) != string(blob) || Stats().CacheHits != hits+1 {
+					t.Fatalf("seed %d: materialize via spec was not a cache hit: %v", seed, err)
+				}
+				withSpec, err := AttachSpec(blob, KernelKey(), spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := ParseRecipe(withSpec); err != nil {
+					t.Fatalf("seed %d: recipe with SPEC record: %v", seed, err)
+				}
+				t.Logf("seed %d: spec %d bytes, recipe %d bytes (%.1fx)", seed, len(spec), len(blob),
+					float64(len(blob))/float64(len(spec)))
 			}
 			st := Stats()
 			t.Logf("%s: %d seeds compiled in %v, %.0f ms/compile",
@@ -67,6 +91,23 @@ func TestCompileRecipe(t *testing.T) {
 				t.Errorf("failed compiles: %d", st.Failed)
 			}
 		})
+	}
+	if KernelKey() == 0 {
+		t.Error("KernelKey is zero after Configure")
+	}
+	// The on-disk cache serves a fresh compiler for the same kernel without
+	// recompiling: same cache dir, new process-level state.
+	cacheDir := theCompiler.cfg.CacheDir
+	before := Stats()
+	if err := Configure(CompileConfig{KernelObj: kobj, CacheDir: cacheDir}); err != nil {
+		t.Fatal(err)
+	}
+	src := Generate(rand.New(rand.NewSource(0)), TCPCong).Render()
+	if _, err := Compile(src); err != nil {
+		t.Fatal(err)
+	}
+	if st := Stats(); st.DiskHits != 1 || st.Compiled != 0 {
+		t.Errorf("restart on the same kernel recompiled: %+v (previous run %+v)", st, before)
 	}
 }
 
