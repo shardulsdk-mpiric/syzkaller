@@ -94,12 +94,12 @@ existing per-object coverage-handle mechanism (the same approach vhost /
 io_uring / usbip use), so there is **no new kernel UAPI**. The patches are
 optional: the harness runs without them, just coverage-blind on those paths.
 
-## Pre-merge differential: tools/mpiric-diff
+## Pre-merge differential: tools/syz-diffrepro
 
 Built on syzkaller's own diff engine. It fuzzes a base-vs-patched kernel pair
 aimed at the changed code, reproduces a crash, and replays it on the base to
 classify patched-only regressions -- catching a regression before it merges.
-See `tools/mpiric-diff/README.md`.
+See `tools/syz-diffrepro/README.md`.
 
 ## Durable corpus (struct_ops)
 
@@ -134,6 +134,6 @@ executor/common_linux_*.h         <- C carriers (what actually runs)
 pkg/structops/                    <- eBPF struct_ops generator + materialize
 pkg/vminfo/linux_syscalls.go      <- pseudo-syscall registration
 kernel_patches/                   <- optional kcov keystones (no UAPI change)
-tools/mpiric-diff/                <- pre-merge differential driver
+tools/syz-diffrepro/                <- pre-merge differential driver
 docs/linux/mptcp_protocol_fuzzing.md  <- MPTCP op-set reference
 ```

@@ -1,8 +1,8 @@
 // Copyright 2026 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-// mpiric-diff drives the differential (base vs patched kernel) fuzzing engine in
-// pkg/manager/diff through its exported API only.  It is Mpiric's replacement
+// syz-diffrepro drives the differential (base vs patched kernel) fuzzing engine in
+// pkg/manager/diff through its exported API only.  It is a replacement
 // driver for tools/syz-diff, which cannot run: that driver never sets the
 // mandatory Config.PatchedOnly channel, so diff.Run fails before booting a VM.
 //
@@ -62,7 +62,7 @@ var (
 	flagBaseObj    = flag.String("base_obj", "", "base vmlinux.o for symbol hashes (default: <base kernel_obj>/vmlinux.o)")
 	flagPatchedObj = flag.String("patched_obj", "",
 		"patched vmlinux.o for symbol hashes (default: <patched kernel_obj>/vmlinux.o)")
-	flagOut  = flag.String("out", "", "output directory (default: <patched workdir>/mpiric-diff)")
+	flagOut  = flag.String("out", "", "output directory (default: <patched workdir>/syz-diffrepro)")
 	flagTime = flag.Duration("time", 2*time.Hour,
 		"total run time; the engine is cancelled and the summary written after it")
 	flagTriage = flag.Duration("triage", 0,
@@ -80,7 +80,7 @@ var (
 func main() {
 	flag.Parse()
 	if !prog.GitRevisionKnown() {
-		log.Fatalf("bad mpiric-diff build: build with 'make mpiric-diff', run bin/mpiric-diff")
+		log.Fatalf("bad syz-diffrepro build: build with 'make syz-diffrepro', run bin/syz-diffrepro")
 	}
 	if *flagBase == "" || *flagPatched == "" {
 		log.Fatalf("both -base and -patched configs are required")
@@ -117,7 +117,7 @@ func main() {
 
 	outDir := *flagOut
 	if outDir == "" {
-		outDir = filepath.Join(patchedCfg.Workdir, "mpiric-diff")
+		outDir = filepath.Join(patchedCfg.Workdir, "syz-diffrepro")
 	}
 	artifactsDir := filepath.Join(outDir, "artifacts")
 	if err := osutil.MkdirAll(artifactsDir); err != nil {
@@ -147,7 +147,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(vm.ShutdownCtx(), *flagTime)
 	defer cancel()
 
-	log.Logf(0, "mpiric-diff: run time %v, triage deadline %v, reach gate %v, output %v",
+	log.Logf(0, "syz-diffrepro: run time %v, triage deadline %v, reach gate %v, output %v",
 		*flagTime, *flagTriage, *flagReach, outDir)
 	err = run(ctx, baseCfg, patchedCfg, store, sink, ignoreRe, outDir)
 	switch {
@@ -472,7 +472,7 @@ func writeSummary(outDir string, store *manager.DiffFuzzerStore, sink *bugSink, 
 	}
 
 	var text strings.Builder
-	fmt.Fprintf(&text, "mpiric-diff summary (%s)\n\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(&text, "syz-diffrepro summary (%s)\n\n", time.Now().Format(time.RFC3339))
 	printRow := func(sb summaryBug) {
 		fmt.Fprintf(&text, "  %s\n    status=%s patched crashes=%d base crashes=%d deliveries=%d "+
 			"reliability=%.2f c_repro=%v\n", sb.Title, sb.Status, sb.PatchedCrashes, sb.BaseCrashes,

@@ -34,7 +34,7 @@ git config core.hooksPath githooks   # activate the commit guard (see sec. 6)
 Remotes, by convention: `fork` = this repo (feature branches live here),
 `origin` = google/syzkaller (upstream; clean non-protocol fixes go there under
 the CLA). The integrated protocol-flow work -- all surfaces (MPTCP, SCTP, HID,
-eBPF struct_ops) plus the keystones, `tools/mpiric-diff`, and this `.claude/` --
+eBPF struct_ops) plus the keystones, `tools/syz-diffrepro`, and this `.claude/` --
 lives on the `protocol-flow-harness` branch.
 
 ## 3. Build
@@ -105,5 +105,5 @@ To replay or minimize a single program outside the manager, use `syz-execprog`
 | understand the design | `.claude/extension_overview.md` |
 | use the MPTCP ops | `docs/linux/mptcp_protocol_fuzzing.md` |
 | apply coverage keystones | `kernel_patches/README.md` |
-| run a pre-merge diff | `tools/mpiric-diff/README.md` |
+| run a pre-merge diff | `tools/syz-diffrepro/README.md` |
 | know the general fuzzer | upstream `docs/` (syzkaller's own docs) |

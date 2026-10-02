@@ -48,7 +48,7 @@ Everything not listed here is upstream syzkaller. Our additions:
   for host-side re-materialization of the corpus against live BTF).
 - `kernel_patches/` -- optional, apply-ready kcov "keystone" series (no new
   UAPI) that make softirq/workqueue coverage visible. See its `README.md`.
-- `tools/mpiric-diff/` -- a pre-merge differential driver built on syzkaller's
+- `tools/syz-diffrepro/` -- a pre-merge differential driver built on syzkaller's
   own diff engine (base vs. patched, aimed at a diff). See its `README.md`.
 - `docs/linux/mptcp_protocol_fuzzing.md`, `CLAUDE.md`, `.claude/` -- docs and
   working context.

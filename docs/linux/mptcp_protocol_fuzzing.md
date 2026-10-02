@@ -28,9 +28,9 @@ This is an **extension** of that lineage, not a new platform. Preserve `LICENSE`
 2. An **`mptcp_token` resource** (`getsockopt$inet_mptcp_info` → `MPTCP_PM_ATTR_TOKEN`)
    so the path-manager netlink commands can name a real msk (upstream types the token as
    a bare int32 that no valid value can reach).
-3. A **differential pre-merge driver** (`tools/mpiric-diff`) that fuzzes a patched kernel
+3. A **differential pre-merge driver** (`tools/syz-diffrepro`) that fuzzes a patched kernel
    aimed at a diff, reproduces crashes, and replays them on the base kernel to classify
-   patched-only regressions. See `tools/mpiric-diff/README.md`.
+   patched-only regressions. See `tools/syz-diffrepro/README.md`.
 
 ## The op-set
 
@@ -110,16 +110,16 @@ Notes:
 
 ## Differential pre-merge fuzzing
 
-`tools/mpiric-diff` fuzzes a **patched** kernel aimed at a `git diff`, reproduces each
+`tools/syz-diffrepro` fuzzes a **patched** kernel aimed at a `git diff`, reproduces each
 crash, and replays it on the **base** kernel to report patched-only regressions with a
 reproducer. Build with `make` (it must carry the same git+descriptions revision as the
 executor), then:
 
 ```
-bin/mpiric-diff -base cfg/base.cfg -patched cfg/patched.cfg -patch series.diff -time 4h
+bin/syz-diffrepro -base cfg/base.cfg -patched cfg/patched.cfg -patch series.diff -time 4h
 ```
 
-See `tools/mpiric-diff/README.md` for the full flag set and output layout.
+See `tools/syz-diffrepro/README.md` for the full flag set and output layout.
 
 ### Manual-pass discipline for race bugs (important)
 
