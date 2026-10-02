@@ -56,10 +56,12 @@
 #if SYZ_EXECUTOR || __NR_syz_bpf_struct_ops_load
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -85,6 +87,11 @@
 #define STRUCTOPS_BPF_PROG_LOAD 5
 #define STRUCTOPS_BPF_BTF_LOAD 18
 #define STRUCTOPS_BPF_LINK_CREATE 28
+#define STRUCTOPS_BPF_OBJ_GET_INFO_BY_FD 15
+#define STRUCTOPS_BPF_ENABLE_STATS 32
+#define STRUCTOPS_BPF_PROG_INFO_RUN_CNT_OFF 200 // offsetof(struct bpf_prog_info, run_cnt)
+#define STRUCTOPS_BPF_PROG_INFO_LEN 232
+#define STRUCTOPS_TCP_CONGESTION 13 // setsockopt(IPPROTO_TCP, TCP_CONGESTION)
 #define STRUCTOPS_BPF_MAP_TYPE_STRUCT_OPS 26
 #define STRUCTOPS_BPF_PROG_TYPE_STRUCT_OPS 27
 #define STRUCTOPS_BPF_STRUCT_OPS_ATTACH 44 // enum bpf_attach_type BPF_STRUCT_OPS
@@ -197,6 +204,16 @@ struct structops_attr_link_create {
 	uint32 target_fd;
 	uint32 attach_type;
 	uint32 flags;
+};
+
+struct structops_attr_obj_info {
+	uint32 bpf_fd;
+	uint32 info_len;
+	uint64 info;
+};
+
+struct structops_attr_enable_stats {
+	uint32 type; // BPF_STATS_RUN_TIME = 0
 };
 
 struct structops_bpf_func_info {
@@ -637,12 +654,103 @@ static void structops_debug_log(const char* what)
 }
 #endif
 
-// --- Per-surface hook: make the registered instance the selected one where
-// a kernel-wide default exists.  mptcp_sched_ops: the netns sysctl selects
-// the scheduler new MPTCP sockets use; the registration is only exercised
-// if selected.  tcp_congestion_ops is selected per socket
-// (setsockopt(TCP_CONGESTION)) and left to the program.
-static void structops_select(const char* struct_name, const char* name)
+// --- Per-surface exercise tail: make the kernel actually call the
+// registered callbacks.  A registration alone covers the struct_ops
+// machinery and the subsystem's register path; the callbacks (and the
+// kfuncs they call) only run when a socket uses the instance.  The name
+// is the one this loader just registered (unique per load), handed in by
+// the caller -- it is not knowable at generation time.
+//
+// mptcp_sched_ops: the netns sysctl selects the scheduler for every MPTCP
+// socket created afterwards; the program's own syz_mptcp_pair_init /
+// drive_traffic calls then run the callbacks with keystone coverage.
+//
+// tcp_congestion_ops: selected per socket, so the tail opens a loopback
+// TCP connection with setsockopt(TCP_CONGESTION, name) on both ends and
+// moves a little data each way.  init runs at setsockopt, cong_avoid on
+// every ACK in slow start / avoidance, release at close; ssthresh and
+// undo_cwnd need loss or an undo and fire only when a program's other
+// calls disturb the connection (that is what the fuzzer is for).
+
+#define STRUCTOPS_TCP_CA_CHUNK 4096
+#define STRUCTOPS_TCP_CA_CHUNKS 32
+
+// structops_tcp_ca_transfer moves chunks x CHUNK bytes from tx to rx in
+// lockstep (each chunk fully received before the next is sent, so nothing
+// ever blocks on a full buffer); returns bytes received.
+static long structops_tcp_ca_transfer(int tx, int rx, char* buf)
+{
+	long total = 0;
+	int c = 0;
+	for (; c < STRUCTOPS_TCP_CA_CHUNKS; c++) {
+		if (send(tx, buf, STRUCTOPS_TCP_CA_CHUNK, MSG_NOSIGNAL) != STRUCTOPS_TCP_CA_CHUNK)
+			return total;
+		long got = 0;
+		while (got < STRUCTOPS_TCP_CA_CHUNK) {
+			long n = recv(rx, buf, STRUCTOPS_TCP_CA_CHUNK - got, 0);
+			if (n <= 0)
+				return total;
+			got += n;
+		}
+		total += got;
+	}
+	return total;
+}
+
+static void structops_exercise_tcp_ca(const char* name)
+{
+	int srv = -1, cli = -1, acc = -1;
+	long fwd = 0, back = 0;
+	char* buf = (char*)malloc(STRUCTOPS_TCP_CA_CHUNK);
+	if (!buf)
+		return;
+	memset(buf, 0x5a, STRUCTOPS_TCP_CA_CHUNK);
+	struct timeval tmo;
+	tmo.tv_sec = 1;
+	tmo.tv_usec = 0;
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(0x7f000001); // 127.0.0.1
+	socklen_t alen = sizeof(addr);
+	srv = socket(AF_INET, SOCK_STREAM, 0);
+	cli = socket(AF_INET, SOCK_STREAM, 0);
+	if (srv < 0 || cli < 0)
+		goto out;
+	// The listener's choice is inherited by the accepted socket, so both
+	// directions run under the registered instance.
+	if (setsockopt(srv, IPPROTO_TCP, STRUCTOPS_TCP_CONGESTION, name, strlen(name)) ||
+	    setsockopt(cli, IPPROTO_TCP, STRUCTOPS_TCP_CONGESTION, name, strlen(name))) {
+		debug("structops: setsockopt(TCP_CONGESTION, %s) failed: %d\n", name, errno);
+		goto out;
+	}
+	if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) || listen(srv, 1) ||
+	    getsockname(srv, (struct sockaddr*)&addr, &alen) ||
+	    connect(cli, (struct sockaddr*)&addr, sizeof(addr))) {
+		debug("structops: tcp_ca exercise: loopback setup failed: %d\n", errno);
+		goto out;
+	}
+	acc = accept(srv, NULL, NULL);
+	if (acc < 0)
+		goto out;
+	setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
+	setsockopt(acc, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
+	setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof(tmo));
+	setsockopt(acc, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof(tmo));
+	fwd = structops_tcp_ca_transfer(cli, acc, buf);
+	back = structops_tcp_ca_transfer(acc, cli, buf);
+	debug("structops: tcp_ca exercise under %s: %ld + %ld bytes over loopback\n", name, fwd, back);
+out:
+	if (acc >= 0)
+		close(acc);
+	if (cli >= 0)
+		close(cli);
+	if (srv >= 0)
+		close(srv);
+	free(buf);
+}
+
+static void structops_exercise(const char* struct_name, const char* name)
 {
 	if (strcmp(struct_name, "mptcp_sched_ops") == 0) {
 		int fd = open("/proc/sys/net/mptcp/scheduler", O_WRONLY);
@@ -654,8 +762,41 @@ static void structops_select(const char* struct_name, const char* name)
 			debug("structops: selecting mptcp scheduler %s failed: %d\n", name, errno);
 		}
 		close(fd);
+	} else if (strcmp(struct_name, "tcp_congestion_ops") == 0) {
+		structops_exercise_tcp_ca(name);
 	}
 }
+
+#if SYZ_EXECUTOR
+// structops_debug_run_counts reports how many times the kernel ran each
+// callback program (bpf_prog_info.run_cnt), the ground truth that the
+// exercise tail reached them.  Counting is only on while a
+// BPF_ENABLE_STATS fd is open, so the caller opens one before exercising.
+static int structops_enable_stats(void)
+{
+	struct structops_attr_enable_stats attr;
+	memset(&attr, 0, sizeof(attr));
+	return structops_bpf(STRUCTOPS_BPF_ENABLE_STATS, &attr, sizeof(attr));
+}
+
+static void structops_debug_run_counts(const struct structops_recipe* r, const int* prog_fds)
+{
+	uint32 i = 0;
+	for (; i < r->nprogs; i++) {
+		uint8 info[STRUCTOPS_BPF_PROG_INFO_LEN];
+		memset(info, 0, sizeof(info));
+		struct structops_attr_obj_info attr;
+		memset(&attr, 0, sizeof(attr));
+		attr.bpf_fd = (uint32)prog_fds[i];
+		attr.info_len = sizeof(info);
+		attr.info = (uint64)(unsigned long)info;
+		uint64 run_cnt = 0;
+		if (structops_bpf(STRUCTOPS_BPF_OBJ_GET_INFO_BY_FD, &attr, sizeof(attr)) == 0)
+			memcpy(&run_cnt, info + STRUCTOPS_BPF_PROG_INFO_RUN_CNT_OFF, sizeof(run_cnt));
+		debug("structops: %s.%s run_cnt=%llu\n", r->struct_name, r->progs[i].member, (unsigned long long)run_cnt);
+	}
+}
+#endif
 
 static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 {
@@ -698,6 +839,9 @@ static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 	uint8* value = NULL;
 	uint32 key = 0;
 	char name[16];
+#if SYZ_EXECUTOR
+	int stats_fd = -1;
+#endif
 
 	// 1. The object's BTF.
 	struct structops_attr_btf_load battr;
@@ -850,7 +994,17 @@ static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 		goto out;
 	}
 	debug("structops: %s registered as %s (%u callbacks), link fd=%d\n", r.struct_name, name, r.nprogs, ret);
-	structops_select(r.struct_name, name);
+#if SYZ_EXECUTOR
+	if (flag_debug)
+		stats_fd = structops_enable_stats();
+#endif
+	structops_exercise(r.struct_name, name);
+#if SYZ_EXECUTOR
+	if (stats_fd >= 0) {
+		structops_debug_run_counts(&r, prog_fds);
+		close(stats_fd);
+	}
+#endif
 	err = 0;
 
 out:
