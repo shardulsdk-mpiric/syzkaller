@@ -255,11 +255,22 @@ func main() {
 	if cfg.TargetOS == targets.Linux && (cfg.KernelObj != "" || cfg.StructOpsVmlinuxH != "") {
 		// BPF struct_ops carrier: generated programs are compiled host-side
 		// against this kernel's BTF (sys/linux/init_structops.go).
-		structops.Configure(structops.CompileConfig{
+		err := structops.Configure(structops.CompileConfig{
 			KernelObj: cfg.KernelObj,
 			VmlinuxH:  cfg.StructOpsVmlinuxH,
 			CacheDir:  filepath.Join(cfg.Workdir, "structops"),
 		})
+		switch {
+		case errors.Is(err, structops.ErrLayoutMismatch):
+			// Programs would be compiled with wrong field offsets: refuse
+			// to run rather than fuzz with a corrupt carrier.
+			log.Fatalf("struct_ops: %v", err)
+		case err != nil:
+			log.Logf(0, "struct_ops carrier disabled (host compile step unavailable): %v", err)
+		default:
+			log.Logf(0, "struct_ops: host compile step ready (layout self-check: %d structs match kernel BTF)",
+				structops.LayoutChecked())
+		}
 	}
 	if cfg.Experimental.EnableKFuzzTest {
 		vmLinuxPath := path.Join(cfg.KernelObj, cfg.SysTarget.KernelObject)
