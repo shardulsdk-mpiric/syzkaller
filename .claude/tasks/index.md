@@ -28,10 +28,10 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
 
 ### differential_premerge
 - **status:** open (reference).
-- **brief:** `tools/mpiric-diff/README.md`.
+- **brief:** `tools/syz-diffrepro/README.md`.
 - **goal:** fuzz a base-vs-patched kernel pair aimed at a diff and classify
   patched-only regressions before merge.
-- **keywords:** diff, differential, pre-merge, mpiric-diff, regression, patched.
+- **keywords:** diff, differential, pre-merge, syz-diffrepro, regression, patched.
 
 ## Development threads
 

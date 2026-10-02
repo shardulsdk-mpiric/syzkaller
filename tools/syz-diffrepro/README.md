@@ -1,11 +1,11 @@
-# mpiric-diff: a working driver for syzkaller's differential fuzzing engine
+# syz-diffrepro: a working driver for syzkaller's differential fuzzing engine
 
 `pkg/manager/diff` fuzzes a PATCHED kernel (coverage-guided, aimed at the diff),
 reproduces each crash, replays the reproducer on the BASE kernel and, when base
 stays clean, reports the crash as **patched-only** with a reproducer.  The
 shipped `tools/syz-diff` cannot drive it: it never sets the mandatory
 `diff.Config.PatchedOnly` channel, so `diff.Run` fails before booting a VM.
-`mpiric-diff` is Mpiric's driver for that engine.  It uses only the engine's
+`syz-diffrepro` is a driver for that engine.  It uses only the engine's
 exported API (`diff.Run`, `diff.Config`, `diff.Bug`, `diff.PatchFocusAreas`,
 `diff.ErrPatchedAreaNotReached`, `manager.DiffFuzzerStore`,
 `build.ElfSymbolHashes`, `repro.Result.CProgram`) and does not touch
@@ -21,13 +21,13 @@ binary to carry the same git + descriptions revision as the executor.  A plain
 `go build` produces a binary that refuses to start.
 
 ```
-make mpiric-diff          # -> bin/mpiric-diff (also builds the executor, like `make diff`)
+make syz-diffrepro          # -> bin/syz-diffrepro (also builds the executor, like `make diff`)
 ```
 
 ## Invocation
 
 ```
-bin/mpiric-diff \
+bin/syz-diffrepro \
     -base    cfg/base.cfg \
     -patched cfg/patched.cfg \
     -patch   series.diff \
@@ -47,7 +47,7 @@ bin/mpiric-diff \
 | `-repros` | parallel reproductions to budget VMs for | `2` |
 | `-possible_cutoff` | patched crash count that makes a title "possibly patched-only" | `10` |
 | `-ignore_titles` | regexp of crash titles the engine must not reproduce | none |
-| `-out` | output directory | `<patched workdir>/mpiric-diff` |
+| `-out` | output directory | `<patched workdir>/syz-diffrepro` |
 | `-vv` | syzkaller log verbosity | `1` (the engine logs each reproducer's reliability, and a reproducer dropped as too unreliable, only at level 1) |
 
 One Ctrl-C (SIGINT/SIGTERM) shuts the run down gracefully and still writes the
