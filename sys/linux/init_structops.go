@@ -4,6 +4,7 @@
 package linux
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 
@@ -24,17 +25,24 @@ import (
 // fails at load.  Registering the types here is also what keeps the generic
 // mutator off the blob (prog/mutation.go consults Target.SpecialTypes).
 //
-// The blob is the load recipe pkg/structops.Compile produces from the
-// rendered C translation unit (clang -O2 -g -target bpf -mcpu=v3
-// -DBPF_NO_PRESERVE_ACCESS_INDEX against the target kernel's vmlinux.h,
-// llvm-strip -g, then an ELF pre-digest into a flat TLV the executor loads
-// with raw bpf() calls; see pkg/structops/recipe.go).  The compile step is
-// configured by syz-manager from kernel_obj / struct_ops_vmlinux_h.  When
-// it is not configured (tests, tools that only parse programs) the blob
-// carries the rendered source instead, which the executor rejects at load
-// (EINVAL, no recipe magic) -- inert, never crashing.  A program whose
-// render fails to compile (kfunc/field drift against the kernel) is
-// re-rolled a few times, then also falls back to the inert source blob.
+// The blob is the program's generative SPEC (pkg/structops/spec.go: surface
+// tag + per-callback statement AST, ~1-3KB, kernel-agnostic), NOT the
+// compiled load recipe.  The recipe (pkg/structops/recipe.go: BTF + insns
+// baked against one kernel's vmlinux.h, 60-160KB) is materialized from the
+// spec host-side right before a program is sent to the executor
+// (pkg/structops/materialize, wired at syz-manager's request source), so
+// what the corpus persists is lean and survives a kernel bump, while what
+// the executor and the crash logs see is the self-contained kernel-specific
+// form.  The executor rejects a spec blob that reaches it un-materialized
+// (no manager-side compile step: tests, execprog in the VM) with EINVAL --
+// inert, never crashing.
+//
+// When the compile step is configured (syz-manager, from kernel_obj /
+// struct_ops_vmlinux_h) generation still compiles the rendered program
+// once: it validates that the spec materializes against this kernel (a
+// program whose render fails to compile -- kfunc/field drift -- is
+// re-rolled a few times) and it warms the sha256(source) compile cache, so
+// the materialize step is a cache hit.
 
 func (arch *arch) generateStructOpsObjTCPCong(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
 	prog.Arg, []*prog.Call) {
@@ -49,22 +57,28 @@ func (arch *arch) generateStructOpsObjMptcpSched(g *prog.Gen, typ prog.Type, dir
 func generateStructOpsObj(g *prog.Gen, typ0 prog.Type, dir prog.Dir, surf *structops.Surface) (
 	prog.Arg, []*prog.Call) {
 	typ := typ0.(*prog.StructType)
-	data := prog.MakeDataArg(typ.Fields[0].Type, dir, structOpsGenerateBlob(g, surf))
+	data := prog.MakeDataArg(typ.Fields[0].Type, dir, structOpsGenerateBlob(g.Rand(), surf))
 	return prog.MakeGroupArg(typ, dir, []prog.Arg{data}), nil
 }
 
 const structOpsCompileAttempts = 3
 
-func structOpsGenerateBlob(g *prog.Gen, surf *structops.Surface) []byte {
-	var src string
+// structOpsGenerateBlob generates one program for surf and returns its spec
+// blob.  Each program is generated from its own seed (drawn from rnd) so
+// the spec records a (seed, surface) provenance that regenerates it under
+// the same generator version.
+func structOpsGenerateBlob(rnd *rand.Rand, surf *structops.Surface) []byte {
+	var spec []byte
 	for attempt := 0; attempt < structOpsCompileAttempts; attempt++ {
-		src = structops.Generate(g.Rand(), surf).Render()
+		seed := rnd.Int63()
+		sop := structops.Generate(rand.New(rand.NewSource(seed)), surf)
+		spec = structops.EncodeSpec(sop, seed)
 		if !structops.Configured() {
 			break
 		}
-		recipe, err := structops.Compile(src)
+		_, err := structops.Compile(sop.Render())
 		if err == nil {
-			return recipe
+			return spec
 		}
 		structOpsCompileErrors.Add(1)
 		if attempt == 0 {
@@ -74,7 +88,7 @@ func structOpsGenerateBlob(g *prog.Gen, surf *structops.Surface) []byte {
 			})
 		}
 	}
-	return []byte(src)
+	return spec
 }
 
 var (
