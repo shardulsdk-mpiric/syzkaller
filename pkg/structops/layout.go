@@ -64,6 +64,9 @@ func layoutProbeTypes() []string {
 		n := strings.TrimPrefix(surf.instanceStruct, "struct ")
 		add(n)
 		add("bpf_struct_ops_" + n)
+		for _, n := range surf.layoutStructs {
+			add(n)
+		}
 	}
 	sort.Strings(out)
 	return out
