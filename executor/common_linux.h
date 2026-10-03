@@ -3391,6 +3391,13 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 #include "common_linux_mptcp.h"
 #endif
 
+// In-kernel QUIC (net/quic) Phase-1 connection carrier (see
+// executor/common_linux_quic.h).
+#if SYZ_EXECUTOR || __NR_syz_quic_conn_init || __NR_syz_quic_conn_close || \
+    __NR_syz_quic_path_challenge
+#include "common_linux_quic.h"
+#endif
+
 // /dev/uhid content-aware GET_REPORT/SET_REPORT responder (see
 // executor/common_linux_uhid.h).
 #if SYZ_EXECUTOR || __NR_syz_uhid_create_responder || __NR_syz_uhid_destroy_responder
