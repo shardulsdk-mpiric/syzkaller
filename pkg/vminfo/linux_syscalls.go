@@ -100,6 +100,9 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_mptcp_disconnect":          linuxSyzMptcpSupported,
 	"syz_mptcp_listener_close_race": linuxSyzMptcpSupported,
 	"syz_mptcp_drive_traffic":       linuxSyzMptcpSupported,
+	"syz_quic_conn_init":            linuxSyzQuicSupported,
+	"syz_quic_conn_close":           linuxSyzQuicSupported,
+	"syz_quic_path_challenge":       linuxSyzQuicSupported,
 	"syz_uhid_create_responder":     linuxUhidResponderSupported,
 	"syz_uhid_destroy_responder":    linuxUhidResponderSupported,
 	"syz_sctp_pair_init":            linuxSctpSupported,
@@ -339,6 +342,19 @@ func linuxSyzMptcpSupported(ctx *checkContext, call *prog.Syscall) string {
 	// rejects with EPROTONOSUPPORT when it is built without CONFIG_MPTCP.
 	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
 		ctx.val("AF_INET"), ctx.val("SOCK_STREAM"), ctx.val("IPPROTO_MPTCP")))
+}
+
+func linuxSyzQuicSupported(ctx *checkContext, call *prog.Syscall) string {
+	// The pseudo-syscalls set net.quic transport params / crypto secrets and
+	// install an nft NFQUEUE rule, which need privilege the setuid sandbox drops
+	// after its netns unshare -- so restrict to sandbox none/namespace.
+	if reason := ctx.onlySandboxNoneOrNamespace(); reason != "" {
+		return reason
+	}
+	// The pseudo-syscalls create IPPROTO_QUIC (261) sockets, which the kernel
+	// rejects with EPROTONOSUPPORT when it is built without CONFIG_IP_QUIC.
+	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
+		ctx.val("AF_INET"), ctx.val("SOCK_DGRAM"), 261))
 }
 
 func linuxSyzBpfStructOpsSupported(ctx *checkContext, call *prog.Syscall) string {
