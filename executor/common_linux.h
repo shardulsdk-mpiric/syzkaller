@@ -3448,7 +3448,7 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 // In-kernel QUIC (net/quic) Phase-1 connection carrier (see
 // executor/common_linux_quic.h).
 #if SYZ_EXECUTOR || __NR_syz_quic_conn_init || __NR_syz_quic_conn_close || \
-    __NR_syz_quic_path_challenge
+    __NR_syz_quic_path_challenge || __NR_syz_quic_wire_mutate
 #include "common_linux_quic.h"
 #endif
 

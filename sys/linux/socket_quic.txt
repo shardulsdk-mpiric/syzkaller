@@ -55,6 +55,21 @@ define QUIC_IO_C2S	0
 define QUIC_IO_S2C	1
 quic_io_dir = QUIC_IO_C2S, QUIC_IO_S2C
 
+# Phase-3 wire-mutation kind. Each flips bytes of a plaintext 1-RTT short-header
+# packet on the wire (disable_1rtt_encryption makes it cleartext) so the kernel
+# reaches the net/quic protocol-VALIDATION paths instead of only AEAD-reject.
+# UNKNOWN_TYPE: rewrite the first frame's type byte to an unknown type
+#   (> QUIC_FRAME_MAX, no frame_attr) -> frame.c FRAME_ENCODING_ERROR teardown.
+# RESERVED_BITS: set the short-header reserved bits -> packet.c PROTOCOL_VIOLATION
+#   after header-protection removal (RFC 9000 17.2).
+# STREAM_TO_RESET: rewrite the first frame's type byte to RESET_STREAM so the
+#   following bytes re-parse as stream_id/errcode/finalsz -> frame.c reset-stream
+#   validation (FLOW_CONTROL / FINAL_SIZE / STREAM_STATE).
+define QUIC_WIRE_UNKNOWN_TYPE	0
+define QUIC_WIRE_RESERVED_BITS	1
+define QUIC_WIRE_STREAM_TO_RESET	2
+quic_wire_kind = QUIC_WIRE_UNKNOWN_TYPE, QUIC_WIRE_RESERVED_BITS, QUIC_WIRE_STREAM_TO_RESET
+
 quic_conn_opts {
 # AF_INET / AF_INET6 (loopback). Phase 1 verifies AF_INET.
 	family		flags[quic_conn_family, int32]
@@ -107,3 +122,13 @@ syz_quic_cid_issue(conn quic_conn) (remote_cover)
 syz_quic_cid_retire(conn quic_conn) (remote_cover)
 syz_quic_key_update(conn quic_conn) (remote_cover)
 syz_quic_migrate(conn quic_conn) (remote_cover)
+
+# Phase-3 wire mutation. On a conn established with disable_1rtt=1 (so 1-RTT
+# short-header packets are plaintext on the wire), arm the UDP NFQUEUE engine to
+# mutate frame bytes of the next 1-RTT packet, then drive a stream round-trip so
+# the mutated packet is delivered and the kernel hits the net/quic protocol-
+# validation / connection-teardown paths (frame.c ~40 violation sites) rather
+# than just the AEAD-decrypt-reject path. This realizes the capability Xin Long
+# asked for: modifying incoming/outgoing skb data from kernel space while the
+# test runs. Requires a disable_1rtt=1 pair (warns otherwise).
+syz_quic_wire_mutate(conn quic_conn, kind flags[quic_wire_kind]) (remote_cover)

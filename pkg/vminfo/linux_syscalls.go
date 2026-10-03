@@ -109,6 +109,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_quic_cid_retire":           linuxSyzQuicSupported,
 	"syz_quic_key_update":           linuxSyzQuicSupported,
 	"syz_quic_migrate":              linuxSyzQuicSupported,
+	"syz_quic_wire_mutate":          linuxSyzQuicSupported,
 	"syz_uhid_create_responder":     linuxUhidResponderSupported,
 	"syz_uhid_destroy_responder":    linuxUhidResponderSupported,
 	"syz_sctp_pair_init":            linuxSctpSupported,

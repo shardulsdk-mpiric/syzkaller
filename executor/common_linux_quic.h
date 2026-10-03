@@ -110,6 +110,27 @@
 #define QUIC_PC_ECHO_CAPTURED 0
 #define QUIC_PC_ECHO_WRONG 1
 
+// Phase-3 wire-mutation kinds (harness constants; match .txt + .const).
+#define QUIC_WIRE_UNKNOWN_TYPE 0
+#define QUIC_WIRE_RESERVED_BITS 1
+#define QUIC_WIRE_STREAM_TO_RESET 2
+
+// net/quic header geometry (net/quic/common.h QUIC_CONN_ID_DEF_LEN=8,
+// net/quic/packet.c QUIC_HLEN=1). With disable_1rtt_encryption negotiated, both
+// header and packet protection are OFF (packet.c: taglen==0), so a 1-RTT
+// short-header packet is fully cleartext and the first frame sits at a fixed
+// offset: QUIC_HLEN + QUIC_CONN_ID_DEF_LEN + number_len, where
+// number_len = (flags & 0x3) + 1 (quichdr.pnl, the low 2 bits, little-endian).
+#define QUIC_CONN_ID_DEF_LEN 8
+#define QUIC_HLEN 1
+// Frame type bytes we rewrite to (net/quic/frame.h). 0x3f is a 1-byte varint
+// > QUIC_FRAME_MAX (0x31) with no frame_attr -> treated as an unknown frame.
+#define QUIC_FRAME_RESET_STREAM 0x04
+#define QUIC_FRAME_UNKNOWN 0x3f
+
+// enum quic_event_type: QUIC_EVENT_CONNECTION_CLOSE = 5.
+#define QUIC_EVENT_CONNECTION_CLOSE 5
+
 // net/quic/path.h QUIC_PATH_ENTROPY_LEN; net/quic/frame.h frame type bytes.
 #define QUIC_PATH_ENTROPY_LEN 8
 #define QUIC_FRAME_PATH_CHALLENGE 0x1a
@@ -1068,6 +1089,156 @@ static long syz_quic_path_challenge(volatile long a0, volatile long a1)
 	      syz_quic_pc_saw_challenge, syz_quic_pc_saw_response, validated, expected,
 	      validated == expected ? "GATE-OK" : "GATE-MISMATCH");
 	return validated;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Phase 3: wire mutation. On a pair established with disable_1rtt_encryption, a
+// 1-RTT short-header packet is cleartext on the wire (packet.c skips both header
+// and packet protection when taglen==0), so the UDP NFQUEUE engine can flip
+// frame bytes in flight. A single byte edit then drives the kernel into the
+// net/quic protocol-VALIDATION / teardown paths (frame.c's ~40 violation sites)
+// rather than the AEAD-decrypt-reject path -- the capability Xin Long asked for
+// ("modify incoming/outgoing skb data from kernel space while testing runs").
+// ---------------------------------------------------------------------------
+#if SYZ_EXECUTOR || __NR_syz_quic_wire_mutate
+#include "common_linux_quic_nfq.h"
+
+static volatile int syz_quic_wm_kind;
+static volatile int syz_quic_wm_armed;
+static volatile int syz_quic_wm_mutated;
+static volatile int syz_quic_wm_saw_short;
+
+// Deterministic offset of the first frame TYPE byte inside a cleartext 1-RTT
+// short-header packet (see the header-geometry note above), or -1 if this is
+// not such a packet. Scoped to short header (form bit 0x80 clear) with the
+// fixed bit (0x40) set so non-QUIC loopback UDP and long-header/handshake
+// packets are left untouched.
+static int syz_quic_wm_frame_off(uint8* ip_pkt, int len)
+{
+	struct iphdr* ip = (struct iphdr*)ip_pkt;
+	int ihl = ip->ihl * 4;
+	int q_off = ihl + (int)sizeof(struct udphdr);
+	if (len < q_off + 1)
+		return -1;
+	uint8* q = ip_pkt + q_off;
+	if ((q[0] & 0x80) || !(q[0] & 0x40))
+		return -1;
+	int number_len = (q[0] & 0x03) + 1;
+	int frame_off = q_off + QUIC_HLEN + QUIC_CONN_ID_DEF_LEN + number_len;
+	if (frame_off >= len)
+		return -1;
+	return frame_off;
+}
+
+// Mutate-once hook: flips exactly one byte of the first cleartext 1-RTT packet
+// seen after arming, then passes everything else through so the teardown is
+// clean and attributable to the single edit.
+static int syz_quic_wm_hook(uint8* ip_pkt, int len)
+{
+	if (!syz_quic_wm_armed || syz_quic_wm_mutated)
+		return 0;
+	int off = syz_quic_wm_frame_off(ip_pkt, len);
+	if (off < 0)
+		return 0;
+	syz_quic_wm_saw_short = 1;
+	struct iphdr* ip = (struct iphdr*)ip_pkt;
+	int q_off = ip->ihl * 4 + (int)sizeof(struct udphdr);
+	uint8 old = ip_pkt[off];
+	switch (syz_quic_wm_kind) {
+	case QUIC_WIRE_RESERVED_BITS:
+		// quichdr.reserved = bits 3-4 (LE); non-zero after HP removal is a
+		// PROTOCOL_VIOLATION (packet.c, RFC 9000 17.2).
+		ip_pkt[q_off] |= 0x18;
+		break;
+	case QUIC_WIRE_STREAM_TO_RESET:
+		ip_pkt[off] = QUIC_FRAME_RESET_STREAM;
+		break;
+	case QUIC_WIRE_UNKNOWN_TYPE:
+	default:
+		ip_pkt[off] = QUIC_FRAME_UNKNOWN;
+		break;
+	}
+	syz_quic_wm_mutated = 1;
+	debug("syz_quic_wm_hook: kind=%d mutated frame_off=%d old=0x%02x hdr0=0x%02x\n",
+	      syz_quic_wm_kind, off, old, ip_pkt[q_off]);
+	return 1;
+}
+
+static long syz_quic_wire_mutate(volatile long a0, volatile long a1)
+{
+	long slot = a0;
+	int kind = (int)a1;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_wire_mutate: bad slot %ld\n", slot);
+		return -1;
+	}
+	if (!syz_quic_pair_pool[slot].disable_1rtt) {
+		debug("syz_quic_wire_mutate: WARNING conn not disable_1rtt; 1-RTT is encrypted, wire bytes are ciphertext\n");
+	}
+	int cfd = syz_quic_pair_pool[slot].client_fd;
+	int sfd = syz_quic_pair_pool[slot].server_fd;
+
+	// Subscribe both ends to CONNECTION_CLOSE events (the teardown oracle).
+	struct quic_event_option_u ev = {QUIC_EVENT_CONNECTION_CLOSE, 1};
+	setsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_EVENT, &ev, sizeof(ev));
+	setsockopt(sfd, SOL_QUIC, QUIC_SOCKOPT_EVENT, &ev, sizeof(ev));
+
+	// Snapshot the protocol-violation / teardown counters before the mutation.
+	long in0 = syz_quic_read_snmp("QuicFrmInCloses");
+	long out0 = syz_quic_read_snmp("QuicFrmOutCloses");
+	long drop0 = syz_quic_read_snmp("QuicPktInvFrmDrop");
+
+	// Arm the mutate-once hook and bring up the engine.
+	syz_quic_wm_kind = (kind == QUIC_WIRE_RESERVED_BITS || kind == QUIC_WIRE_STREAM_TO_RESET)
+			       ? kind
+			       : QUIC_WIRE_UNKNOWN_TYPE;
+	syz_quic_wm_mutated = 0;
+	syz_quic_wm_saw_short = 0;
+	syz_quic_wm_armed = 1;
+	quic_nfq_hook = syz_quic_wm_hook;
+	if (quic_nfq_setup() < 0) {
+		debug("syz_quic_wire_mutate: nfq setup failed: %d\n", errno);
+		syz_quic_wm_armed = 0;
+		return -1;
+	}
+
+	// Drive a stream round-trip so a 1-RTT data packet is put on the wire and
+	// mutated in flight; the peer then parses the corrupted frame and tears the
+	// connection down with a transport error (CONNECTION_CLOSE).
+	static const char probe[] = "quic-wire-mutate-probe-0123456789abcdef";
+	uint32 flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	for (int i = 0; i < 4 && !syz_quic_wm_mutated; i++) {
+		syz_quic_stream_sendmsg(cfd, probe, sizeof(probe), -1, flags);
+		syz_quic_stream_drain(sfd);
+		syz_quic_stream_sendmsg(sfd, probe, sizeof(probe), -1, flags);
+		syz_quic_stream_drain(cfd);
+		struct timespec ts = {0, 50 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+
+	// Poll the counters for up to ~2s for the teardown to register.
+	long in1 = in0, out1 = out0, drop1 = drop0;
+	for (int i = 0; i < 40; i++) {
+		syz_quic_stream_drain(cfd);
+		syz_quic_stream_drain(sfd);
+		in1 = syz_quic_read_snmp("QuicFrmInCloses");
+		out1 = syz_quic_read_snmp("QuicFrmOutCloses");
+		drop1 = syz_quic_read_snmp("QuicPktInvFrmDrop");
+		if (out1 > out0 || in1 > in0 || drop1 > drop0)
+			break;
+		struct timespec ts = {0, 50 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+	syz_quic_wm_armed = 0;
+
+	int reached = (out1 > out0 || in1 > in0 || drop1 > drop0);
+	debug("syz_quic_wire_mutate: kind=%d saw_short=%d mutated=%d "
+	      "FrmInCloses %ld->%ld FrmOutCloses %ld->%ld PktInvFrmDrop %ld->%ld -> %s\n",
+	      syz_quic_wm_kind, syz_quic_wm_saw_short, syz_quic_wm_mutated,
+	      in0, in1, out0, out1, drop0, drop1,
+	      reached ? "VALIDATION-REACHED" : "no-teardown");
+	return reached ? 1 : 0;
 }
 #endif
 
