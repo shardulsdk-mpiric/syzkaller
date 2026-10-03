@@ -822,8 +822,11 @@ static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 	snprintf(value_name, sizeof(value_name), "bpf_struct_ops_%s", r.struct_name);
 	uint32 value_id = structops_vml_find(value_name, STRUCTOPS_BTF_KIND_STRUCT);
 	uint32 data_off = 0, data_type = 0, name_off = 0, name_type = 0;
+	// The registered-name member is `name` on every surface but Qdisc_ops,
+	// which calls it `id` (its TCA_KIND string, char[IFNAMSIZ]).
 	if (!struct_id || !value_id || structops_vml_member(value_id, "data", &data_off, &data_type) < 0 ||
-	    structops_vml_member(struct_id, "name", &name_off, &name_type) < 0) {
+	    (structops_vml_member(struct_id, "name", &name_off, &name_type) < 0 &&
+	     structops_vml_member(struct_id, "id", &name_off, &name_type) < 0)) {
 		debug("structops: %s / %s not a struct_ops of this kernel\n", r.struct_name, value_name);
 		errno = ENOENT;
 		return -1;
