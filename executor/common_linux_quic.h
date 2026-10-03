@@ -59,23 +59,44 @@
 #define QUIC_CRYPTO_EARLY 3
 
 // enum quic_cmsg_type: QUIC_STREAM_INFO=0, QUIC_HANDSHAKE_INFO=1.
+#define QUIC_STREAM_INFO 0
 #define QUIC_HANDSHAKE_INFO 1
 // MSG_QUIC_NOTIFICATION == MSG_MORE (enum quic_msg_flags). Set in recvmsg
 // msg_flags when the received datagram is an event, not stream data.
 #ifndef MSG_QUIC_NOTIFICATION
 #define MSG_QUIC_NOTIFICATION MSG_MORE
 #endif
+// enum quic_msg_flags stream bits: NEW=MSG_SYN, FIN=MSG_FIN, UNI=MSG_CONFIRM.
+// These are the plain Linux MSG_* values the kernel re-labels for QUIC stream
+// semantics (uapi/linux/quic.h); referenced directly so no extra include.
+#ifndef MSG_QUIC_STREAM_NEW
+#define MSG_QUIC_STREAM_NEW MSG_SYN
+#endif
+#ifndef MSG_QUIC_STREAM_FIN
+#define MSG_QUIC_STREAM_FIN MSG_FIN
+#endif
+#ifndef MSG_QUIC_STREAM_UNI
+#define MSG_QUIC_STREAM_UNI MSG_CONFIRM
+#endif
 
 // Socket option numbers (uapi/linux/quic.h).
 #define QUIC_SOCKOPT_EVENT 0
+#define QUIC_SOCKOPT_STREAM_OPEN 1
+#define QUIC_SOCKOPT_CONNECTION_ID 4
 #define QUIC_SOCKOPT_CONNECTION_MIGRATION 6
+#define QUIC_SOCKOPT_KEY_UPDATE 7
 #define QUIC_SOCKOPT_TRANSPORT_PARAM 8
 #define QUIC_SOCKOPT_CONFIG 9
 #define QUIC_SOCKOPT_CRYPTO_SECRET 13
 #define QUIC_SOCKOPT_TRANSPORT_PARAM_EXT 14
 
-// enum quic_event_type: QUIC_EVENT_CONNECTION_MIGRATION = 6.
+// enum quic_event_type: QUIC_EVENT_CONNECTION_MIGRATION = 6, KEY_UPDATE = 7.
 #define QUIC_EVENT_CONNECTION_MIGRATION 6
+#define QUIC_EVENT_KEY_UPDATE 7
+
+// Stream I/O direction for syz_quic_stream_io (harness constants; match .txt).
+#define QUIC_IO_C2S 0
+#define QUIC_IO_S2C 1
 
 // TLS cipher types (uapi/linux/tls.h). Mirrored as harness constants so the
 // executor needs no tls.h include; must match socket_quic.txt + its .const.
@@ -113,6 +134,28 @@ struct quic_handshake_info_u {
 struct quic_event_option_u {
 	uint8 type;
 	uint8 on;
+};
+
+// struct quic_stream_info (uapi): {stream_id, stream_flags}. Carried in the
+// QUIC_STREAM_INFO cmsg on send/recv and in getsockopt(QUIC_SOCKOPT_STREAM_OPEN).
+// stream_id is __s64 in the uapi; the executor headers typedef only the
+// unsigned uintN syzkaller types, so use plain `long long` for the signed field
+// (csource rewrites uintN -> uintN_t and would mangle a signed stand-in).
+struct quic_stream_info_u {
+	long long stream_id;
+	uint32 stream_flags;
+};
+
+// struct quic_connection_id_info (uapi): {dest, reserved[3], active, prior_to}.
+// setsockopt(QUIC_SOCKOPT_CONNECTION_ID): prior_to retires CIDs below it, which
+// drives NEW_CONNECTION_ID (dest=0) / RETIRE_CONNECTION_ID (dest=1) emission.
+// getsockopt returns active = current active CID number, prior_to = first (the
+// smallest issued number) -- used to pick a valid in-range prior_to.
+struct quic_connection_id_info_u {
+	uint8 dest;
+	uint8 reserved[3];
+	uint32 active;
+	uint32 prior_to;
 };
 
 // Prefix of struct quic_transport_param (uapi) up to disable_1rtt_encryption.
@@ -594,6 +637,270 @@ static long syz_quic_conn_close(volatile long a0)
 	syz_quic_pair_pool[slot].server_port_h = 0;
 	syz_quic_pair_pool[slot].disable_1rtt = false;
 	__atomic_store_n(&syz_quic_pair_pool[slot].in_use, false, __ATOMIC_RELEASE);
+	return 0;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Phase 2: post-handshake drivers. Each walks the kernel through a slice of the
+// post-handshake state machine that stock syzkaller cannot reach (it rarely
+// gets past the handshake), so it lights up the deep net/quic files Xin Long's
+// own coverage showed dark: stream.c/frame.c/inqueue.c/outqueue.c (streams),
+// connid.c/frame.c (CID rotation), crypto.c (key update), path.c (migration).
+// All operate on an already-established pair held in a brf_quic_pair_pool slot;
+// they use only the real socket/cmsg API (no wire capture), so they work
+// whether or not disable_1rtt was negotiated.
+// ---------------------------------------------------------------------------
+
+// send on a QUIC stream: the stream id + flags travel in a QUIC_STREAM_INFO
+// cmsg, mirroring the selftest's send_msg(). stream_flags carries the
+// MSG_QUIC_STREAM_* bits; the remaining MSG_* bits go in the sendmsg flags arg.
+static int syz_quic_stream_sendmsg(int fd, const void* buf, size_t len, long long sid, uint32 flags)
+{
+	char outcmsg[CMSG_SPACE(sizeof(struct quic_stream_info_u))];
+	struct quic_stream_info_u* info;
+	struct msghdr outmsg;
+	struct cmsghdr* cmsg;
+	struct iovec iov;
+	uint32 stream_bits = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN | MSG_QUIC_STREAM_UNI;
+
+	iov.iov_base = (void*)buf;
+	iov.iov_len = len;
+	memset(&outmsg, 0, sizeof(outmsg));
+	outmsg.msg_iov = &iov;
+	outmsg.msg_iovlen = 1;
+	outmsg.msg_control = outcmsg;
+	outmsg.msg_controllen = sizeof(outcmsg);
+	cmsg = CMSG_FIRSTHDR(&outmsg);
+	cmsg->cmsg_level = SOL_QUIC;
+	cmsg->cmsg_type = QUIC_STREAM_INFO;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(*info));
+	outmsg.msg_controllen = cmsg->cmsg_len;
+	info = (struct quic_stream_info_u*)CMSG_DATA(cmsg);
+	info->stream_id = sid;
+	info->stream_flags = flags & stream_bits;
+	return (int)sendmsg(fd, &outmsg, (int)(flags & ~stream_bits) | MSG_NOSIGNAL);
+}
+
+// drain up to a few datagrams from fd (non-blocking); keeps the RX buffer from
+// filling so later sends don't EAGAIN, and forces the inqueue reassembly path.
+static void syz_quic_stream_drain(int fd)
+{
+	char buf[2048];
+	for (int i = 0; i < 8; i++) {
+		struct iovec iov = {buf, sizeof(buf)};
+		struct msghdr m;
+		memset(&m, 0, sizeof(m));
+		m.msg_iov = &iov;
+		m.msg_iovlen = 1;
+		if (recvmsg(fd, &m, MSG_DONTWAIT) <= 0)
+			break;
+	}
+}
+
+#if SYZ_EXECUTOR || __NR_syz_quic_stream_open
+// Allocate the next stream of the requested type via getsockopt(STREAM_OPEN):
+// the kernel assigns the id and sets up stream state (net/quic/stream.c), the
+// id returned to the fuzzer. No bytes are sent -- isolates the open path.
+static long syz_quic_stream_open(volatile long a0, volatile long a1)
+{
+	long slot = a0;
+	int uni = (int)a1 ? 1 : 0;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_stream_open: bad slot %ld\n", slot);
+		return -1;
+	}
+	int cfd = syz_quic_pair_pool[slot].client_fd;
+	struct quic_stream_info_u info;
+	socklen_t optlen = sizeof(info);
+	memset(&info, 0, sizeof(info));
+	info.stream_id = -1;
+	info.stream_flags = uni ? MSG_QUIC_STREAM_UNI : 0;
+	if (getsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_STREAM_OPEN, &info, &optlen) < 0) {
+		debug("syz_quic_stream_open: STREAM_OPEN uni=%d: %d\n", uni, errno);
+		return -1;
+	}
+	debug("syz_quic_stream_open: opened sid=%lld uni=%d\n", (long long)info.stream_id, uni);
+	return (long)info.stream_id;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_quic_stream_io
+// Push data on a new stream in the requested direction and drain the far end.
+// Drives frame.c (STREAM frame encode/parse), outqueue.c (transmit), inqueue.c
+// (reassembly), stream.c (send/recv state machine). sid=-1 + MSG_QUIC_STREAM_NEW
+// makes the kernel pick the next stream id.
+static long syz_quic_stream_io(volatile long a0, volatile long a1, volatile long a2,
+			       volatile long a3, volatile long a4)
+{
+	long slot = a0;
+	int dir = (int)a1;
+	int uni = (int)a2 ? 1 : 0;
+	const void* data = (const void*)a3;
+	size_t len = (size_t)a4;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_stream_io: bad slot %ld\n", slot);
+		return -1;
+	}
+	if (len > 4096)
+		len = 4096;
+	int sfd = (dir == QUIC_IO_S2C) ? syz_quic_pair_pool[slot].server_fd
+					: syz_quic_pair_pool[slot].client_fd;
+	int rfd = (dir == QUIC_IO_S2C) ? syz_quic_pair_pool[slot].client_fd
+					: syz_quic_pair_pool[slot].server_fd;
+	uint32 flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN | (uni ? MSG_QUIC_STREAM_UNI : 0);
+	int sent = syz_quic_stream_sendmsg(sfd, data, len, -1, flags);
+	if (sent < 0)
+		debug("syz_quic_stream_io: send dir=%d uni=%d len=%zu: %d\n", dir, uni, len, errno);
+	syz_quic_stream_drain(rfd);
+	debug("syz_quic_stream_io: dir=%d uni=%d sent=%d\n", dir, uni, sent);
+	return sent < 0 ? -1 : (long)sent;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_quic_cid_issue
+// Rotate SOURCE connection IDs: read the current first/active via getsockopt,
+// then retire everything below first+1, which makes the kernel emit fresh
+// NEW_CONNECTION_ID frames (net/quic/connid.c + frame.c CID encode / limit).
+static long syz_quic_cid_issue(volatile long a0)
+{
+	long slot = a0;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_cid_issue: bad slot %ld\n", slot);
+		return -1;
+	}
+	int cfd = syz_quic_pair_pool[slot].client_fd;
+	struct quic_connection_id_info_u info;
+	socklen_t optlen = sizeof(info);
+	memset(&info, 0, sizeof(info));
+	info.dest = 0; // source CID set
+	if (getsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_CONNECTION_ID, &info, &optlen) < 0) {
+		debug("syz_quic_cid_issue: get CONNECTION_ID: %d\n", errno);
+		return -1;
+	}
+	uint32 first = info.prior_to; // getsockopt returns first in prior_to
+	struct quic_connection_id_info_u set;
+	memset(&set, 0, sizeof(set));
+	set.dest = 0;
+	set.active = 0;
+	set.prior_to = first + 1; // first < prior_to <= last
+	if (setsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_CONNECTION_ID, &set, sizeof(set)) < 0) {
+		debug("syz_quic_cid_issue: set prior_to=%u: %d\n", set.prior_to, errno);
+		return -1;
+	}
+	debug("syz_quic_cid_issue: retired source CIDs < %u (was first=%u active=%u)\n",
+	      set.prior_to, first, info.active);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_quic_cid_retire
+// Rotate DESTINATION connection IDs: retire the peer's CIDs below first+1,
+// which makes the kernel emit RETIRE_CONNECTION_ID frames (net/quic/connid.c +
+// frame.c). Returns -EAGAIN-ish (-1) if a migration is mid-flight (id_set->alt).
+static long syz_quic_cid_retire(volatile long a0)
+{
+	long slot = a0;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_cid_retire: bad slot %ld\n", slot);
+		return -1;
+	}
+	int cfd = syz_quic_pair_pool[slot].client_fd;
+	struct quic_connection_id_info_u info;
+	socklen_t optlen = sizeof(info);
+	memset(&info, 0, sizeof(info));
+	info.dest = 1; // destination CID set
+	if (getsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_CONNECTION_ID, &info, &optlen) < 0) {
+		debug("syz_quic_cid_retire: get CONNECTION_ID: %d\n", errno);
+		return -1;
+	}
+	uint32 first = info.prior_to;
+	struct quic_connection_id_info_u set;
+	memset(&set, 0, sizeof(set));
+	set.dest = 1;
+	set.active = 0;
+	set.prior_to = first + 1;
+	if (setsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_CONNECTION_ID, &set, sizeof(set)) < 0) {
+		debug("syz_quic_cid_retire: set prior_to=%u: %d\n", set.prior_to, errno);
+		return -1;
+	}
+	debug("syz_quic_cid_retire: retired dest CIDs < %u (was first=%u active=%u)\n",
+	      set.prior_to, first, info.active);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_quic_key_update
+// Initiate a 1-RTT key update (net/quic/crypto.c quic_crypto_key_update: derive
+// the next-generation application keys, flip key_phase). Then push a little data
+// so the new phase is actually exercised on the wire and the peer reacts.
+static long syz_quic_key_update(volatile long a0)
+{
+	long slot = a0;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_key_update: bad slot %ld\n", slot);
+		return -1;
+	}
+	int cfd = syz_quic_pair_pool[slot].client_fd;
+	int sfd = syz_quic_pair_pool[slot].server_fd;
+	if (setsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_KEY_UPDATE, NULL, 0) < 0) {
+		debug("syz_quic_key_update: KEY_UPDATE: %d\n", errno);
+		return -1;
+	}
+	// Drive a round-trip so the freshly-derived phase keys are used.
+	static const char ku[] = "quic-key-update-probe";
+	uint32 flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	syz_quic_stream_sendmsg(cfd, ku, sizeof(ku), -1, flags);
+	syz_quic_stream_drain(sfd);
+	syz_quic_stream_sendmsg(sfd, ku, sizeof(ku), -1, flags);
+	syz_quic_stream_drain(cfd);
+	debug("syz_quic_key_update: initiated on slot %ld\n", slot);
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_quic_migrate
+// Trigger a connection migration to a new local port (net/quic/path.c): the
+// kernel probes the new path with PATH_CHALLENGE / validates PATH_RESPONSE. On
+// loopback both ends are real QUIC, so validation completes naturally (no wire
+// echo needed -- that is what syz_quic_path_challenge adds on top). Driving a
+// data round-trip pushes the packets that carry the probe/response + completes
+// the path swap.
+static long syz_quic_migrate(volatile long a0)
+{
+	long slot = a0;
+	if (slot < 0 || slot >= QUIC_PAIR_POOL_SIZE || !syz_quic_pair_pool[slot].in_use) {
+		debug("syz_quic_migrate: bad slot %ld\n", slot);
+		return -1;
+	}
+	int cfd = syz_quic_pair_pool[slot].client_fd;
+	int sfd = syz_quic_pair_pool[slot].server_fd;
+	struct sockaddr_in sa;
+	socklen_t sl = sizeof(sa);
+	memset(&sa, 0, sizeof(sa));
+	if (getsockname(cfd, (struct sockaddr*)&sa, &sl) < 0) {
+		debug("syz_quic_migrate: getsockname: %d\n", errno);
+		return -1;
+	}
+	sa.sin_port = htons((uint16)(ntohs(sa.sin_port) + 1));
+	if (setsockopt(cfd, SOL_QUIC, QUIC_SOCKOPT_CONNECTION_MIGRATION, &sa, sl) < 0) {
+		debug("syz_quic_migrate: CONNECTION_MIGRATION: %d\n", errno);
+		return -1;
+	}
+	// Push traffic both ways so the path probe/response flows and completes.
+	static const char mp[] = "quic-migrate-probe";
+	uint32 flags = MSG_QUIC_STREAM_NEW | MSG_QUIC_STREAM_FIN;
+	syz_quic_stream_sendmsg(cfd, mp, sizeof(mp), -1, flags);
+	syz_quic_stream_drain(sfd);
+	syz_quic_stream_sendmsg(sfd, mp, sizeof(mp), -1, flags);
+	syz_quic_stream_drain(cfd);
+	{
+		struct sockaddr_in cur;
+		socklen_t cl = sizeof(cur);
+		if (getsockname(cfd, (struct sockaddr*)&cur, &cl) == 0)
+			syz_quic_pair_pool[slot].client_port_h = ntohs(cur.sin_port);
+	}
+	debug("syz_quic_migrate: migrated slot %ld to port %u\n", slot, ntohs(sa.sin_port));
 	return 0;
 }
 #endif

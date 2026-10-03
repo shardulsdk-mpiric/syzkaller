@@ -50,6 +50,11 @@ define QUIC_PC_ECHO_CAPTURED	0
 define QUIC_PC_ECHO_WRONG	1
 quic_pc_modes = QUIC_PC_ECHO_CAPTURED, QUIC_PC_ECHO_WRONG
 
+# Phase-2 stream-I/O direction: client->server (0) or server->client (1).
+define QUIC_IO_C2S	0
+define QUIC_IO_S2C	1
+quic_io_dir = QUIC_IO_C2S, QUIC_IO_S2C
+
 quic_conn_opts {
 # AF_INET / AF_INET6 (loopback). Phase 1 verifies AF_INET.
 	family		flags[quic_conn_family, int32]
@@ -76,3 +81,29 @@ quic_conn_state {
 syz_quic_conn_init(opts ptr[in, quic_conn_opts], state ptr[out, quic_conn_state]) quic_conn (remote_cover)
 syz_quic_conn_close(conn quic_conn)
 syz_quic_path_challenge(conn quic_conn, mode flags[quic_pc_modes]) (remote_cover)
+
+# Phase-2 post-handshake drivers. Each walks the established pair through a slice
+# of the post-handshake state machine that stock syzkaller cannot reach, lighting
+# up the deep net/quic files (stream.c/frame.c/inqueue.c/outqueue.c, connid.c,
+# crypto.c, path.c). They use only the real socket/cmsg API, so they are valid
+# whether or not disable_1rtt was negotiated.
+#
+# syz_quic_stream_open(): getsockopt(QUIC_SOCKOPT_STREAM_OPEN) allocates the next
+# bidi (uni=0) / uni (uni=1) stream -- isolates net/quic/stream.c open.
+# syz_quic_stream_io(): send a buffer on a NEW stream in the given direction and
+# drain the far end -- drives STREAM frame encode/parse (frame.c), send/recv
+# queues (outqueue.c/inqueue.c reassembly), stream.c state machine.
+# syz_quic_cid_issue(): rotate SOURCE connection IDs -> NEW_CONNECTION_ID frames
+# (connid.c + frame.c CID-limit). syz_quic_cid_retire(): rotate DESTINATION CIDs
+# -> RETIRE_CONNECTION_ID frames.
+# syz_quic_key_update(): initiate a 1-RTT key update (crypto.c key derivation /
+# phase flip), then round-trip data so the new phase is used.
+# syz_quic_migrate(): migrate to a new local port -> path.c PATH_CHALLENGE /
+# PATH_RESPONSE validation (completes naturally on loopback; the capture-echo
+# variant is syz_quic_path_challenge).
+syz_quic_stream_open(conn quic_conn, uni int8[0:1]) (remote_cover)
+syz_quic_stream_io(conn quic_conn, dir flags[quic_io_dir], uni int8[0:1], data ptr[in, array[int8]], data_len len[data]) (remote_cover)
+syz_quic_cid_issue(conn quic_conn) (remote_cover)
+syz_quic_cid_retire(conn quic_conn) (remote_cover)
+syz_quic_key_update(conn quic_conn) (remote_cover)
+syz_quic_migrate(conn quic_conn) (remote_cover)
