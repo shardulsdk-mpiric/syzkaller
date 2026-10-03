@@ -1314,7 +1314,7 @@ func TestStructOpsHelpers(t *testing.T) {
 	// scalarCType: true for the integer-like types (incl. the A2-added
 	// __u32/u32/unsigned int the CC kfuncs use), false for pointers/structs.
 	scalars := []string{"int", "unsigned long", "bool", "__u64", "u64",
-		"long", "unsigned int", "__u32", "u32", "const __u32"}
+		"long", "unsigned int", "__u32", "u32", "const __u32", "ktime_t"}
 	for _, ct := range scalars {
 		if !scalarCType(ct) {
 			t.Errorf("scalarCType(%q) = false, want true", ct)

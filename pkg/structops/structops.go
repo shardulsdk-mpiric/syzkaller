@@ -173,6 +173,13 @@ type Kfunc struct {
 	// (IsPtrRet && RetNull); KF_RET_NULL on a scalar-returning kfunc
 	// just means the scalar may be 0 -- no guard is needed.
 	RetNull bool
+	// Release mirrors the kernel KF_RELEASE flag: the call releases the
+	// reference its pointer argument holds.  The body generator has no
+	// reference-lifecycle model (nothing tracks which pool pointer is still
+	// live), so a Release kfunc is never generated-callable; a surface that
+	// must release a referenced argument does it in a FIXED epilogue
+	// (Qdisc_ops.enqueue: bpf_qdisc_skb_drop on the skb__ref ctx arg).
+	Release bool
 }
 
 // needsNullGuard reports whether a kfunc's return value must be bound
@@ -676,12 +683,20 @@ var condJoins = []string{"&&", "||"}
 
 // genCtxValue picks a fuzzer value sized to a writable field's
 // C type.  `int` (snd_burst) gets a signed 32-bit draw -- negative
-// values are interesting transport state; `unsigned long`
-// (avg_pacing_rate) gets a non-negative draw.
+// values are interesting transport state -- and so does `ktime_t`
+// (skb->tstamp, an s64 departure time); `__u32` gets the full 32-bit
+// range, top bit included (a qdisc's limit / q.qlen / qstats counters
+// near UINT_MAX are the wrap cases); `__u64` a wide draw (the
+// qdisc_skb_cb words); `unsigned long` (avg_pacing_rate) and anything
+// else a non-negative 31-bit draw.
 func genCtxValue(r *randGen, ctype string) int64 {
 	switch ctype {
-	case "int":
+	case "int", "ktime_t":
 		return int64(r.Intn(1<<32)) - (1 << 31)
+	case "__u32", "u32":
+		return int64(r.Intn(1 << 32))
+	case "__u64", "u64":
+		return int64(r.Intn(1 << 62))
 	default: // "unsigned long" and any future unsigned field
 		return int64(r.Intn(1 << 31))
 	}
@@ -727,7 +742,7 @@ const mskSockExpr = "(struct sock *)msk"
 func scalarCType(t string) bool {
 	switch normalizeCType(t) {
 	case "int", "unsigned long", "bool", "__u64", "u64", "long",
-		"unsigned int", "__u32", "u32":
+		"unsigned int", "__u32", "u32", "ktime_t":
 		return true
 	default:
 		return false
@@ -850,6 +865,14 @@ type bodyScope struct {
 	depth int
 	// minStmt / maxStmt bound the generated statement count.
 	minStmt, maxStmt int
+	// kfuncAllow, when non-nil, restricts the kfuncs this body may call to
+	// the named subset of the surface's kfunc table -- the generator-side
+	// image of a kernel per-op kfunc filter (Qdisc_ops'
+	// bpf_qdisc_kfunc_filter keys the allowed set on the callback: the
+	// watchdog from enqueue / dequeue only, bstats_update from dequeue
+	// only; a call outside the op's set is a verifier -EACCES).  nil, the
+	// two older surfaces, means the whole table is callable.
+	kfuncAllow []string
 }
 
 // ifElseMaxDepth caps generated `if`/`else` nesting (Stage 2b).  A
@@ -858,6 +881,20 @@ type bodyScope struct {
 // small (2) so a generated `get_send` body stays well within the BPF
 // verifier's instruction- and branch-complexity limits.
 const ifElseMaxDepth = 2
+
+// kfuncAllowed reports whether this scope may call the named kfunc: always
+// when no allow-list is set, else only when the name is on it.
+func (sc *bodyScope) kfuncAllowed(name string) bool {
+	if sc.kfuncAllow == nil {
+		return true
+	}
+	for _, n := range sc.kfuncAllow {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
 
 // genBody generates a BRF struct_ops body: a short,
 // randomly-ordered sequence of ctx reads, ctx writes (the write
@@ -904,6 +941,13 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 				continue
 			}
 			if sc.noReturn && kf.needsNullGuard() {
+				continue
+			}
+			if kf.Release || !sc.kfuncAllowed(kf.Name) {
+				// No reference-lifecycle model (Kfunc.Release), or
+				// outside this callback's kernel-permitted set.  Both
+				// are decided before any random draw, so a surface
+				// without either leaves the draw sequence untouched.
 				continue
 			}
 			if _, ok := pickKfuncArgs(r, kf, pool); ok {
@@ -1169,6 +1213,7 @@ func genIfElse(r *randGen, sop *Prog, sc bodyScope, varId *int,
 		depth:        sc.depth + 1,
 		minStmt:      1,
 		maxStmt:      3,
+		kfuncAllow:   sc.kfuncAllow,
 	}
 	st.IfBody = genBody(r, sop, branchScope, varId)
 	if r.bin() {
@@ -1251,6 +1296,12 @@ type callbackSpec struct {
 	prologue     string
 	epilogue     string
 	scope        func(surf *Surface) bodyScope
+	// ctxType / ctxVar, when non-empty, override the surface-wide first
+	// argument for THIS callback only: a surface whose ops do not all take
+	// the same first argument (Qdisc_ops.enqueue takes the skb first, its
+	// other four ops the qdisc) declares the odd one out here.
+	ctxType string
+	ctxVar  string
 }
 
 // Surface captures everything that was hard-coded for the MPTCP
@@ -1314,6 +1365,16 @@ type Surface struct {
 	instanceCallbackOrder []instanceField
 	// nameSep is the whitespace between `.name` and `=`.
 	nameSep string
+	// nameField is the instance member that carries the registered name;
+	// "" means `name` (mptcp_sched_ops, tcp_congestion_ops).  Qdisc_ops
+	// calls it `id` (its TCA_KIND string, char[IFNAMSIZ]).  The loader
+	// looks the member up under the same two names
+	// (executor/common_linux_structops.h).
+	nameField string
+	// layoutStructs names kernel structs, beyond layoutProbeCommon, whose
+	// layout this surface's field accessors depend on; the Configure-time
+	// layout self-check (layout.go) probes them too.
+	layoutStructs []string
 	// flagsField, when non-empty, emits a `.flags <flagsSep>= <flagsField>,`
 	// line before `.name`.
 	flagsField string
@@ -1326,6 +1387,18 @@ type Surface struct {
 	// (which may differ from generation order -- MPTCP generates
 	// get_send/init/release but renders init/release/get_send).
 	renderOrder []string
+}
+
+// callbackCtx returns the first-argument type and variable of the callback
+// with the given suffix: the callback's own override when it declares one,
+// else the surface-wide ctxType / ctxVar.
+func (surf *Surface) callbackCtx(suffix string) (string, string) {
+	for i := range surf.callbacks {
+		if cs := &surf.callbacks[i]; cs.suffix == suffix && cs.ctxType != "" {
+			return cs.ctxType, cs.ctxVar
+		}
+	}
+	return surf.ctxType, surf.ctxVar
 }
 
 // resolveWriteFields returns the surface's writable fields as the
@@ -1846,9 +1919,11 @@ func (sop *Prog) Render() string {
 			continue
 		}
 		fmt.Fprintf(s, "SEC(\"%s\")\n", surf.progSection)
-		// Signature: `<ret> BPF_PROG(<name><suffix>, <ctx> [, args...])`.
+		// Signature: `<ret> BPF_PROG(<name><suffix>, <ctx> [, args...])`;
+		// the ctx arg is the surface's unless this callback overrides it.
+		ctxType, ctxVar := surf.callbackCtx(cb.Suffix)
 		fmt.Fprintf(s, "%s BPF_PROG(%s%s, %s%s",
-			cb.RetType, sop.SchedName, cb.Suffix, surf.ctxType, surf.ctxVar)
+			cb.RetType, sop.SchedName, cb.Suffix, ctxType, ctxVar)
 		for _, a := range cb.ArgsAfterCtx {
 			fmt.Fprintf(s, ", %s", a)
 		}
@@ -1885,7 +1960,11 @@ func (sop *Prog) Render() string {
 	if surf.flagsField != "" {
 		fmt.Fprintf(s, "\t.flags%s= %s,\n", surf.flagsSep, surf.flagsField)
 	}
-	fmt.Fprintf(s, "\t.name%s= \"%s\",\n", surf.nameSep, sop.SchedName)
+	nameField := surf.nameField
+	if nameField == "" {
+		nameField = "name"
+	}
+	fmt.Fprintf(s, "\t.%s%s= \"%s\",\n", nameField, surf.nameSep, sop.SchedName)
 	fmt.Fprintf(s, "};\n")
 
 	return s.String()
