@@ -107,6 +107,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_sctp_drive_traffic":        linuxSctpSupported,
 	"syz_sctp_inject_chunk":         linuxSctpSupported,
 	"syz_bpf_struct_ops_load":       linuxSyzBpfStructOpsSupported,
+	"syz_sched_ext_exercise":        linuxSyzSchedExtExerciseSupported,
 	"syz_mount_image":               linuxSyzMountImageSupported,
 	"syz_read_part_table":           linuxSyzReadPartTableSupported,
 	"syz_io_uring_setup":            alwaysSupported,
@@ -348,6 +349,12 @@ func linuxSyzBpfStructOpsSupported(ctx *checkContext, call *prog.Syscall) string
 	// exists only in the mptcp/export tree) is learnt from the load's errno,
 	// not probed here.
 	return ctx.rootCanOpen("/sys/kernel/btf/vmlinux")
+}
+
+func linuxSyzSchedExtExerciseSupported(ctx *checkContext, call *prog.Syscall) string {
+	// The exercise only does something under a loaded sched_ext scheduler;
+	// CONFIG_SCHED_CLASS_EXT exposes /sys/kernel/sched_ext/state.
+	return ctx.rootCanOpen("/sys/kernel/sched_ext/state")
 }
 
 func linuxPkeysSupported(ctx *checkContext, call *prog.Syscall) string {

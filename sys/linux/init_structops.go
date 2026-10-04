@@ -54,6 +54,11 @@ func (arch *arch) generateStructOpsObjMptcpSched(g *prog.Gen, typ prog.Type, dir
 	return generateStructOpsObj(g, typ, dir, structops.MptcpSched)
 }
 
+func (arch *arch) generateStructOpsObjSchedExt(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
+	prog.Arg, []*prog.Call) {
+	return generateStructOpsObj(g, typ, dir, structops.SchedExt)
+}
+
 func generateStructOpsObj(g *prog.Gen, typ0 prog.Type, dir prog.Dir, surf *structops.Surface) (
 	prog.Arg, []*prog.Call) {
 	typ := typ0.(*prog.StructType)

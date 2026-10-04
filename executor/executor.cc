@@ -588,6 +588,12 @@ int main(int argc, char** argv)
 		fprintf(stderr, "no command");
 		return 1;
 	}
+#if GOOS_linux
+	// Every syz-executor process (runner and exec alike) runs its control
+	// path on the RT class; what it forks goes back to SCHED_NORMAL.  See
+	// sched_rt_refuge in executor_linux.h.
+	sched_rt_refuge();
+#endif
 	if (strcmp(argv[1], "runner") == 0) {
 		runner(argv, argc);
 		fail("runner returned");
