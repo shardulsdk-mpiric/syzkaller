@@ -47,6 +47,24 @@ import (
 //	                 be re-materialized against a different kernel
 //	                 (materialize.Stale), so the kernel-specific form stays
 //	                 recoverable.
+//	type 5 DATA      char member[32]   a scalar, non-callback instance member
+//	                 u32 size          its width in bytes (1/2/4/8)
+//	                 u32 reserved
+//	                 u64 value         the member's value in the object
+//	                 One record per instance-data member the rendered
+//	                 instance sets to a non-zero value (`.flags`,
+//	                 `.timeout_ms`, ...).  Digest reads them back from the
+//	                 object's .struct_ops[.link] section data, so the
+//	                 rendered C stays the single source of truth; the
+//	                 loader copies each into the map value at the member's
+//	                 offset in the running kernel's struct (after checking
+//	                 the width matches that kernel's BTF).  Which members
+//	                 the kernel accepts a value for is the subsystem's
+//	                 ->init_member(); anything else must stay zero
+//	                 (bpf_struct_ops_map_update_elem rejects it), and that
+//	                 is the surface table's responsibility.  Absent on an
+//	                 object that sets nothing (every pre-DATA recipe), so
+//	                 adding the record type needed no version bump.
 //
 // The C side mirrors these sizes verbatim (STRUCTOPS_* in the executor).
 const (
@@ -57,6 +75,7 @@ const (
 	recInstance = 2
 	recProg     = 3
 	recSpec     = 4
+	recData     = 5
 
 	recipeInstanceFlagLink = 1 << 0
 
@@ -64,6 +83,7 @@ const (
 	recipeMemberLen     = 32
 	recipeProgNameLen   = 32
 	recipeKfuncNameLen  = 64
+	recipeDataLen       = recipeMemberLen + 16
 )
 
 // Recipe is the parsed form of a load recipe (host-side mirror of what the
@@ -73,9 +93,19 @@ type Recipe struct {
 	StructName string
 	Link       bool
 	Progs      []RecipeProg
+	// Data are the DATA records: the scalar instance members the object
+	// sets to a non-zero value, in struct member order.
+	Data []RecipeData
 	// KernelKey / Spec are the SPEC record (zero / nil when absent).
 	KernelKey uint64
 	Spec      []byte
+}
+
+// RecipeData is one scalar instance-data member and its value.
+type RecipeData struct {
+	Member string
+	Size   uint32 // 1, 2, 4 or 8
+	Value  uint64
 }
 
 // RecipeProg is one struct_ops callback program.
@@ -274,6 +304,7 @@ func Digest(obj []byte) ([]byte, error) {
 
 	// Which member each prog fills: .rel<instSec> relocs within the instance.
 	progMember := map[string]string{}
+	relocAt := map[uint64]bool{} // instance byte offsets a callback pointer fills
 	if err := forEachRel(f, ".rel"+instSec, func(off uint64, typ uint32, symIdx uint32) error {
 		s, ok := symAt(symIdx)
 		if !ok {
@@ -290,9 +321,43 @@ func Digest(obj []byte) ([]byte, error) {
 			return fmt.Errorf("structops: member name %q too long", member)
 		}
 		progMember[s.Name] = member
+		relocAt[off] = true
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+
+	// Instance data: every scalar member the rendered instance initialised
+	// to a non-zero value, read straight from the section data (a callback
+	// slot is a relocation and reads as zero here; the name is a char
+	// array, not a scalar; struct/union/pointer members are never carried).
+	var data []RecipeData
+	for _, m := range members {
+		if m.bitSize != 0 || m.bitOff%8 != 0 || relocAt[uint64(m.bitOff/8)] {
+			continue
+		}
+		tid := b.skipModifiers(m.typ)
+		switch b.typeKind(tid) {
+		case btfKindInt, btfKindEnum, btfKindEnum64:
+		default:
+			continue
+		}
+		size := b.typeSizeOrType(tid)
+		off := uint64(m.bitOff / 8)
+		if size != 1 && size != 2 && size != 4 && size != 8 || off+uint64(size) > uint64(len(instData)) {
+			return nil, fmt.Errorf("structops: instance member %s: bad scalar extent (size %d at %#x)", m.name, size, off)
+		}
+		var v uint64
+		for i := uint64(0); i < uint64(size); i++ {
+			v |= uint64(instData[off+i]) << (8 * i)
+		}
+		if v == 0 {
+			continue
+		}
+		if len(m.name) >= recipeMemberLen {
+			return nil, fmt.Errorf("structops: member name %q too long", m.name)
+		}
+		data = append(data, RecipeData{Member: m.name, Size: size, Value: v})
 	}
 
 	// Kfunc call sites: .relstruct_ops relocs against undefined symbols.
@@ -323,7 +388,7 @@ func Digest(obj []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	r := &Recipe{BTF: b.data, StructName: structName, Link: link} // b.data: post-fixup (may be rebuilt)
+	r := &Recipe{BTF: b.data, StructName: structName, Link: link, Data: data} // b.data: post-fixup (may be rebuilt)
 	for _, p := range progSyms {
 		member, ok := progMember[p.sym.Name]
 		if !ok {
@@ -400,7 +465,7 @@ func (r *Recipe) Marshal() []byte {
 	var w tlvWriter
 	w.u32(recipeMagic)
 	w.u32(recipeVersion)
-	nrec := 2 + len(r.Progs)
+	nrec := 2 + len(r.Progs) + len(r.Data)
 	if len(r.Spec) != 0 {
 		nrec++
 	}
@@ -430,6 +495,16 @@ func (r *Recipe) Marshal() []byte {
 		}
 		pw.Write(p.Insns)
 		w.rec(recProg, pw.Bytes())
+	}
+	for _, d := range r.Data {
+		var dw tlvWriter
+		dw.str(d.Member, recipeMemberLen)
+		dw.u32(d.Size)
+		dw.u32(0)
+		var v [8]byte
+		binary.LittleEndian.PutUint64(v[:], d.Value)
+		dw.Write(v[:])
+		w.rec(recData, dw.Bytes())
 	}
 	if len(r.Spec) != 0 {
 		w.specRec(r.KernelKey, r.Spec)
@@ -553,6 +628,19 @@ func ParseRecipe(data []byte) (*Recipe, error) {
 			}
 			pr.Insns = p[q:]
 			r.Progs = append(r.Progs, pr)
+		case recData:
+			if n != recipeDataLen {
+				return nil, fmt.Errorf("recipe: bad DATA size %d", n)
+			}
+			d := RecipeData{
+				Member: cstr(p[:recipeMemberLen]),
+				Size:   le.Uint32(p[recipeMemberLen:]),
+				Value:  le.Uint64(p[recipeMemberLen+8:]),
+			}
+			if d.Size != 1 && d.Size != 2 && d.Size != 4 && d.Size != 8 {
+				return nil, fmt.Errorf("recipe: DATA %s: bad size %d", d.Member, d.Size)
+			}
+			r.Data = append(r.Data, d)
 		case recSpec:
 			if n < 8 {
 				return nil, fmt.Errorf("recipe: bad SPEC size %d", n)
