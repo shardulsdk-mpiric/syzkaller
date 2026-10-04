@@ -1,0 +1,70 @@
+From a11d90dffff053927f99cef3e714a714a465b00a Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Sun, 4 Oct 2026 00:52:26 +0530
+Subject: [PATCH 2/2] quic: annotate the receive-softirq frame dispatch with
+ kcov remote coverage
+
+quic_packet_rcv() runs under the UDP tunnel encap receive softirq and,
+when the socket is not owned by a user, pushes the packet straight into
+quic_packet_process() via sk->sk_backlog_rcv(). Everything downstream --
+header-protection removal, AEAD decrypt, quic_frame_process() and the
+per-frame-type validation handlers, the connection-teardown paths -- then
+executes with no per-task kcov attribution.
+
+Bracket that single softirq dispatch with the softirq-guarded helper
+keyed on the connection's kcov handle: one remote section per packet,
+opened only on the not-owned-by-user fast path. The bracket sits at
+quic_packet_rcv() rather than inside quic_packet_process() because the
+latter re-enters itself for coalesced packets and kcov forbids nested
+softirq sections; the outer section covers all re-entries. The same code
+also runs in process context from quic_backlog_rcv() (backlog drain under
+release_sock()), where the helper is a no-op and per-task kcov already
+records it.
+
+Measured (loopback fake-keys exercise, KCOV_REMOTE_ENABLE collector):
+the remote-coverage stream goes from 0 to 226 net/quic PCs across 27
+functions, including quic_packet_process, quic_frame_process and
+quic_frame_connection_close_process; 9 of those functions
+(quic_frame_connection_close_process, quic_packet_rcv, quic_backlog_rcv,
+quic_request_sock_{create,lookup,backlog_tail}, quic_accept_sock_exists,
+quic_get_msg_addrs, quic_inq_event_recv) appear only in the remote stream
+and in neither per-task stream -- the softirq-only RX work the blind spot
+was about. The per-task net/quic coverage is unchanged (142 functions /
+1134 PCs with and without the series). No kcov WARN and no KASAN splat
+over a 40x stress on the patched kernel; crash profile identical to the
+unpatched kernel (both clean).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/quic/packet.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/packet.c b/net/quic/packet.c
+index ad5e6be1a6e17..880f05886f3fe 100644
+--- a/net/quic/packet.c
++++ b/net/quic/packet.c
+@@ -624,9 +624,19 @@ int quic_packet_rcv(struct sock *sk, struct sk_buff *skb, bool icmp)
+ 		}
+ 		QUIC_INC_STATS(net, QUIC_MIB_PKT_RCVBACKLOGS);
+ 	} else {
+-		/* Socket not busy: process immediately. */
++		/* Socket not busy: process immediately.  This is the receive
++		 * softirq fast path -- quic_packet_process() and the whole
++		 * frame-validation state machine run here with no per-task kcov
++		 * attribution.  Bracket this single dispatch (not
++		 * quic_packet_process(), which re-enters itself for coalesced
++		 * packets) with the softirq-guarded remote section keyed on the
++		 * connection's kcov handle; a no-op in process context and when
++		 * the handle is zero.
++		 */
+ 		QUIC_INC_STATS(net, QUIC_MIB_PKT_RCVFASTPATHS);
++		quic_kcov_remote_start(quic_sk(sk)->kcov_handle);
+ 		sk->sk_backlog_rcv(sk, skb); /* quic_backlog_rcv(). */
++		quic_kcov_remote_stop();
+ 	}
+ 	bh_unlock_sock(sk);
+ 	sock_put(sk);
+-- 
+2.34.1
+

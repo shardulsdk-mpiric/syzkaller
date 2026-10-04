@@ -1,0 +1,29 @@
+total unique PCs: 510; distinct functions: 75
+net/quic functions: 27; sctp PCs: 226
+     72  quic_packet_process
+     16  quic_crypto_header_protect
+     14  quic_crypto_payload_protect
+     13  quic_packet_handshake_header_process.constprop.0
+     13  quic_frame_connection_close_process
+     13  quic_frame_process
+     11  quic_request_sock_backlog_tail
+      8  quic_crypto_decrypt
+      7  quic_get_var
+      7  quic_request_sock_create
+      7  quic_packet_get_long_header
+      6  quic_get_int
+      5  quic_packet_get_connid
+      3  quic_get_num
+      3  quic_get_msg_addrs
+      3  quic_get_msg_ecn
+      3  quic_pnspace_check
+      3  quic_pnspace_mark
+      3  quic_crypto_get_number
+      3  quic_crypto_aead_mem_alloc
+      3  quic_inq_event_recv
+      2  quic_request_sock_lookup
+      2  quic_accept_sock_exists
+      2  quic_timer_reset
+      2  quic_packet_rcv
+      1  quic_net
+      1  quic_backlog_rcv

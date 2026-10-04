@@ -1,0 +1,9 @@
+quic_accept_sock_exists
+quic_backlog_rcv
+quic_frame_connection_close_process
+quic_get_msg_addrs
+quic_inq_event_recv
+quic_packet_rcv
+quic_request_sock_backlog_tail
+quic_request_sock_create
+quic_request_sock_lookup

@@ -1,0 +1,2 @@
+net/quic TOTAL: 2193 / 5121 (42.8%)
+net/quic EXTRA(softirq) TOTAL: 1235 / 5121 (24.1%)
