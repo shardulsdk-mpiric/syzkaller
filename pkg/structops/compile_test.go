@@ -38,6 +38,7 @@ func TestCompileRecipe(t *testing.T) {
 	const seeds = 8
 	for _, surf := range []*Surface{TCPCong, MptcpSched} {
 		t.Run(surf.Tag(), func(t *testing.T) {
+			skipUnlessKernelHas(t, kobj, surf)
 			start := time.Now()
 			for seed := int64(0); seed < seeds; seed++ {
 				p := Generate(rand.New(rand.NewSource(seed)), surf)
@@ -108,6 +109,30 @@ func TestCompileRecipe(t *testing.T) {
 	}
 	if st := Stats(); st.DiskHits != 1 || st.Compiled != 0 {
 		t.Errorf("restart on the same kernel recompiled: %+v (previous run %+v)", st, before)
+	}
+}
+
+// surfaceKernelGate names, per surface, a kernel BTF struct its rendered
+// programs cannot compile without: the compile tests skip that surface on
+// a kernel build lacking it rather than fail (mptcp_sched is pinned to the
+// mptcp/export tree's subflow iterator, which a mainline-based build such
+// as the sched_ext Phase-0 kernel does not have).
+var surfaceKernelGate = map[string]string{
+	MptcpSched.tag: "bpf_iter_mptcp_subflow",
+}
+
+func skipUnlessKernelHas(t *testing.T, kobj string, surf *Surface) {
+	t.Helper()
+	gate, ok := surfaceKernelGate[surf.tag]
+	if !ok {
+		return
+	}
+	sizes, err := kernelStructSizes(kobj+"/vmlinux", []string{gate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizes[gate] == 0 {
+		t.Skipf("kernel BTF has no struct %s; %s programs cannot compile against it", gate, surf.tag)
 	}
 }
 
