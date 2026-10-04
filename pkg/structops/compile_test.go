@@ -36,7 +36,7 @@ func TestCompileRecipe(t *testing.T) {
 		t.Errorf("layout self-check compared only %d structs", n)
 	}
 	const seeds = 8
-	for _, surf := range []*Surface{TCPCong, MptcpSched} {
+	for _, surf := range []*Surface{TCPCong, MptcpSched, SchedExt} {
 		t.Run(surf.Tag(), func(t *testing.T) {
 			skipUnlessKernelHas(t, kobj, surf)
 			start := time.Now()
@@ -119,6 +119,7 @@ func TestCompileRecipe(t *testing.T) {
 // as the sched_ext Phase-0 kernel does not have).
 var surfaceKernelGate = map[string]string{
 	MptcpSched.tag: "bpf_iter_mptcp_subflow",
+	SchedExt.tag:   "sched_ext_ops", // CONFIG_SCHED_CLASS_EXT
 }
 
 func skipUnlessKernelHas(t *testing.T, kobj string, surf *Surface) {

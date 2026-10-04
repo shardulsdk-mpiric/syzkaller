@@ -187,6 +187,19 @@ type Kfunc struct {
 	// runtime error (scheduler ejection), not a bug -- and is emitted only
 	// where bodyScope.terminal asks for it.
 	Terminal bool
+	// ArgCands, when set, lists per parameter (by position; a nil entry
+	// means "no override") the C expressions that may be passed in that
+	// position, in ADDITION to any same-typed in-scope pool value and in
+	// PLACE of the fuzzer-literal draw an integer parameter would otherwise
+	// get.  It is how a surface names a parameter whose legal values are a
+	// small enum-like set rather than any integer: sched_ext's kick flags
+	// (SCX_KICK_IDLE with PREEMPT is a runtime error -> ejection) or a dsq
+	// id (a stray LOCAL_ON bit with a garbage cpu is one too).  Give such a
+	// parameter an opaque ArgTypes entry (e.g. "scx_kick_flags") that no
+	// pool value and no literal rule matches, and the candidates are its
+	// only source.  nil on every kfunc of the older surfaces, whose draws
+	// are unchanged.
+	ArgCands [][]string
 }
 
 // needsNullGuard reports whether a kfunc's return value must be bound
@@ -436,6 +449,193 @@ var tcpCongWriteFields = []CtxField{
 		Field:    "snd_cwnd_cnt",
 		Accessor: "tp->snd_cwnd_cnt",
 		CType:    "unsigned int",
+	},
+}
+
+// schedExtKfuncs are the kfuncs a row-A sched_ext scheduler may call,
+// transcribed from kernel/sched/ext/ext.c in BPF-VISIBLE prototype form:
+// the kernel definitions of most of them end in an implicit
+// `const struct bpf_prog_aux *aux` (KF_IMPLICIT_ARGS), which the program
+// does not pass and the verifier supplies, so it is dropped here; where a
+// `___v2` sibling exists the v1 name is used (v1 is what every in-tree
+// scheduler calls and what the loader resolves by name).
+//
+// Which op may call which kfunc is the kernel's scx_kfunc_context_filter:
+// the `scx_kfunc_ids_any` set is callable from every op; the other sets are
+// per-op (scx_kf_allow_flags[]).  Row A draws only from `any` plus the
+// dispatch-only `scx_bpf_dispatch_nr_slots`, and the per-callback
+// bodyScope.kfuncAllow lists are the generator-side image of that table:
+//
+//	select_cpu  SELECT_CPU | ENQUEUE  -> any (+ insert: terminal only)
+//	enqueue     SELECT_CPU | ENQUEUE  -> any (+ insert: terminal only)
+//	dispatch    ENQUEUE | DISPATCH    -> any + dispatch set
+//	running / stopping                -> any
+//	init / exit UNLOCKED              -> any (+ create_dsq: Phase 3)
+//
+// Three kernel runtime checks shape the argument types:
+//   - a CPU argument must be a valid CPU id (scx_cpu_valid -> scx_error ->
+//     scheduler ejection otherwise), so cpu parameters are typed `s32` and
+//     `s32` is deliberately NOT a scalar the generator draws literals for or
+//     computes on (scalarCType / integerCType): the only `s32` values are
+//     the ctx `prev_cpu` / `cpu` and `scx_bpf_task_cpu()` results, all
+//     valid by construction;
+//   - kick flags: SCX_KICK_IDLE together with PREEMPT or WAIT is a runtime
+//     error, so the flags come from an ArgCands set.  SCX_KICK_WAIT is left
+//     out of row A: it spins in irq_work until the target CPU's SCX task
+//     switches out, which a SLICE_INF task on that CPU never does;
+//   - a dsq id for scx_bpf_dsq_nr_queued: an unknown user id is a clean
+//     -ENOENT, but LOCAL_ON with a stray cpu is an error, so it is an
+//     ArgCands set of the two builtins.
+//
+// Not in row A, with the reason: scx_bpf_dsq_move_to_local (user DSQs only,
+// find_user_dsq; Phase 3 with ops.init creating one), scx_bpf_create_dsq
+// (sleepable, init-only; Phase 3), scx_bpf_select_cpu_dfl and the idle
+// masks (Phase 4), every KF_RCU_PROTECTED / KF_ACQUIRE kfunc (needs an
+// explicit RCU section or a release the body generator does not model),
+// scx_bpf_dsq_insert_vtime (builtin DSQs cannot be priority queues).
+var schedExtKfuncs = []Kfunc{
+	{
+		// __bpf_kfunc void scx_bpf_dsq_insert(struct task_struct *p,
+		//	u64 dsq_id, u64 slice, u64 enq_flags, const struct bpf_prog_aux *aux)
+		// scx_kfunc_ids_enqueue_dispatch.  The liveness scaffold's terminal
+		// statement (StmtDsqInsert); never a generated draw.
+		Name: "scx_bpf_dsq_insert",
+		CDecl: "extern void scx_bpf_dsq_insert(struct task_struct *p, __u64 dsq_id, " +
+			"__u64 slice, __u64 enq_flags) __ksym;",
+		RetType:  "", // void
+		ArgTypes: []string{"struct task_struct *", "__u64", "__u64", "__u64"},
+		Terminal: true,
+	},
+	{
+		// __bpf_kfunc u32 scx_bpf_dispatch_nr_slots(const struct bpf_prog_aux *aux)
+		// scx_kfunc_ids_dispatch: ops.dispatch only.
+		Name:     "scx_bpf_dispatch_nr_slots",
+		CDecl:    "extern __u32 scx_bpf_dispatch_nr_slots(void) __ksym;",
+		RetType:  "__u32",
+		ArgTypes: nil,
+	},
+	{
+		// __bpf_kfunc bool scx_bpf_task_set_slice(struct task_struct *p, u64 slice,
+		//	const struct bpf_prog_aux *aux)
+		Name:     "scx_bpf_task_set_slice",
+		CDecl:    "extern bool scx_bpf_task_set_slice(struct task_struct *p, __u64 slice) __ksym;",
+		RetType:  "bool",
+		ArgTypes: []string{"struct task_struct *", "__u64"},
+	},
+	{
+		// __bpf_kfunc bool scx_bpf_task_set_dsq_vtime(struct task_struct *p, u64 vtime,
+		//	const struct bpf_prog_aux *aux)
+		Name:     "scx_bpf_task_set_dsq_vtime",
+		CDecl:    "extern bool scx_bpf_task_set_dsq_vtime(struct task_struct *p, __u64 vtime) __ksym;",
+		RetType:  "bool",
+		ArgTypes: []string{"struct task_struct *", "__u64"},
+	},
+	{
+		// __bpf_kfunc void scx_bpf_kick_cpu(s32 cpu, u64 flags, const struct bpf_prog_aux *aux)
+		Name:     "scx_bpf_kick_cpu",
+		CDecl:    "extern void scx_bpf_kick_cpu(__s32 cpu, __u64 flags) __ksym;",
+		RetType:  "", // void
+		ArgTypes: []string{"__s32", "scx_kick_flags"},
+		ArgCands: [][]string{nil, {"0", "SCX_KICK_IDLE", "SCX_KICK_PREEMPT"}},
+	},
+	{
+		// __bpf_kfunc s32 scx_bpf_dsq_nr_queued(u64 dsq_id, const struct bpf_prog_aux *aux)
+		// The result is a count or -ENOENT, never a CPU: typed `int`, not
+		// `s32`, so it is an arithmetic operand and never a cpu argument.
+		Name:     "scx_bpf_dsq_nr_queued",
+		CDecl:    "extern __s32 scx_bpf_dsq_nr_queued(__u64 dsq_id) __ksym;",
+		RetType:  "int",
+		ArgTypes: []string{"scx_dsq_id"},
+		ArgCands: [][]string{{"SCX_DSQ_GLOBAL", "SCX_DSQ_LOCAL"}},
+	},
+	{
+		// __bpf_kfunc u32 scx_bpf_cpuperf_cap(s32 cpu, const struct bpf_prog_aux *aux)
+		Name:     "scx_bpf_cpuperf_cap",
+		CDecl:    "extern __u32 scx_bpf_cpuperf_cap(__s32 cpu) __ksym;",
+		RetType:  "__u32",
+		ArgTypes: []string{"__s32"},
+	},
+	{
+		// __bpf_kfunc u32 scx_bpf_cpuperf_cur(s32 cpu, const struct bpf_prog_aux *aux)
+		Name:     "scx_bpf_cpuperf_cur",
+		CDecl:    "extern __u32 scx_bpf_cpuperf_cur(__s32 cpu) __ksym;",
+		RetType:  "__u32",
+		ArgTypes: []string{"__s32"},
+	},
+	{
+		// __bpf_kfunc u32 scx_bpf_nr_cpu_ids(void)
+		Name:     "scx_bpf_nr_cpu_ids",
+		CDecl:    "extern __u32 scx_bpf_nr_cpu_ids(void) __ksym;",
+		RetType:  "__u32",
+		ArgTypes: nil,
+	},
+	{
+		// __bpf_kfunc bool scx_bpf_task_running(const struct task_struct *p)
+		Name:     "scx_bpf_task_running",
+		CDecl:    "extern bool scx_bpf_task_running(const struct task_struct *p) __ksym;",
+		RetType:  "bool",
+		ArgTypes: []string{"const struct task_struct *"},
+	},
+	{
+		// __bpf_kfunc s32 scx_bpf_task_cpu(const struct task_struct *p)
+		// Also the fixed prologue of enqueue / running / stopping (`s32 cpu =
+		// scx_bpf_task_cpu(p);`), so it is a prologue kfunc: always declared,
+		// never a generated draw; `cpu` is the pool's `s32` there.
+		Name:     "scx_bpf_task_cpu",
+		CDecl:    "extern __s32 scx_bpf_task_cpu(const struct task_struct *p) __ksym;",
+		RetType:  "__s32",
+		ArgTypes: []string{"const struct task_struct *"},
+	},
+	{
+		// __bpf_kfunc u64 scx_bpf_now(void)
+		Name:     "scx_bpf_now",
+		CDecl:    "extern __u64 scx_bpf_now(void) __ksym;",
+		RetType:  "__u64",
+		ArgTypes: nil,
+	},
+}
+
+// schedExtAnyKfuncs are the row-A kfuncs callable from EVERY sched_ext op
+// (the kernel's scx_kfunc_ids_any members of the table above); the
+// dispatch-only kfunc is added by the dispatch scope.  scx_bpf_dsq_insert
+// (Terminal) and scx_bpf_task_cpu (prologue) are listed for completeness --
+// both are excluded from draws before the allow-list is consulted.
+var schedExtAnyKfuncs = []string{
+	"scx_bpf_dsq_insert", "scx_bpf_task_set_slice", "scx_bpf_task_set_dsq_vtime",
+	"scx_bpf_kick_cpu", "scx_bpf_dsq_nr_queued", "scx_bpf_cpuperf_cap",
+	"scx_bpf_cpuperf_cur", "scx_bpf_nr_cpu_ids", "scx_bpf_task_running",
+	"scx_bpf_task_cpu", "scx_bpf_now",
+}
+
+// schedExtDispatchKfuncs is the dispatch scope's allow-list: `any` plus the
+// kernel's scx_kfunc_ids_dispatch members modelled in row A.
+var schedExtDispatchKfuncs = append([]string{"scx_bpf_dispatch_nr_slots"}, schedExtAnyKfuncs...)
+
+// schedExtWriteFields is the writable task state a cpu-form sched_ext
+// program may store to, exactly bpf_scx_btf_struct_access
+// (kernel/sched/ext/ext.c): `p->scx.slice` and `p->scx.dsq_vtime` (u64),
+// and `p->scx.disallow` (bool, bpf_scx_btf_struct_access_common).  Any
+// other task_struct store is a verifier -EACCES.  Accessors are relative to
+// the callback's task local `p`; the dispatch scope re-bases them onto its
+// NULL-checked `prev`.
+var schedExtWriteFields = []CtxField{
+	{
+		Owner:    "struct task_struct",
+		Field:    "scx.slice",
+		Accessor: "p->scx.slice",
+		CType:    "__u64",
+	},
+	{
+		Owner:    "struct task_struct",
+		Field:    "scx.dsq_vtime",
+		Accessor: "p->scx.dsq_vtime",
+		CType:    "__u64",
+	},
+	{
+		Owner:    "struct task_struct",
+		Field:    "scx.disallow",
+		Accessor: "p->scx.disallow",
+		CType:    "bool",
 	},
 }
 
@@ -723,6 +923,10 @@ func genCtxValue(r *randGen, ctype string) int64 {
 		return int64(r.Intn(1 << 32))
 	case "__u64", "u64":
 		return int64(r.Intn(1 << 62))
+	case "bool":
+		// A bool field (sched_ext_entity.disallow) takes 0 or 1; any other
+		// literal would only convert to 1 and read as noise.
+		return int64(r.Intn(2))
 	default: // "unsigned long" and any future unsigned field
 		return int64(r.Intn(1 << 31))
 	}
@@ -784,7 +988,7 @@ func scalarCType(t string) bool {
 // parameter's normalized type.
 func pickKfuncArgs(r *randGen, kf *Kfunc, pool []typedVal) ([]string, bool) {
 	args := make([]string, 0, len(kf.ArgTypes))
-	for _, pt := range kf.ArgTypes {
+	for ai, pt := range kf.ArgTypes {
 		want := normalizeCType(pt)
 		var cands []string
 		for _, v := range pool {
@@ -792,7 +996,11 @@ func pickKfuncArgs(r *randGen, kf *Kfunc, pool []typedVal) ([]string, bool) {
 				cands = append(cands, v.expr)
 			}
 		}
-		if want == "bool" {
+		if ai < len(kf.ArgCands) && len(kf.ArgCands[ai]) > 0 {
+			// The surface's own candidate set for this position (see
+			// Kfunc.ArgCands); it replaces the literal rules below.
+			cands = append(cands, kf.ArgCands[ai]...)
+		} else if want == "bool" {
 			// `bool` is also satisfiable by a fuzzer-chosen literal
 			// -- mptcp_subflow_set_scheduled's `scheduled` arg is the
 			// only bool parameter, and the fixed epilogue always
@@ -1045,6 +1253,15 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 		StmtCtxRead, StmtCtxWrite,
 		StmtArith, StmtKfuncCall,
 	}
+	// A scope with no ctx fields (sched_ext's `s32 init(void)` / `exit(info)`
+	// have no task in scope) can only call kfuncs and compute over their
+	// results: the two field kinds are not offered, and the "fall back to a
+	// read" repairs below skip the statement instead.  Every older surface
+	// has fields in every scope, so their draws are unchanged.
+	noFields := len(sc.writeFields) == 0
+	if noFields {
+		kinds = []StmtKind{StmtArith, StmtKfuncCall}
+	}
 	if sc.allowIter {
 		kinds = append(kinds, StmtSubflowIter)
 	}
@@ -1060,7 +1277,7 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 	for i := 0; i < nStmt; i++ {
 		// Pick freely among the statement kinds available to this scope.
 		kind := kinds[r.Intn(len(kinds))]
-		if sc.requireWrite && i == nStmt-1 {
+		if sc.requireWrite && i == nStmt-1 && !noFields {
 			// Bias the last statement toward a write so the headline
 			// primitive is reliably exercised.
 			haveWrite := false
@@ -1086,6 +1303,11 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 			// The condition tests an in-scope scalar local; none yet --
 			// fall back to a read, which produces one.
 			kind = StmtCtxRead
+		}
+		if noFields && kind == StmtCtxRead {
+			// No field to read: the repair above has nothing to offer, so
+			// this statement is simply not emitted.
+			continue
 		}
 
 		switch kind {
@@ -1151,7 +1373,9 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 				// Defensive -- pool only grows, so this cannot
 				// happen; fall back to a read rather than emit a
 				// malformed call.
-				emitCtxRead(r.Intn(len(sc.writeFields)))
+				if !noFields {
+					emitCtxRead(r.Intn(len(sc.writeFields)))
+				}
 				continue
 			}
 			st := Stmt{
@@ -1463,6 +1687,12 @@ type callbackSpec struct {
 	// other four ops the qdisc) declares the odd one out here.
 	ctxType string
 	ctxVar  string
+	// noCtx marks a callback whose kernel prototype takes NO arguments
+	// (sched_ext_ops.init: `s32 (*init)(void)`): it renders as
+	// `BPF_PROG(<name>)` with no ctx parameter at all.  Declaring one anyway
+	// would make the BPF_PROG wrapper load ctx[0], which the verifier
+	// rejects against a zero-argument member prototype.
+	noCtx bool
 }
 
 // Surface captures everything that was hard-coded for the MPTCP
@@ -1566,6 +1796,17 @@ func (surf *Surface) callbackCtx(suffix string) (string, string) {
 		}
 	}
 	return surf.ctxType, surf.ctxVar
+}
+
+// callbackHasCtx reports whether the callback with the given suffix takes a
+// ctx argument (every callback does, except one declared noCtx).
+func (surf *Surface) callbackHasCtx(suffix string) bool {
+	for i := range surf.callbacks {
+		if cs := &surf.callbacks[i]; cs.suffix == suffix {
+			return !cs.noCtx
+		}
+	}
+	return true
 }
 
 // resolveWriteFields returns the surface's writable fields as the
@@ -1753,6 +1994,18 @@ var TCPCong = &Surface{
 		{"_undo_cwnd", "\t"},
 	},
 	nameSep: "\t\t",
+	// `.flags` is fuzzed: any subset of TCP_CONG_MASK (include/net/tcp.h:
+	// NON_RESTRICTED, NEEDS_ECN, NEEDS_ACCECN, ECT_1_NEGOTIATION,
+	// NO_FALLBACK_RFC3168 -- bits 0..4), zero included, so
+	// bpf_tcp_ca_init_member's acceptance and the ECN-negotiation paths the
+	// bits select become part of the fuzzed surface.  Added 2026-10 after
+	// the instance-data machinery landed; it re-pinned the tcp_cong golden
+	// hash (see TestStructOpsGolden).
+	instanceFields: []InstanceField{
+		{Field: "flags", Sep: "\t\t", gen: func(r *randGen) uint64 {
+			return uint64(r.Intn(32))
+		}},
+	},
 	callbacks: []callbackSpec{
 		{
 			suffix:   "_ssthresh",
@@ -1780,6 +2033,289 @@ var TCPCong = &Surface{
 	renderOrder: []string{"_ssthresh", "_cong_avoid", "_undo_cwnd"},
 }
 
+// schedExtTaskScope is the bodyScope shared by the sched_ext callbacks that
+// see a task `p` and the fixed prologue local `cpu` (enqueue, running,
+// stopping); extra seeds the per-callback ctx args.  The writable surface
+// is the three btf-struct-access task fields via `p->scx.`; kfuncs are the
+// `any` set.  noReturn is set so no draw can leave a path early -- in
+// enqueue that is what makes the terminal insert reach every path; in
+// running / stopping it costs nothing (no row-A kfunc needs a guard).
+func schedExtTaskScope(surf *Surface, extra ...typedVal) bodyScope {
+	pool := []typedVal{
+		{expr: "p", ctype: "struct task_struct *"},
+		{expr: "cpu", ctype: "__s32"},
+	}
+	return bodyScope{
+		pool:         append(pool, extra...),
+		writeFields:  surf.resolveWriteFields(),
+		allowIter:    false,
+		requireWrite: false,
+		noReturn:     true,
+		allowIf:      true,
+		depth:        0,
+		minStmt:      1,
+		maxStmt:      4,
+		kfuncAllow:   schedExtAnyKfuncs,
+	}
+}
+
+// schedExtNoTaskScope is the bodyScope of init / exit: no task, no ctx
+// fields, so the body is kfunc calls over the `any` set's no-argument
+// members and arithmetic / branching over their results (genBody's
+// field-less mode).
+func schedExtNoTaskScope(surf *Surface) bodyScope {
+	return bodyScope{
+		pool:       nil,
+		noReturn:   true,
+		allowIf:    true,
+		minStmt:    0,
+		maxStmt:    3,
+		kfuncAllow: schedExtAnyKfuncs,
+	}
+}
+
+// schedExtCpuPrologue is the fixed first line of enqueue / running /
+// stopping: the task's CPU, the scope's only `s32` (a valid cpu id by
+// construction, see schedExtKfuncs) and the enqueue terminal's LOCAL_ON
+// target.
+const schedExtCpuPrologue = "\t__s32 cpu = scx_bpf_task_cpu(p);\n\n"
+
+// schedExtTerminal is the enqueue scope's terminal insert: every path of
+// ops.enqueue ends in exactly one scx_bpf_dsq_insert of `p` to a DRAINED
+// builtin DSQ -- the global DSQ (the core consumes it before and after
+// ops.dispatch), this CPU's local DSQ, or the task's CPU's local DSQ
+// (LOCAL_ON | cpu, the kernel kicks the target).  No user DSQ (row B).  The
+// slice and enqueue flags are the fuzzed dimensions: slice 0 keeps the
+// residual slice, SCX_SLICE_INF makes the task run until it blocks or is
+// kicked (a stall of OTHER tasks queued behind a CPU-bound SLICE_INF task
+// is by-spec, and the measured soak is where that shows up if it does);
+// PREEMPT / HEAD are the two flags legal on every DSQ (IMMED and RESCUE are
+// local-only -> runtime error on GLOBAL), and `enq_flags` passes the ctx
+// flags through as the in-tree schedulers do.
+var schedExtTerminal = &terminalInsert{
+	kfunc:    "scx_bpf_dsq_insert",
+	task:     "p",
+	dsqIDs:   []string{"SCX_DSQ_GLOBAL", "SCX_DSQ_LOCAL", "SCX_DSQ_LOCAL_ON | cpu"},
+	slices:   []string{"0", "SCX_SLICE_DFL", "SCX_SLICE_DFL / 4", "1000", "SCX_SLICE_INF"},
+	enqFlags: []string{"SCX_ENQ_PREEMPT", "SCX_ENQ_HEAD", "enq_flags"},
+}
+
+// schedExtOpsFlagBits are the SCX_OPS_* bits a generated `.flags` may carry,
+// in bit order: exactly SCX_OPS_ALL_FLAGS of kernel/sched/ext/internal.h
+// (a bit outside it is a load-time -EINVAL).  SCX_OPS_SWITCH_PARTIAL (bit
+// 3) is a FUZZED bit like the others, never forced: full switch is the
+// larger surface and liveness comes from the terminal insert, not from
+// leaving the executor on the fair class.
+var schedExtOpsFlagBits = []uint64{
+	1 << 0, // SCX_OPS_KEEP_BUILTIN_IDLE
+	1 << 1, // SCX_OPS_ENQ_LAST (last task on a CPU goes through enqueue too)
+	1 << 2, // SCX_OPS_ENQ_EXITING
+	1 << 3, // SCX_OPS_SWITCH_PARTIAL
+	1 << 4, // SCX_OPS_ENQ_MIGRATION_DISABLED
+	1 << 5, // SCX_OPS_ALLOW_QUEUED_WAKEUP
+	1 << 6, // SCX_OPS_BUILTIN_IDLE_PER_NODE
+	1 << 7, // SCX_OPS_ALWAYS_ENQ_IMMED
+	1 << 8, // SCX_OPS_TID_TO_TASK
+}
+
+// SchedExtOpsSwitchPartial is SCX_OPS_SWITCH_PARTIAL, exported for tests
+// and tooling that classify a generated scheduler.
+const SchedExtOpsSwitchPartial = uint64(1 << 3)
+
+// SchedExt is the THIRD struct_ops surface: a fuzzed cpu-form
+// `sched_ext_ops` BPF scheduler, row A of the sched_ext design (builtin
+// DSQs, non-sleepable callbacks).  Ground truth is kernel/sched/ext/ext.c
+// (writable task fields, kfunc sets and their per-op filter, init_member's
+// validation of the instance members) and internal.h / include/linux/
+// sched/ext.h (the enums the rendered text names); the shape follows
+// tools/sched_ext/scx_simple.bpf.c.
+//
+// Liveness by construction: the one way a BPF scheduler can stall the
+// system is to take a task into custody in ops.enqueue and never dispatch
+// it.  The enqueue body is generated under noReturn with a terminal
+// StmtDsqInsert, so every path ends in exactly one insert to a drained
+// builtin DSQ; `.timeout_ms` is pinned to 1-3 s so even a genuine stall
+// (a kernel bug) is ejected by the kernel's own watchdog before any
+// secondary detector (syzkaller's 5 s program timeout, RCU stall, soft
+// lockup) sees it.  The excluded "custody and never dispatch" behaviour is
+// by-spec, not a kernel bug, so this costs no surface.
+var SchedExt = &Surface{
+	tag:            "sched_ext",
+	instanceStruct: "struct sched_ext_ops",
+	linkSection:    ".struct_ops.link",
+	progSection:    "struct_ops",
+	nameMax:        16, // the loader's unique name is 16 wide (SCX_OPS_NAME_LEN is 128)
+	namePrefix:     "scx_",
+	ctxType:        "struct task_struct *",
+	ctxVar:         "p",
+	kfuncs:         schedExtKfuncs,
+	iterKfuncs:     nil,
+	writeFields:    schedExtWriteFields,
+	prologueKfuncNames: []string{
+		"scx_bpf_task_cpu",
+	},
+	kfuncExternComment: "/* sched_ext kfuncs (kernel/sched/ext/ext.c), BPF-visible prototypes. */",
+	iterExternComment:  "",
+	headerComment:      "/* Generated sched_ext struct_ops scheduler (row A: builtin DSQs). */",
+	instanceCallbackOrder: []instanceField{
+		{"_select_cpu", "\t\t"},
+		{"_enqueue", "\t\t"},
+		{"_dispatch", "\t\t"},
+		{"_running", "\t\t"},
+		{"_stopping", "\t\t"},
+		{"_init", "\t\t\t"},
+		{"_exit", "\t\t\t"},
+	},
+	nameSep:       "\t\t\t",
+	layoutStructs: []string{"task_struct", "sched_ext_entity"},
+	// Instance data, validated by bpf_scx_init_member: timeout_ms pinned to
+	// [1000, 3000] (the liveness backstop; the kernel caps it at 30 s),
+	// flags a random subset of SCX_OPS_ALL_FLAGS (each bit p=0.3,
+	// SWITCH_PARTIAL p=0.4), exit_dump_len (0 = the 32 KB default; the
+	// kernel allocates this much at enable, so it stays small) and
+	// dispatch_max_batch (0 = the default 32; sizes the per-cpu dispatch
+	// buffer, 1 makes "dispatch buffer overflow" reachable from a second
+	// insert).
+	instanceFields: []InstanceField{
+		{Field: "timeout_ms", Sep: "\t\t", gen: func(r *randGen) uint64 {
+			return 1000 + uint64(r.Intn(2001))
+		}},
+		{Field: "flags", Sep: "\t\t\t", gen: func(r *randGen) uint64 {
+			var v uint64
+			for _, bit := range schedExtOpsFlagBits {
+				p := 3
+				if bit == SchedExtOpsSwitchPartial {
+					p = 4
+				}
+				if r.Intn(10) < p {
+					v |= bit
+				}
+			}
+			return v
+		}},
+		{Field: "exit_dump_len", Sep: "\t\t", gen: func(r *randGen) uint64 {
+			return []uint64{0, 0, 512, 4096, 32768}[r.Intn(5)]
+		}},
+		{Field: "dispatch_max_batch", Sep: "\t", gen: func(r *randGen) uint64 {
+			return []uint64{0, 0, 1, 2, 8, 64}[r.Intn(6)]
+		}},
+	},
+	callbacks: []callbackSpec{
+		{
+			// s32 (*select_cpu)(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+			// Returns prev_cpu (always a valid cpu for p); a body never
+			// returns early, so the epilogue runs on every path.
+			suffix:       "_select_cpu",
+			retType:      "__s32",
+			argsAfterCtx: []string{"__s32 prev_cpu", "__u64 wake_flags"},
+			epilogue:     "\treturn prev_cpu;\n",
+			scope: func(surf *Surface) bodyScope {
+				return bodyScope{
+					pool: []typedVal{
+						{expr: "p", ctype: "struct task_struct *"},
+						{expr: "prev_cpu", ctype: "__s32"},
+						{expr: "wake_flags", ctype: "__u64"},
+					},
+					writeFields: surf.resolveWriteFields(),
+					noReturn:    true,
+					allowIf:     true,
+					minStmt:     1,
+					maxStmt:     4,
+					kfuncAllow:  schedExtAnyKfuncs,
+				}
+			},
+		},
+		{
+			// void (*enqueue)(struct task_struct *p, u64 enq_flags)
+			// The liveness scaffold: prologue `cpu`, generated body under
+			// noReturn with a forced task-field write, terminal insert last.
+			suffix:       "_enqueue",
+			retType:      "void",
+			argsAfterCtx: []string{"__u64 enq_flags"},
+			prologue:     schedExtCpuPrologue,
+			scope: func(surf *Surface) bodyScope {
+				sc := schedExtTaskScope(surf, typedVal{expr: "enq_flags", ctype: "__u64"})
+				sc.requireWrite = true
+				sc.minStmt = 2
+				sc.maxStmt = 6
+				sc.terminal = schedExtTerminal
+				return sc
+			},
+		},
+		{
+			// void (*dispatch)(s32 cpu, struct task_struct *prev)
+			// `prev` is nullable (the kernel stub names it prev__nullable),
+			// so the prologue NULL-checks it; the body then sees it as the
+			// trusted task and may call the dispatch-only kfunc.  Row A
+			// dispatches nothing itself: the core drains the global DSQ
+			// around this call.
+			suffix:       "_dispatch",
+			retType:      "void",
+			ctxType:      "__s32 ", // a scalar ctx: the renderer joins type and name verbatim
+			ctxVar:       "cpu",
+			argsAfterCtx: []string{"struct task_struct *prev"},
+			prologue:     "\tif (!prev)\n\t\treturn;\n\n",
+			scope: func(surf *Surface) bodyScope {
+				fields := make([]ctxWriteField, len(surf.writeFields))
+				for i, f := range surf.writeFields {
+					fields[i] = ctxWriteField{accessor: "prev->" + f.Field, ctype: f.CType}
+				}
+				return bodyScope{
+					pool: []typedVal{
+						{expr: "cpu", ctype: "__s32"},
+						{expr: "prev", ctype: "struct task_struct *"},
+					},
+					writeFields: fields,
+					noReturn:    true,
+					allowIf:     true,
+					minStmt:     1,
+					maxStmt:     4,
+					kfuncAllow:  schedExtDispatchKfuncs,
+				}
+			},
+		},
+		{
+			// void (*running)(struct task_struct *p)
+			suffix:   "_running",
+			retType:  "void",
+			prologue: schedExtCpuPrologue,
+			scope: func(surf *Surface) bodyScope {
+				return schedExtTaskScope(surf)
+			},
+		},
+		{
+			// void (*stopping)(struct task_struct *p, bool runnable)
+			suffix:       "_stopping",
+			retType:      "void",
+			argsAfterCtx: []string{"bool runnable"},
+			prologue:     schedExtCpuPrologue,
+			scope: func(surf *Surface) bodyScope {
+				return schedExtTaskScope(surf, typedVal{expr: "runnable", ctype: "bool"})
+			},
+		},
+		{
+			// s32 (*init)(void) -- no ctx at all (noCtx); returns 0 so the
+			// enable proceeds.
+			suffix:   "_init",
+			retType:  "__s32",
+			noCtx:    true,
+			epilogue: "\treturn 0;\n",
+			scope:    schedExtNoTaskScope,
+		},
+		{
+			// void (*exit)(struct scx_exit_info *info) -- the exit info is
+			// not exposed to the body (its fields are read-only ctx, and the
+			// scheduler is already disabled when this runs).
+			suffix:  "_exit",
+			retType: "void",
+			ctxType: "struct scx_exit_info *",
+			ctxVar:  "ei",
+			scope:   schedExtNoTaskScope,
+		},
+	},
+	renderOrder: []string{"_select_cpu", "_enqueue", "_dispatch", "_running", "_stopping", "_init", "_exit"},
+}
+
 // surfaces is the registry of known surfaces, keyed by tag.  The
 // renderer looks a program's surface up here AFTER gob deserialization
 // (the Prog carries only the Surface tag, not the descriptor),
@@ -1788,6 +2324,7 @@ var TCPCong = &Surface{
 var surfaces = map[string]*Surface{
 	MptcpSched.tag: MptcpSched,
 	TCPCong.tag:    TCPCong,
+	SchedExt.tag:   SchedExt,
 }
 
 // surface returns the descriptor for this program's Surface tag,
@@ -2121,9 +2658,13 @@ func (sop *Prog) Render() string {
 		fmt.Fprintf(s, "SEC(\"%s\")\n", surf.progSection)
 		// Signature: `<ret> BPF_PROG(<name><suffix>, <ctx> [, args...])`;
 		// the ctx arg is the surface's unless this callback overrides it.
-		ctxType, ctxVar := surf.callbackCtx(cb.Suffix)
-		fmt.Fprintf(s, "%s BPF_PROG(%s%s, %s%s",
-			cb.RetType, sop.SchedName, cb.Suffix, ctxType, ctxVar)
+		if surf.callbackHasCtx(cb.Suffix) {
+			ctxType, ctxVar := surf.callbackCtx(cb.Suffix)
+			fmt.Fprintf(s, "%s BPF_PROG(%s%s, %s%s",
+				cb.RetType, sop.SchedName, cb.Suffix, ctxType, ctxVar)
+		} else {
+			fmt.Fprintf(s, "%s BPF_PROG(%s%s", cb.RetType, sop.SchedName, cb.Suffix)
+		}
 		for _, a := range cb.ArgsAfterCtx {
 			fmt.Fprintf(s, ", %s", a)
 		}

@@ -1432,7 +1432,19 @@ func TestStructOpsGolden(t *testing.T) {
 		{
 			surf: TCPCong,
 			gen:  func(r *randGen) *Prog { return generate(r, TCPCong) },
-			want: "68640057073c8c8cf6936526ddb585e8c73c256776c035247a4aa6fc2a1d838a",
+			// Re-pinned 2026-10 when `.flags` became a fuzzed instance field
+			// (one extra draw per program + the rendered `.flags` line); the
+			// previous hash, with no instance data, was
+			// 68640057073c8c8cf6936526ddb585e8c73c256776c035247a4aa6fc2a1d838a.
+			want: "02d3217f262b6ef204ee6f9cb31de4329e3d934cdbe032a6f4bba643c5d0552d",
+		},
+		{
+			surf: SchedExt,
+			gen:  func(r *randGen) *Prog { return generate(r, SchedExt) },
+			// Pinned at introduction (2026-10, Phase 2 of the sched_ext
+			// surface design): the row-A tables, the enqueue terminal insert
+			// and the four instance fields.
+			want: "1b460cb29716a193ac40fd813076f5c600ea9c8648dfdc93d9e0eeb2c88818d7",
 		},
 	} {
 		h := sha256.New()
@@ -1461,6 +1473,7 @@ func TestStructOpsByTag(t *testing.T) {
 	for tag, want := range map[string]*Surface{
 		"mptcp_sched": MptcpSched,
 		"tcp_cong":    TCPCong,
+		"sched_ext":   SchedExt,
 	} {
 		if got := ByTag(tag); got != want {
 			t.Errorf("ByTag(%q) = %v, want %v", tag, got, want)
