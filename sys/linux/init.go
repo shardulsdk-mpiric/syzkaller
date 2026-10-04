@@ -76,6 +76,7 @@ func InitTarget(target *prog.Target) {
 		// BPF struct_ops object blobs (sys/linux/init_structops.go).
 		"bpf_struct_ops_obj_tcp_cong":    arch.generateStructOpsObjTCPCong,
 		"bpf_struct_ops_obj_mptcp_sched": arch.generateStructOpsObjMptcpSched,
+		"bpf_struct_ops_obj_sched_ext":   arch.generateStructOpsObjSchedExt,
 	}
 
 	target.AuxResources = map[string]bool{

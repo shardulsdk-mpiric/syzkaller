@@ -3404,8 +3404,9 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 #include "common_linux_sctp.h"
 #endif
 
-// BPF struct_ops carrier loader (see executor/common_linux_structops.h).
-#if SYZ_EXECUTOR || __NR_syz_bpf_struct_ops_load
+// BPF struct_ops carrier loader + sched_ext exercise (see
+// executor/common_linux_structops.h).
+#if SYZ_EXECUTOR || __NR_syz_bpf_struct_ops_load || __NR_syz_sched_ext_exercise
 #include "common_linux_structops.h"
 #endif
 
