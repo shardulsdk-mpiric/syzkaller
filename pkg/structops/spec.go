@@ -58,6 +58,12 @@ type Spec struct {
 	// vanished kfunc is a decode error rather than a wrong call.
 	Kfuncs    []string
 	Callbacks []SpecCallback
+	// Instance are the generated instance-data values (Prog.Instance):
+	// one per surface InstanceField, by member name.  Decode requires the
+	// set to match the current surface's exactly, as it does for
+	// callbacks: a surface that gains or loses an instance field retires
+	// the specs generated before the change rather than guessing a value.
+	Instance []InstanceVal
 }
 
 // SpecCallback is one callback's generated body, keyed by its op suffix.
@@ -74,6 +80,7 @@ func EncodeSpec(sop *Prog, seed int64) []byte {
 		Surface:   sop.Surface,
 		SchedName: sop.SchedName,
 		Seed:      seed,
+		Instance:  sop.Instance,
 	}
 	for i := range sop.Kfuncs {
 		spec.Kfuncs = append(spec.Kfuncs, sop.Kfuncs[i].Name)
@@ -185,6 +192,21 @@ func (spec *Spec) prog() (*Prog, error) {
 	}
 	for suffix := range bodies {
 		return nil, fmt.Errorf("structops: spec callback %q is not in surface %s", suffix, surf.tag)
+	}
+	// Instance data: the spec must carry exactly the surface's fields, in
+	// the surface's order (the render order).
+	if len(spec.Instance) != len(surf.instanceFields) {
+		return nil, fmt.Errorf("structops: spec sets %d instance fields, surface %s has %d",
+			len(spec.Instance), surf.tag, len(surf.instanceFields))
+	}
+	for i, v := range spec.Instance {
+		if v.Field != surf.instanceFields[i].Field {
+			return nil, fmt.Errorf("structops: spec instance field %q, surface %s has %q at %d",
+				v.Field, surf.tag, surf.instanceFields[i].Field, i)
+		}
+	}
+	if len(spec.Instance) > 0 {
+		sop.Instance = append([]InstanceVal(nil), spec.Instance...)
 	}
 	var err error
 	for _, body := range sop.allBodies() {

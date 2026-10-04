@@ -23,7 +23,8 @@
 //   BPF_MAP_CREATE          BPF_MAP_TYPE_STRUCT_OPS, value type
 //                           bpf_struct_ops_<name>, BPF_F_LINK
 //   BPF_MAP_UPDATE_ELEM     the value: program fds in their callback
-//                           slots + a unique .name
+//                           slots + the object's scalar instance data
+//                           (.flags, .timeout_ms, ...) + a unique .name
 //   BPF_LINK_CREATE         the registration (tcp_register_congestion_control,
 //                           mptcp_register_scheduler, ...); the link fd is
 //                           returned
@@ -74,13 +75,16 @@
 #define STRUCTOPS_REC_INSTANCE 2u
 #define STRUCTOPS_REC_PROG 3u
 #define STRUCTOPS_REC_SPEC 4u // host-only generative spec; skipped here
+#define STRUCTOPS_REC_DATA 5u
 #define STRUCTOPS_INSTANCE_FLAG_LINK 1u
 #define STRUCTOPS_STRUCT_NAME_LEN 64
 #define STRUCTOPS_MEMBER_LEN 32
 #define STRUCTOPS_PROG_NAME_LEN 32
 #define STRUCTOPS_KFUNC_NAME_LEN 64
+#define STRUCTOPS_DATA_LEN (STRUCTOPS_MEMBER_LEN + 16)
 #define STRUCTOPS_MAX_PROGS 16
 #define STRUCTOPS_MAX_KFUNCS 64
+#define STRUCTOPS_MAX_DATA 16
 
 // --- UAPI constants (include/uapi/linux/bpf.h, include/uapi/linux/btf.h).
 #define STRUCTOPS_BPF_MAP_CREATE 0
@@ -530,6 +534,15 @@ struct structops_recipe_prog {
 	const uint8* insns; // ninsn x 8
 };
 
+// One scalar instance-data member (`.flags`, `.timeout_ms`, ...) the object
+// set to a non-zero value; copied into the map value at the member's offset
+// in the running kernel's struct.
+struct structops_recipe_data {
+	const char* member;
+	uint32 size;
+	uint64 value;
+};
+
 struct structops_recipe {
 	const uint8* btf;
 	uint32 btf_len;
@@ -537,6 +550,8 @@ struct structops_recipe {
 	const char* struct_name;
 	uint32 nprogs;
 	struct structops_recipe_prog progs[STRUCTOPS_MAX_PROGS];
+	uint32 ndata;
+	struct structops_recipe_data data[STRUCTOPS_MAX_DATA];
 };
 
 static uint32 structops_get32(const uint8* p)
@@ -607,6 +622,18 @@ static int structops_parse_recipe(const uint8* blob, uint32 len, struct structop
 			pr->kfuncs = p + hdr;
 			pr->insns = pr->kfuncs + pr->nkfunc * (4 + STRUCTOPS_KFUNC_NAME_LEN);
 			r->nprogs++;
+			break;
+		}
+		case STRUCTOPS_REC_DATA: {
+			if (n != STRUCTOPS_DATA_LEN || r->ndata == STRUCTOPS_MAX_DATA)
+				return -1;
+			struct structops_recipe_data* d = &r->data[r->ndata];
+			d->member = structops_cstr(p, STRUCTOPS_MEMBER_LEN);
+			d->size = structops_get32(p + STRUCTOPS_MEMBER_LEN);
+			memcpy(&d->value, p + STRUCTOPS_MEMBER_LEN + 8, sizeof(d->value));
+			if (!d->member || (d->size != 1 && d->size != 2 && d->size != 4 && d->size != 8))
+				return -1;
+			r->ndata++;
 			break;
 		}
 		case STRUCTOPS_REC_SPEC:
@@ -964,7 +991,8 @@ static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 		goto out;
 	}
 
-	// 4. The value: callback fds in their slots, the unique name, rest zero.
+	// 4. The value: callback fds in their slots, the object's instance data
+	// in theirs, the unique name, rest zero.
 	value = (uint8*)calloc(1, value_size);
 	if (!value) {
 		err = ENOMEM;
@@ -975,6 +1003,22 @@ static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 		structops_vml_member(struct_id, r.progs[i].member, &member_off, &member_type);
 		uint64 fd = (uint64)prog_fds[i];
 		memcpy(value + data_off + member_off, &fd, sizeof(fd));
+	}
+	for (i = 0; i < r.ndata; i++) {
+		// The member is resolved by name in THIS kernel's struct and its
+		// width must match the object's (a width change is BTF drift the
+		// object was not compiled for).  The value travels as a
+		// little-endian u64; its low `size` bytes are the member.
+		const struct structops_recipe_data* d = &r.data[i];
+		uint32 member_off = 0, member_type = 0;
+		if (structops_vml_member(struct_id, d->member, &member_off, &member_type) < 0 ||
+		    structops_vml_type_size(member_type) != d->size || data_off + member_off + d->size > value_size) {
+			debug("structops: %s.%s: instance data member not resolvable (size %u)\n", r.struct_name, d->member, d->size);
+			err = ENOENT;
+			goto out;
+		}
+		memcpy(value + data_off + member_off, &d->value, d->size);
+		debug("structops: %s.%s = %#llx\n", r.struct_name, d->member, (unsigned long long)d->value);
 	}
 	structops_uniquify_name(name, name_size > sizeof(name) ? sizeof(name) : name_size);
 	memcpy(value + data_off + name_off, name, strlen(name) + 1);

@@ -624,6 +624,10 @@ type Prog struct {
 	// mptcp_subflow_set_scheduled).  They are excluded from the generated
 	// kfunc-call set and force-included in the rendered externs.
 	PrologueKfuncs []string
+	// Instance are the generated instance-data values (one per
+	// Surface.instanceFields entry, same order); nil for a surface that
+	// sets none.
+	Instance []InstanceVal
 }
 
 // isPrologueKfunc reports whether name is one of the kfuncs the renderer
@@ -1281,6 +1285,59 @@ type instanceField struct {
 	sep    string
 }
 
+// InstanceField is one scalar instance-data member a surface sets in the
+// rendered instance (`.timeout_ms = 0x5dc,`).  It is the fuzzable
+// replacement for fixed flags text: the value is a per-program draw, so
+// e.g. a sched_ext `.flags` can carry a random subset of SCX_OPS_* bits and
+// `.timeout_ms` a pinned low range, and the kernel's own validation of
+// each member (->init_member) becomes part of the fuzzed surface.
+type InstanceField struct {
+	// Field is the member name ("flags", "timeout_ms").
+	Field string
+	// Sep is the whitespace between `.Field` and `=` (hand-aligned).
+	Sep string
+	// gen draws the value; nil means the fixed Value is used.
+	gen func(r *randGen) uint64
+	// Value is the fixed value when gen is nil.
+	Value uint64
+}
+
+// InstanceVal is one generated instance-data value: the member and the
+// value drawn for it.  Exported so a Prog / Spec gob-serializes it.
+type InstanceVal struct {
+	Field string
+	Value uint64
+}
+
+// genInstance draws the surface's instance-data values for one program.
+// It runs after the callback bodies, so a surface without instance fields
+// adds no draw and its programs are unchanged.
+func genInstance(r *randGen, surf *Surface) []InstanceVal {
+	if len(surf.instanceFields) == 0 {
+		return nil
+	}
+	out := make([]InstanceVal, len(surf.instanceFields))
+	for i, f := range surf.instanceFields {
+		v := f.Value
+		if f.gen != nil {
+			v = f.gen(r)
+		}
+		out[i] = InstanceVal{Field: f.Field, Value: v}
+	}
+	return out
+}
+
+// instanceSep returns the hand-aligned whitespace for an instance-data
+// member, or a single space for one the surface no longer declares.
+func (surf *Surface) instanceSep(field string) string {
+	for i := range surf.instanceFields {
+		if surf.instanceFields[i].Field == field {
+			return surf.instanceFields[i].Sep
+		}
+	}
+	return " "
+}
+
 // callbackSpec is the per-callback knowledge a surface declares:
 // the op suffix, return type, any args after the fixed ctx arg, the FIXED
 // prologue/epilogue text the renderer wraps around the generated body,
@@ -1375,10 +1432,16 @@ type Surface struct {
 	// layout this surface's field accessors depend on; the Configure-time
 	// layout self-check (layout.go) probes them too.
 	layoutStructs []string
-	// flagsField, when non-empty, emits a `.flags <flagsSep>= <flagsField>,`
-	// line before `.name`.
-	flagsField string
-	flagsSep   string
+	// instanceFields are the scalar, non-callback instance members this
+	// surface sets (`.flags`, `.timeout_ms`, ...), rendered between the
+	// callback pointers and `.name` in this order.  Each value is drawn per
+	// program (InstanceField.gen) or fixed, persists in the Spec, and
+	// reaches the kernel through the recipe's DATA records (recipe.go) --
+	// so it must be a member the subsystem's ->init_member() accepts a
+	// value for; the kernel rejects a non-zero value in any other
+	// non-callback member.  Empty on mptcp_sched and tcp_cong (their
+	// renders, and golden hashes, are unchanged).
+	instanceFields []InstanceField
 	// callbacks are the per-callback specs, in GENERATION order (the
 	// order bodies are generated, which fixes the random-draw sequence).
 	// The RENDER order is given separately by renderOrder.
@@ -1692,6 +1755,7 @@ func generate(r *randGen, surf *Surface) *Prog {
 			Body:         genBody(r, sop, spec.scope(surf), &varId),
 		}
 	}
+	sop.Instance = genInstance(r, surf)
 	return sop
 }
 
@@ -1957,8 +2021,13 @@ func (sop *Prog) Render() string {
 		fmt.Fprintf(s, "\t%s%s= (void *)%s%s,\n",
 			field, f.sep, sop.SchedName, f.suffix)
 	}
-	if surf.flagsField != "" {
-		fmt.Fprintf(s, "\t.flags%s= %s,\n", surf.flagsSep, surf.flagsField)
+	// Instance data, in surface order.  Hex: a hex literal takes the first
+	// of int / unsigned / long / unsigned long that holds it, so a
+	// full-width u64 value needs no suffix and a narrower member converts
+	// silently.  Digest reads these values back out of the compiled object
+	// (recipe.go DATA records); the loader copies them into the map value.
+	for _, v := range sop.Instance {
+		fmt.Fprintf(s, "\t.%s%s= %#x,\n", v.Field, surf.instanceSep(v.Field), v.Value)
 	}
 	nameField := surf.nameField
 	if nameField == "" {
