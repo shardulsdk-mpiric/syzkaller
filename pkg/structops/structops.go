@@ -180,6 +180,13 @@ type Kfunc struct {
 	// must release a referenced argument does it in a FIXED epilogue
 	// (Qdisc_ops.enqueue: bpf_qdisc_skb_drop on the skb__ref ctx arg).
 	Release bool
+	// Terminal marks the kfunc a scope's terminal statement calls
+	// (sched_ext's scx_bpf_dsq_insert: the liveness-by-construction insert
+	// that ends every ops.enqueue path, see StmtDsqInsert).  It is never a
+	// generated StmtKfuncCall draw -- a second insert of the same task is a
+	// runtime error (scheduler ejection), not a bug -- and is emitted only
+	// where bodyScope.terminal asks for it.
+	Terminal bool
 }
 
 // needsNullGuard reports whether a kfunc's return value must be bound
@@ -447,9 +454,9 @@ const (
 	// StmtKfuncCall -- call a modelled MPTCP kfunc with
 	// typed, in-scope arguments.  A pointer return that is
 	// KF_RET_NULL is bound to a local and IMMEDIATELY followed by a
-	// `if (!local) return -1;` guard (rendered as part of this same
-	// statement); a scalar return is bound to a local; a void kfunc
-	// is emitted for effect.
+	// `if (!local) return -1;` guard (`return;` in a void callback;
+	// rendered as part of this same statement); a scalar return is
+	// bound to a local; a void kfunc is emitted for effect.
 	StmtKfuncCall
 	// StmtSubflowIter -- the open-coded subflow iterator.
 	// Rendered as ONE atomic compound statement: the iterator
@@ -468,6 +475,19 @@ const (
 	// under a `noReturn` scope, so no branch emits a `return` and every
 	// path falls through to the fixed scheduling epilogue.
 	StmtIfElse
+	// StmtDsqInsert -- a scope's TERMINAL statement: the one dispatch-queue
+	// insert that ends every path of a sched_ext ops.enqueue body
+	// (`scx_bpf_dsq_insert(p, <dsq_id>, <slice>, <enq_flags>);`).  It is
+	// generated (dsq id, slice and flags are fuzzer draws, so the insert
+	// itself is a mutation dimension) but its PLACE is fixed: genBody
+	// appends exactly one as the last statement of a scope whose
+	// bodyScope.terminal is set, after the drawn statements, and the
+	// branch / loop scopes inside that body never carry one.  With the
+	// body under noReturn this gives "every path ends in exactly one
+	// insert" by construction -- the liveness scaffold of the sched_ext
+	// surface design.  Rendered as a void kfunc call; KfuncIdx / KfuncArgs
+	// carry the call exactly as a StmtKfuncCall does.
+	StmtDsqInsert
 )
 
 // Stmt is one statement of the BRF-generated get_send body.
@@ -517,7 +537,9 @@ type Stmt struct {
 	KfuncArgs []string
 	// NullGuard is true when this KfuncCall's pointer result is
 	// KF_RET_NULL and the renderer must emit the mandatory
-	// `if (!Var) return -1;` guard immediately after the call.
+	// `if (!Var) return -1;` guard immediately after the call (`return;`
+	// in a void callback -- the renderer picks the form from the enclosing
+	// callback's return type).
 	NullGuard bool
 	// IterId is a per-statement unique id for a SubflowIter -- it
 	// names the iterator local (`itN`) and the loop variable
@@ -854,7 +876,10 @@ type bodyScope struct {
 	// on that path, so no branch may return -- every path then falls
 	// through to the epilogue and always schedules.  A KF_RET_NULL-
 	// pointer kfunc is simply not offered when noReturn is set; a
-	// non-guarded scalar/void kfunc still is.
+	// non-guarded scalar/void kfunc still is.  noReturn is about the
+	// PATH, not the return type: a void callback with no fixed epilogue
+	// may leave it clear and its guards render as `return;`
+	// (guardReturn).
 	noReturn bool
 	// allowIf permits StmtIfElse as a statement kind (Stage
 	// 2b).  True for the top-level get_send body and -- subject to the
@@ -877,6 +902,36 @@ type bodyScope struct {
 	// only; a call outside the op's set is a verifier -EACCES).  nil, the
 	// two older surfaces, means the whole table is callable.
 	kfuncAllow []string
+	// terminal, when set, makes genBody end this scope's body with exactly
+	// one StmtDsqInsert drawn from it (after the nStmt drawn statements).
+	// Only a callback's top-level scope sets it; the branch and iterator
+	// scopes genBody opens inside never inherit it, so the body has one
+	// terminal insert on every path.  Pair it with noReturn so no drawn
+	// statement can leave before the insert.  nil on every scope of the
+	// older surfaces.
+	terminal *terminalInsert
+}
+
+// terminalInsert is what a scope's terminal StmtDsqInsert is drawn from:
+// the insert kfunc (which must be in the surface table and marked
+// Kfunc.Terminal), the task expression it inserts, and the candidate
+// expressions for its three fuzzed arguments.  All candidates are C
+// expressions the rendered program can name (vmlinux.h enum constants,
+// literals); the generator picks, it does not interpret.
+type terminalInsert struct {
+	kfunc string // e.g. "scx_bpf_dsq_insert"
+	task  string // the task_struct expression, e.g. "p"
+	// dsqIDs are the candidate dsq_id expressions; one is drawn.  A Phase-2
+	// surface lists the drained builtins (SCX_DSQ_GLOBAL, SCX_DSQ_LOCAL,
+	// SCX_DSQ_LOCAL_ON | cpu); a user DSQ joins only when the surface's
+	// dispatch drains it.
+	dsqIDs []string
+	// slices are the candidate slice expressions; one is drawn (e.g. "0",
+	// "SCX_SLICE_DFL", "SCX_SLICE_INF", a literal).
+	slices []string
+	// enqFlags are the candidate flag bits; an independent coin per bit
+	// picks the OR'ed subset, "0" when none.
+	enqFlags []string
 }
 
 // ifElseMaxDepth caps generated `if`/`else` nesting (Stage 2b).  A
@@ -947,11 +1002,12 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 			if sc.noReturn && kf.needsNullGuard() {
 				continue
 			}
-			if kf.Release || !sc.kfuncAllowed(kf.Name) {
-				// No reference-lifecycle model (Kfunc.Release), or
-				// outside this callback's kernel-permitted set.  Both
-				// are decided before any random draw, so a surface
-				// without either leaves the draw sequence untouched.
+			if kf.Release || kf.Terminal || !sc.kfuncAllowed(kf.Name) {
+				// No reference-lifecycle model (Kfunc.Release), a
+				// terminal-only kfunc (Kfunc.Terminal), or outside this
+				// callback's kernel-permitted set.  All decided before
+				// any random draw, so a surface without any of them
+				// leaves the draw sequence untouched.
 				continue
 			}
 			if _, ok := pickKfuncArgs(r, kf, pool); ok {
@@ -1153,7 +1209,55 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 			body = append(body, genIfElse(r, sop, sc, varId, pool, condNames))
 		}
 	}
+	if sc.terminal != nil {
+		// The scope's terminal statement, last on every path (the drawn
+		// statements above never `return` under noReturn, and the branch
+		// and loop scopes they opened carry no terminal of their own).
+		body = append(body, genDsqInsert(r, sop, sc.terminal))
+	}
 	return body
+}
+
+// genDsqInsert draws one StmtDsqInsert from the scope's terminalInsert:
+// the kfunc by name from the program's table, one dsq id, one slice, and
+// an independently-drawn subset of the enqueue flags.
+func genDsqInsert(r *randGen, sop *Prog, ti *terminalInsert) Stmt {
+	ki := -1
+	for i := range sop.Kfuncs {
+		if sop.Kfuncs[i].Name == ti.kfunc {
+			ki = i
+			break
+		}
+	}
+	if ki < 0 || !sop.Kfuncs[ki].Terminal {
+		// A surface-table error, not a runtime condition: the terminal
+		// kfunc must be in the table and marked Terminal (so it is never
+		// also a generated draw).
+		panic(fmt.Sprintf("structops: surface %s: terminal kfunc %q is not a Terminal table entry",
+			sop.Surface, ti.kfunc))
+	}
+	flags := ""
+	for _, f := range ti.enqFlags {
+		if r.bin() {
+			if flags != "" {
+				flags += " | "
+			}
+			flags += f
+		}
+	}
+	if flags == "" {
+		flags = "0"
+	}
+	return Stmt{
+		Kind:     StmtDsqInsert,
+		KfuncIdx: ki,
+		KfuncArgs: []string{
+			ti.task,
+			ti.dsqIDs[r.Intn(len(ti.dsqIDs))],
+			ti.slices[r.Intn(len(ti.slices))],
+			flags,
+		},
+	}
 }
 
 // condOps -- the condition operators genIfElse may pick for an
@@ -1562,9 +1666,12 @@ var MptcpSched = &Surface{
 // bodies.  Only `msk` (and its `(struct sock *)` cast) is in scope --
 // there is no scheduling and no `subflow` prologue -- so the writable
 // surface is just `msk->snd_burst`, the iterator is not allowed, and no
-// write is forced.  noReturn is set: init/release are `void`, so a
-// KF_RET_NULL-pointer guard (`if (!v) return -1;`) would be an invalid
-// return from a void function; such a kfunc is therefore not offered here.
+// write is forced.  noReturn is set: init/release are `void`, and when
+// this scope was written a KF_RET_NULL-pointer guard could only render as
+// `return -1;`, so such kfuncs were not offered here.  The renderer now
+// emits `return;` for a void callback (guardReturn), but the scope keeps
+// noReturn: offering the guarded kfuncs would change the draw sequence
+// and the golden-pinned render of every existing MPTCP program.
 func mptcpInitReleaseScope(surf *Surface) bodyScope {
 	return bodyScope{
 		pool: []typedVal{
@@ -1808,7 +1915,7 @@ func (sop *Prog) usedKfuncIdxs() []int {
 	}
 	for _, b := range sop.allBodies() {
 		walkStmts(b, func(st *Stmt) {
-			if st.Kind == StmtKfuncCall {
+			if st.Kind == StmtKfuncCall || st.Kind == StmtDsqInsert {
 				used[st.KfuncIdx] = true
 			}
 		})
@@ -1825,9 +1932,13 @@ func (sop *Prog) usedKfuncIdxs() []int {
 
 // renderBody renders a generated body to BPF C.  indent is the leading
 // whitespace prefixed to every statement (one tab at callback scope,
-// two inside an iterator loop).  The body may itself contain a
-// SubflowIter, whose loop body is rendered recursively at indent+"\t".
-func (sop *Prog) renderBody(s *bytes.Buffer, body []Stmt, indent string) {
+// two inside an iterator loop).  guardRet is the `return` statement a
+// KF_RET_NULL guard emits -- `return -1;` in a value-returning callback,
+// `return;` in a void one (guardReturn) -- the same throughout a callback,
+// so it is threaded down into branch and loop bodies.  The body may itself
+// contain a SubflowIter, whose loop body is rendered recursively at
+// indent+"\t".
+func (sop *Prog) renderBody(s *bytes.Buffer, body []Stmt, indent, guardRet string) {
 	for _, st := range body {
 		switch st.Kind {
 		case StmtCtxRead:
@@ -1848,13 +1959,7 @@ func (sop *Prog) renderBody(s *bytes.Buffer, body []Stmt, indent string) {
 			}
 		case StmtKfuncCall:
 			kf := &sop.Kfuncs[st.KfuncIdx]
-			argList := ""
-			for ai, a := range st.KfuncArgs {
-				if ai > 0 {
-					argList += ", "
-				}
-				argList += a
-			}
+			argList := joinArgs(st.KfuncArgs)
 			if st.Var == "" {
 				// void kfunc -- call for effect.
 				fmt.Fprintf(s, "%s%s(%s);\n", indent, kf.Name, argList)
@@ -1868,14 +1973,45 @@ func (sop *Prog) renderBody(s *bytes.Buffer, body []Stmt, indent string) {
 				// IMMEDIATELY after the call so the local is only
 				// ever used after the verifier sees it null-checked.
 				fmt.Fprintf(s, "%sif (!%s)\n", indent, st.Var)
-				fmt.Fprintf(s, "%s\treturn -1;\n", indent)
+				fmt.Fprintf(s, "%s\t%s\n", indent, guardRet)
 			}
+		case StmtDsqInsert:
+			// The scope's terminal insert: a void kfunc call, last in its
+			// body (see StmtDsqInsert).
+			kf := &sop.Kfuncs[st.KfuncIdx]
+			fmt.Fprintf(s, "%s/* Generated terminal insert (liveness). */\n", indent)
+			fmt.Fprintf(s, "%s%s(%s);\n", indent, kf.Name, joinArgs(st.KfuncArgs))
 		case StmtSubflowIter:
-			sop.renderSubflowIter(s, st, indent)
+			sop.renderSubflowIter(s, st, indent, guardRet)
 		case StmtIfElse:
-			sop.renderIfElse(s, st, indent)
+			sop.renderIfElse(s, st, indent, guardRet)
 		}
 	}
+}
+
+// joinArgs renders a kfunc argument list.
+func joinArgs(args []string) string {
+	out := ""
+	for i, a := range args {
+		if i > 0 {
+			out += ", "
+		}
+		out += a
+	}
+	return out
+}
+
+// guardReturn is the `return` a KF_RET_NULL guard emits in a callback of
+// the given return type: a void callback cannot `return -1;`, so it
+// returns bare; every other callback keeps the fork's `return -1;` (the
+// MPTCP get_send "nothing to schedule" path).  A value-returning callback
+// whose epilogue must run (tcp_cong's `return tp->snd_cwnd;`) keeps its
+// body noReturn and never reaches this.
+func guardReturn(retType string) string {
+	if retType == "void" {
+		return "return;"
+	}
+	return "return -1;"
 }
 
 // renderIfElse renders one IfElse (Stage 2b) as
@@ -1896,7 +2032,7 @@ func renderCondClause(v, op string, val int64) string {
 	return fmt.Sprintf("%s %s %d", v, op, val)
 }
 
-func (sop *Prog) renderIfElse(s *bytes.Buffer, st Stmt, indent string) {
+func (sop *Prog) renderIfElse(s *bytes.Buffer, st Stmt, indent, guardRet string) {
 	cond := renderCondClause(st.CondVar, st.CondOp, st.CondVal)
 	if st.CondJoin != "" {
 		// Compound predicate: parenthesise each clause so the connective
@@ -1906,10 +2042,10 @@ func (sop *Prog) renderIfElse(s *bytes.Buffer, st Stmt, indent string) {
 	}
 	fmt.Fprintf(s, "%s/* BRF-generated if/else. */\n", indent)
 	fmt.Fprintf(s, "%sif (%s) {\n", indent, cond)
-	sop.renderBody(s, st.IfBody, indent+"\t")
+	sop.renderBody(s, st.IfBody, indent+"\t", guardRet)
 	if len(st.ElseBody) > 0 {
 		fmt.Fprintf(s, "%s} else {\n", indent)
-		sop.renderBody(s, st.ElseBody, indent+"\t")
+		sop.renderBody(s, st.ElseBody, indent+"\t", guardRet)
 	}
 	fmt.Fprintf(s, "%s}\n", indent)
 }
@@ -1922,7 +2058,7 @@ func (sop *Prog) renderIfElse(s *bytes.Buffer, st Stmt, indent string) {
 // selftest `tools/testing/selftests/bpf/progs/mptcp_bpf_rr.c`, whose
 // `bpf_for_each(mptcp_subflow, subflow, (struct sock *)msk)` expands to
 // exactly this idiom; the socket argument is `(struct sock *)msk`.
-func (sop *Prog) renderSubflowIter(s *bytes.Buffer, st Stmt, indent string) {
+func (sop *Prog) renderSubflowIter(s *bytes.Buffer, st Stmt, indent, guardRet string) {
 	itVar := fmt.Sprintf("it%d", st.IterId)
 	sfVar := st.Var
 	fmt.Fprintf(s, "%s/* BRF-generated subflow iterator. */\n", indent)
@@ -1932,7 +2068,7 @@ func (sop *Prog) renderSubflowIter(s *bytes.Buffer, st Stmt, indent string) {
 		indent, itVar, st.IterSockExpr)
 	fmt.Fprintf(s, "%swhile ((%s = bpf_iter_mptcp_subflow_next(&%s))) {\n",
 		indent, sfVar, itVar)
-	sop.renderBody(s, st.IterBody, indent+"\t")
+	sop.renderBody(s, st.IterBody, indent+"\t", guardRet)
 	fmt.Fprintf(s, "%s}\n", indent)
 	fmt.Fprintf(s, "%sbpf_iter_mptcp_subflow_destroy(&%s);\n", indent, itVar)
 }
@@ -2000,7 +2136,7 @@ func (sop *Prog) Render() string {
 		if len(cb.Body) == 0 {
 			fmt.Fprintf(s, "\t/* (empty) */\n")
 		}
-		sop.renderBody(s, cb.Body, "\t")
+		sop.renderBody(s, cb.Body, "\t", guardReturn(cb.RetType))
 		// Fixed epilogue (verbatim, already indented) -- preceded by a
 		// blank line, matching the MPTCP get_send layout.
 		if cb.Epilogue != "" {
