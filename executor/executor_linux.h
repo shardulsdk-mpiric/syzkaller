@@ -3,9 +3,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -100,6 +102,30 @@ static inline __u64 kcov_remote_handle(__u64 subsys, __u64 inst)
 	if (subsys & ~KCOV_SUBSYSTEM_MASK || inst & ~KCOV_INSTANCE_MASK)
 		return 0;
 	return subsys | inst;
+}
+
+// sched_rt_refuge moves the calling executor process to SCHED_FIFO with
+// SCHED_RESET_ON_FORK.  This is the control path's refuge from a fuzzed
+// sched_ext scheduler (syz_bpf_struct_ops_load$sched_ext): once a generated
+// scheduler is registered it governs every SCHED_NORMAL task on the machine,
+// including the executor, so the runner / exec loop that times programs out
+// and kills them must not depend on it.  RT outranks the ext class (the
+// kernel's own SCX disable helper is SCHED_FIFO for the same reason), and
+// RESET_ON_FORK puts everything this process forks or clones -- the program
+// child, its syscall threads, and the next syz-executor before it re-applies
+// this at its own start -- back on SCHED_NORMAL, i.e. on the generated
+// scheduler, which is the surface under test.  Lowest RT priority, so kernel
+// RT threads keep precedence.  Failure (no CAP_SYS_NICE, RLIMIT_RTPRIO) is
+// not fatal: the kernel watchdog on the object's pinned timeout_ms is the
+// backstop.
+static void sched_rt_refuge(void)
+{
+	struct sched_param sp;
+	memset(&sp, 0, sizeof(sp));
+	sp.sched_priority = 1;
+	const int sched_reset_on_fork = 0x40000000; // SCHED_RESET_ON_FORK
+	if (syscall(__NR_sched_setscheduler, 0, SCHED_FIFO | sched_reset_on_fork, &sp))
+		debug("sched_setscheduler(SCHED_FIFO | SCHED_RESET_ON_FORK) failed: %d\n", errno);
 }
 
 static void os_init(int argc, char** argv, char* data, size_t data_size)

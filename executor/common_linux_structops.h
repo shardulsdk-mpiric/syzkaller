@@ -54,6 +54,118 @@
 #ifndef EXECUTOR_COMMON_LINUX_STRUCTOPS_H
 #define EXECUTOR_COMMON_LINUX_STRUCTOPS_H
 
+// --- sched_ext exercise: short worker processes under the loaded scheduler.
+//
+// A sched_ext scheduler's callbacks run when tasks are enqueued, dispatched,
+// switched in and out; a registration alone exercises only the enable path.
+// The exercise forks a few short workers (not threads: fork also walks the
+// scheduler's init_task / enable path for each) that burn CPU, yield and
+// sleep for a bounded number of milliseconds, and reaps them with a
+// deadline.  One worker switches itself to SCHED_EXT, so a scheduler loaded
+// with SCX_OPS_SWITCH_PARTIAL (only SCHED_EXT tasks are governed) is
+// exercised too.  Shared by the loader's exercise tail (fixed short run) and
+// the syz_sched_ext_exercise pseudo-syscall (fuzzed duration).
+//
+// A worker is a plain SCHED_NORMAL (or SCHED_EXT) task, i.e. it runs on the
+// generated scheduler; it is bounded by its own clock and by the parent's
+// SIGKILL at the deadline, and if the scheduler stalls it the kernel's
+// watchdog (the object's pinned timeout_ms) ejects the scheduler and the
+// worker runs again.
+#if SYZ_EXECUTOR || __NR_syz_bpf_struct_ops_load || __NR_syz_sched_ext_exercise
+#include <errno.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define STRUCTOPS_SCX_WORKERS 3
+#define STRUCTOPS_SCX_MAX_MS 1000
+#define STRUCTOPS_SCHED_EXT 7 // SCHED_EXT policy (include/uapi/linux/sched.h)
+
+static uint64 structops_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64)ts.tv_sec * 1000 + (uint64)ts.tv_nsec / 1000000;
+}
+
+// structops_scx_worker runs in a forked child for about ms milliseconds.
+// Worker 0 moves itself to SCHED_EXT first; worker 1 yields after every
+// burst (enqueue/dispatch cycles); worker 2 sleeps briefly between bursts
+// (select_cpu on wakeup, running/stopping around each run).
+static void structops_scx_worker(int idx, unsigned ms)
+{
+	if (idx == 0) {
+		struct sched_param sp;
+		memset(&sp, 0, sizeof(sp));
+		syscall(__NR_sched_setscheduler, 0, STRUCTOPS_SCHED_EXT, &sp);
+	}
+	uint64 end = structops_now_ms() + ms;
+	volatile unsigned long acc = 0;
+	while (structops_now_ms() < end) {
+		int i = 0;
+		for (; i < 20000; i++)
+			acc += (unsigned long)i;
+		if (idx == 1)
+			sched_yield();
+		else if (idx == 2)
+			usleep(200);
+	}
+}
+
+static void structops_scx_exercise(unsigned ms)
+{
+	if (ms == 0)
+		ms = 1;
+	if (ms > STRUCTOPS_SCX_MAX_MS)
+		ms = STRUCTOPS_SCX_MAX_MS;
+	int pids[STRUCTOPS_SCX_WORKERS];
+	int i = 0;
+	for (; i < STRUCTOPS_SCX_WORKERS; i++) {
+		pids[i] = fork();
+		if (pids[i] == 0) {
+			structops_scx_worker(i, ms);
+			_exit(0);
+		}
+		if (pids[i] < 0) {
+			// Braced: csource strips debug(), an unbraced body would dangle.
+			debug("structops: scx exercise: fork failed: %d\n", errno);
+		}
+	}
+	// Reap with a deadline: the workers' own clock plus slack; past it they
+	// are killed (a worker that the scheduler starves is the kernel
+	// watchdog's business, not ours -- see the file comment).
+	uint64 deadline = structops_now_ms() + ms + 500;
+	for (i = 0; i < STRUCTOPS_SCX_WORKERS; i++) {
+		if (pids[i] <= 0)
+			continue;
+		int status = 0;
+		while (waitpid(pids[i], &status, WNOHANG) == 0) {
+			if (structops_now_ms() > deadline) {
+				debug("structops: scx exercise: worker %d past the deadline, killing\n", pids[i]);
+				kill(pids[i], SIGKILL);
+				waitpid(pids[i], &status, 0);
+				break;
+			}
+			usleep(1000);
+		}
+	}
+	debug("structops: scx exercise: %u ms, %d workers done\n", ms, STRUCTOPS_SCX_WORKERS);
+}
+
+#if SYZ_EXECUTOR || __NR_syz_sched_ext_exercise
+static long syz_sched_ext_exercise(volatile long a0)
+{
+	structops_scx_exercise((unsigned)a0);
+	return 0;
+}
+#endif
+#endif // SYZ_EXECUTOR || __NR_syz_bpf_struct_ops_load || __NR_syz_sched_ext_exercise
+
 #if SYZ_EXECUTOR || __NR_syz_bpf_struct_ops_load
 #include <errno.h>
 #include <fcntl.h>
@@ -703,6 +815,10 @@ static void structops_debug_log(const char* what)
 // every ACK in slow start / avoidance, release at close; ssthresh and
 // undo_cwnd need loss or an undo and fire only when a program's other
 // calls disturb the connection (that is what the fuzzer is for).
+//
+// sched_ext_ops: the scheduler governs the system from the moment the link
+// is created, so the tail just runs the short worker exercise above (the
+// program's remaining calls, and syz_sched_ext_exercise, add more).
 
 #define STRUCTOPS_TCP_CA_CHUNK 4096
 #define STRUCTOPS_TCP_CA_CHUNKS 32
@@ -796,6 +912,8 @@ static void structops_exercise(const char* struct_name, const char* name)
 		close(fd);
 	} else if (strcmp(struct_name, "tcp_congestion_ops") == 0) {
 		structops_exercise_tcp_ca(name);
+	} else if (strcmp(struct_name, "sched_ext_ops") == 0) {
+		structops_scx_exercise(30);
 	}
 }
 

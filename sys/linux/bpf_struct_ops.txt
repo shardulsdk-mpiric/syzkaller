@@ -20,6 +20,18 @@
 # Surfaces:
 #   tcp_cong     struct tcp_congestion_ops  net/ipv4/bpf_tcp_ca.c  (mainline)
 #   mptcp_sched  struct mptcp_sched_ops     net/mptcp/bpf.c        (mptcp/export tree)
+#   sched_ext    struct sched_ext_ops       kernel/sched/ext/ext.c (CONFIG_SCHED_CLASS_EXT)
+#
+# sched_ext: a loaded scheduler governs every SCHED_NORMAL task (or only
+# SCHED_EXT tasks when its fuzzed .flags carry SCX_OPS_SWITCH_PARTIAL),
+# including the executor's own program process, so the generated enqueue
+# always ends in a dispatch-queue insert (liveness by construction,
+# pkg/structops) and .timeout_ms is pinned to 1-3 s so the kernel's own
+# watchdog ejects a stalled scheduler before syzkaller's program timeout.
+# The load's exercise tail runs a few short worker processes (one of them
+# switched to SCHED_EXT) so enqueue/dispatch/running/stopping fire;
+# syz_sched_ext_exercise repeats that for a fuzzed duration while the
+# program still holds the link (the registration lives as long as the fd).
 
 # The call returns the bpf link that holds the registration (the loader
 # always registers through a BPF_F_LINK struct_ops map + BPF_LINK_CREATE, so
@@ -29,11 +41,22 @@
 
 syz_bpf_struct_ops_load$tcp_cong(obj ptr[in, bpf_struct_ops_obj_tcp_cong], len bytesize[obj]) fd_bpf_link (no_squash)
 syz_bpf_struct_ops_load$mptcp_sched(obj ptr[in, bpf_struct_ops_obj_mptcp_sched], len bytesize[obj]) fd_bpf_link (no_squash)
+syz_bpf_struct_ops_load$sched_ext(obj ptr[in, bpf_struct_ops_obj_sched_ext], len bytesize[obj]) fd_bpf_link (no_squash)
+
+# Run short CPU-burning / yielding / sleeping worker processes for ms
+# milliseconds under whatever sched_ext scheduler is loaded (a no-op on the
+# fair class otherwise).  One worker switches itself to SCHED_EXT so a
+# SWITCH_PARTIAL scheduler is exercised too.
+syz_sched_ext_exercise(ms int32[1:200])
 
 bpf_struct_ops_obj_tcp_cong {
 	data	array[int8]
 }
 
 bpf_struct_ops_obj_mptcp_sched {
+	data	array[int8]
+}
+
+bpf_struct_ops_obj_sched_ext {
 	data	array[int8]
 }
