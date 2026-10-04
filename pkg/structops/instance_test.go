@@ -76,14 +76,23 @@ func TestInstanceFieldsRender(t *testing.T) {
 		t.Errorf("flags draw not varying: %v", seen)
 	}
 
-	// A surface without instance fields renders none and the two golden
-	// surfaces are exactly that (TestStructOpsGolden is the oracle; this
-	// is the direct statement).
-	for _, s := range []*Surface{TCPCong, MptcpSched} {
-		p := Generate(rand.New(rand.NewSource(1)), s)
-		if p.Instance != nil {
-			t.Errorf("%s: Instance = %+v, want nil", s.tag, p.Instance)
+	// A surface without instance fields renders none: mptcp_sched is
+	// exactly that (TestStructOpsGolden is the oracle; this is the direct
+	// statement).  tcp_cong carries the one production `.flags` field,
+	// always within TCP_CONG_MASK (bits 0..4), zero included.
+	if p := Generate(rand.New(rand.NewSource(1)), MptcpSched); p.Instance != nil {
+		t.Errorf("mptcp_sched: Instance = %+v, want nil", p.Instance)
+	}
+	zeroFlags := false
+	for seed := int64(0); seed < 64; seed++ {
+		p := Generate(rand.New(rand.NewSource(seed)), TCPCong)
+		if len(p.Instance) != 1 || p.Instance[0].Field != "flags" || p.Instance[0].Value&^0x1f != 0 {
+			t.Fatalf("tcp_cong seed %d: Instance = %+v", seed, p.Instance)
 		}
+		zeroFlags = zeroFlags || p.Instance[0].Value == 0
+	}
+	if !zeroFlags {
+		t.Error("tcp_cong: .flags = 0 not drawn in 64 seeds")
 	}
 
 	// Drift: the spec carries a field the surface no longer has, or lacks
@@ -209,19 +218,30 @@ func TestDigestInstanceData(t *testing.T) {
 	if nonzero == 0 {
 		t.Error("no non-zero draw in 8 seeds")
 	}
-	// The two production surfaces set no instance data: no DATA record.
+	// mptcp_sched sets no instance data: no DATA record.  The production
+	// tcp_cong carries `.flags` and digests to exactly that member (or to
+	// nothing when the draw is zero); sched_ext's four members are covered
+	// by TestSchedExtCompile.
 	for _, s := range []*Surface{TCPCong, MptcpSched} {
 		if gate := surfaceKernelGate[s.tag]; gate != "" {
 			if sizes, _ := kernelStructSizes(kobj+"/vmlinux", []string{gate}); sizes[gate] == 0 {
 				continue
 			}
 		}
-		blob, err := Compile(Generate(rand.New(rand.NewSource(0)), s).Render())
+		p := Generate(rand.New(rand.NewSource(0)), s)
+		blob, err := Compile(p.Render())
 		if err != nil {
 			t.Fatalf("%s: %v", s.tag, err)
 		}
-		if r, _ := ParseRecipe(blob); len(r.Data) != 0 {
+		r, _ := ParseRecipe(blob)
+		switch {
+		case s == MptcpSched && len(r.Data) != 0:
 			t.Errorf("%s: unexpected DATA records %+v", s.tag, r.Data)
+		case s == TCPCong && p.Instance[0].Value == 0 && len(r.Data) != 0:
+			t.Errorf("%s: .flags = 0 digested as %+v", s.tag, r.Data)
+		case s == TCPCong && p.Instance[0].Value != 0 &&
+			(len(r.Data) != 1 || r.Data[0] != RecipeData{Member: "flags", Size: 4, Value: p.Instance[0].Value}):
+			t.Errorf("%s: .flags = %#x digested as %+v", s.tag, p.Instance[0].Value, r.Data)
 		}
 	}
 }
