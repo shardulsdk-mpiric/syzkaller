@@ -211,7 +211,7 @@ func (spec *Spec) prog() (*Prog, error) {
 	var err error
 	for _, body := range sop.allBodies() {
 		walkStmts(body, func(st *Stmt) {
-			if err != nil || st.Kind != StmtKfuncCall {
+			if err != nil || (st.Kind != StmtKfuncCall && st.Kind != StmtDsqInsert) {
 				return
 			}
 			if st.KfuncIdx < 0 || st.KfuncIdx >= len(remap) {
