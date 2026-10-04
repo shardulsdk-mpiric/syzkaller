@@ -1,0 +1,146 @@
+From 1002a8dbf86f01e7e5996df582dbce28bfda3d68 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Sun, 4 Oct 2026 00:52:02 +0530
+Subject: [PATCH 1/2] quic: add kcov remote handle capture and annotation
+ helpers
+
+In-kernel QUIC (net/quic) processes incoming packets in the UDP tunnel
+encap receive softirq: quic_udp_rcv() -> quic_packet_rcv(), which, when
+the socket is not owned by a user, dispatches straight into
+quic_packet_process() and the whole frame-validation state machine
+(quic_frame_process() and the per-frame-type *_process() handlers:
+quic_frame_stream_process, quic_frame_crypto_process,
+quic_frame_connection_close_process, ...). kcov's per-task mode records
+none of that: in softirq the current task is whatever was interrupted,
+not the task that owns the QUIC connection, so a coverage-guided fuzzer
+sees the syscall half of the protocol and nothing of the RX frame
+validation that decides whether a packet is accepted or tears the
+connection down.
+
+kcov solves this with remote coverage, but the softirq side needs a
+handle to attribute coverage to, and kcov_common_handle() returns 0
+outside task context. Capture the creating task's common handle on the
+QUIC connection in quic_init_sock(), which only ever runs in task
+context: socket() for a client/listener, and accept() for the
+server-side child (quic_accept_sock_init() calls quic_init_sock() on the
+freshly cloned sock, after quic_accept()'s memset has cleared the
+inherited copy), so the accepted connection inherits the accepting
+task's handle.
+
+Add quic_kcov_remote_start()/_stop() helpers that open a remote coverage
+section using that handle, restricted to softirq context: the same code
+runs in process context when the backlog is drained from a syscall
+(quic_backlog_rcv() under release_sock()), where per-task kcov already
+records it and kcov_remote_start() warns if a task with kcov enabled
+opens a remote section. A zero handle is a lookup miss and makes both
+calls no-ops. The field is struct kcov_common_handle_id, which is
+zero-sized without CONFIG_KCOV, so no ifdefs are needed.
+
+No new uAPI and no change to the kcov core; same shape as the per-object
+handle in vhost, io_uring and usbip, and as the MPTCP msk-carried and
+SCTP endpoint-carried handles.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxTZMJNnZE5MDKnwFWizdX
+---
+ net/quic/socket.c | 10 ++++++++++
+ net/quic/socket.h | 48 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/net/quic/socket.c b/net/quic/socket.c
+index 75545fe8bd470..09cc48f89df8c 100644
+--- a/net/quic/socket.c
++++ b/net/quic/socket.c
+@@ -449,6 +449,16 @@ static int quic_init_sock(struct sock *sk)
+ 	sk->sk_write_space = quic_write_space;
+ 	sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
+ 
++	/* Capture the creating task's kcov remote handle so the receive-softirq
++	 * frame state machine on this connection can be attributed back to it.
++	 * This runs only in task context: socket() for a client/listener, and
++	 * accept() for the server-side child (quic_accept_sock_init() calls
++	 * quic_init_sock() on the freshly cloned sock, after quic_accept()'s
++	 * memset has cleared the inherited copy).  It is zero when the task has
++	 * no remote coverage enabled, which makes the annotation a no-op.
++	 */
++	quic_sk(sk)->kcov_handle = kcov_common_handle();
++
+ 	sk_sockets_allocated_inc(sk);
+ 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
+ 	INIT_LIST_HEAD(quic_reqs(sk));
+diff --git a/net/quic/socket.h b/net/quic/socket.h
+index 38dc967b5e6de..9d36a82116bf6 100644
+--- a/net/quic/socket.h
++++ b/net/quic/socket.h
+@@ -10,6 +10,7 @@
+ 
+ #include <net/udp_tunnel.h>
+ #include <linux/quic.h>
++#include <linux/kcov.h>
+ 
+ #include "common.h"
+ #include "pnspace.h"
+@@ -106,6 +107,17 @@ struct quic_sock {
+ 	struct quic_inqueue		inq;
+ 	struct quic_packet		packet;
+ 	struct quic_timer		timers[QUIC_TIMER_MAX];
++
++	/* kcov remote coverage handle of the task that created this QUIC
++	 * connection, captured in quic_init_sock() -- which runs only in task
++	 * context (socket(), and accept() for the server-side child, via
++	 * quic_accept_sock_init()).  Keys the receive-softirq packet/frame
++	 * processing section (quic_kcov_remote_start()) so the frame state
++	 * machine, which runs in the UDP encap receive softirq and is
++	 * attributed to no task by per-task kcov, is attributed back to the
++	 * task that opened the socket.  Zero-sized without CONFIG_KCOV.
++	 */
++	struct kcov_common_handle_id	kcov_handle;
+ };
+ 
+ struct quic6_sock {
+@@ -118,6 +130,42 @@ static inline struct quic_sock *quic_sk(const struct sock *sk)
+ 	return (struct quic_sock *)sk;
+ }
+ 
++/* kcov remote coverage for the QUIC receive-softirq frame state machine.
++ *
++ * Incoming packets enter from the UDP tunnel encap callback (quic_udp_rcv ->
++ * quic_packet_rcv) in the receive softirq.  When the socket is not owned by a
++ * user, quic_packet_rcv dispatches straight into quic_packet_process() ->
++ * quic_frame_process() and the per-frame-type *_process() handlers
++ * (quic_frame_stream_process, quic_frame_crypto_process,
++ * quic_frame_connection_close_process, ...), i.e. the whole frame-validation
++ * state machine, in softirq.  kcov's per-task mode records nothing there: the
++ * current task is whatever was interrupted, not the task that owns the QUIC
++ * connection.  These helpers open a kcov remote section keyed on the handle
++ * captured from the connection's creating task (quic_sk(sk)->kcov_handle), so
++ * that coverage is attributed back to it.
++ *
++ * Restricted to softirq on purpose: the same quic_packet_process() path also
++ * runs in process context when the socket backlog is drained from a syscall
++ * (quic_backlog_rcv() under release_sock()), where the task's own per-task
++ * kcov already records it and kcov_remote_start() warns if a task with kcov
++ * enabled opens a remote section.  A zero handle (the creating task had no
++ * remote coverage enabled) is a lookup miss in kcov, so start and stop are
++ * both no-ops and stay balanced.  Bracket the single softirq dispatch in
++ * quic_packet_rcv(), never quic_packet_process() itself: it re-enters itself
++ * for coalesced packets and kcov forbids nested softirq sections.
++ */
++static inline void quic_kcov_remote_start(struct kcov_common_handle_id id)
++{
++	if (IS_ENABLED(CONFIG_KCOV) && in_serving_softirq())
++		kcov_remote_start_common(id);
++}
++
++static inline void quic_kcov_remote_stop(void)
++{
++	if (IS_ENABLED(CONFIG_KCOV) && in_serving_softirq())
++		kcov_remote_stop();
++}
++
+ static inline struct list_head *quic_reqs(const struct sock *sk)
+ {
+ 	return &quic_sk(sk)->reqs;
+-- 
+2.34.1
+
