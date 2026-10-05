@@ -135,6 +135,11 @@ func TestRecipeDataRecord(t *testing.T) {
 			Member: "enqueue", Name: "x_enqueue", FuncTypeID: 7,
 			Kfuncs: []RecipeKfunc{{InsnIdx: 2, Name: "scx_bpf_dsq_insert"}},
 			Insns:  make([]byte, 4*bpfInsnSize),
+		}, {
+			// A sleepable program: PROG flags bit 0 (the formerly reserved
+			// word), round-trips; the non-sleepable one reads back false.
+			Member: "init", Name: "x_init", FuncTypeID: 9,
+			Insns: make([]byte, 2*bpfInsnSize), Sleepable: true,
 		}},
 		Data: []RecipeData{
 			{Member: "flags", Size: 8, Value: 0x11},
@@ -154,7 +159,8 @@ func TestRecipeDataRecord(t *testing.T) {
 		if len(got.Data) != 2 || got.Data[0] != r.Data[0] || got.Data[1] != r.Data[1] {
 			t.Errorf("Data round-trip: %+v", got.Data)
 		}
-		if got.StructName != r.StructName || len(got.Progs) != 1 || got.Progs[0].Member != "enqueue" {
+		if got.StructName != r.StructName || len(got.Progs) != 2 || got.Progs[0].Member != "enqueue" ||
+			got.Progs[0].Sleepable || got.Progs[1].Member != "init" || !got.Progs[1].Sleepable {
 			t.Errorf("recipe round-trip: %+v", got)
 		}
 	}
@@ -162,8 +168,8 @@ func TestRecipeDataRecord(t *testing.T) {
 		t.Errorf("RecipeSpec past DATA records: %v %q %v", key, spec, ok)
 	}
 	// The record count header counts the DATA records.
-	if n := int(blob[8]) | int(blob[9])<<8; n != 2+1+2 {
-		t.Errorf("nrec = %d, want 5", n)
+	if n := int(blob[8]) | int(blob[9])<<8; n != 2+2+2 {
+		t.Errorf("nrec = %d, want 6", n)
 	}
 	// A DATA record with a bad size is rejected.
 	bad := &Recipe{BTF: r.BTF, StructName: r.StructName, Progs: r.Progs,
