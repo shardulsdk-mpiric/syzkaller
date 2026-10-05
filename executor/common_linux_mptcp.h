@@ -1313,7 +1313,13 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 			__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 			return -1;
 		}
-		syz_mptcp_mut_publish(local_addr_be, mut_op);
+		// keys/keys_valid are consumed only by MPTCP_MUT_CRYPTO_SELFVERIFY (Phase 0),
+		// which recomputes the ACK HMAC from the captured nonces + these MP_CAPABLE
+		// keys. The mutation ops ignore them. keys_valid requires the pair to have
+		// been created with MPTCP_INIT_CAPTURE_KEYS.
+		syz_mptcp_mut_publish(local_addr_be, mut_op,
+				      pair->local_key, pair->remote_key,
+				      pair->keys_valid ? 1 : 0);
 	}
 
 	if (mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
@@ -1371,6 +1377,31 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 			      pair_slot);
 		}
 		close(evfd);
+	}
+
+	// Phase-0 crypto self-verify oracle (design ingress_injection_design.md §7).
+	// The join established, so the client ACK (and thus the worker's HMAC recompute)
+	// has happened; give the worker a brief grace window to publish its verdict in
+	// case the verdict send trails our MPTCP_INFO poll, then log MATCH/MISMATCH.
+	// This is the acceptance check that R_B capture + the HMAC recompute are correct;
+	// debug() is stripped from the csource reproducer, so it is a debug-only oracle
+	// (like the token self-check), never a wire effect. [RUN]-1: a MATCH also
+	// confirms LOCAL_OUT saw SYN -> SYN-ACK -> ACK in order (R_A and R_B were both
+	// captured before the ACK).
+	if (mut_op == MPTCP_MUT_CRYPTO_SELFVERIFY) {
+		int vr = syz_mptcp_mut_verify_result();
+		for (int i = 0; i < 20 && vr == MPTCP_SELFVERIFY_PENDING; i++) {
+			usleep(5000); // up to ~100ms for the worker's release store
+			vr = syz_mptcp_mut_verify_result();
+		}
+		if (vr == MPTCP_SELFVERIFY_MATCH) {
+			debug("syz_mptcp_join_subflow: pair=%ld SELFVERIFY MATCH "
+			      "(R_B captured, recomputed ACK HMAC == kernel's)\n", pair_slot);
+		} else {
+			debug("syz_mptcp_join_subflow: pair=%ld SELFVERIFY result=%d "
+			      "(1=match -1=mismatch -2=no-keys -3=no-nonce 0=pending)\n",
+			      pair_slot, vr);
+		}
 	}
 
 	// The egress ACK has been sent (and mutated, if requested) by now; retire the

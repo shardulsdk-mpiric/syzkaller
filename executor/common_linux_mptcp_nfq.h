@@ -41,12 +41,32 @@
 #define NFQ_NFT_TABLE "syz_mptcp_mut"
 #define NFQ_NFT_CHAIN "out"
 
-// The subsystem hook: given a copy of the IP packet (len bytes), mutate it IN
-// PLACE and return 1 if mutated, 0 to pass through. Must be a pure function of
-// the packet content and the layer's (persistently-set) spec -- no per-call state,
-// no fire-once. Set once by the subsystem layer before syz_nfq_setup().
+// The subsystem hook: given a mutable copy of the IP packet (len bytes, sitting in
+// a buffer with ample headroom -- see the worker's 128 KiB buffer), it may rewrite
+// and/or GROW the packet in place and returns:
+//   > 0 : the packet's new total IP length. The engine re-injects exactly that many
+//         bytes and recomputes the checksums (TCP always; IP header only when the
+//         length changed). Equal to `len` for a same-length rewrite; greater for a
+//         length-grow graft (the hook is then responsible for having updated
+//         tcph->doff / the IP+TCP option geometry, and for staying within the
+//         TCP option-space bound, SYZ-free macro MPTCP_TCP_MAX_OPT_SPACE below).
+//     0 : pass through unmodified (the engine verdict-accepts the original packet).
+//   < 0 : drop the packet (NF_DROP).
+// Must be a pure function of the packet content and the layer's (persistently-set)
+// spec -- no per-call state, no fire-once. Set once by the subsystem layer before
+// syz_nfq_setup(). (Contract widened from the original bool for the ingress-injection
+// length-grow graft, design ingress_injection_design.md §4; a hook that only ever
+// returns len/0 behaves exactly as the pre-widening engine did.)
 typedef int (*syz_nfq_mutate_fn)(uint8* ip_pkt, int len);
 static syz_nfq_mutate_fn syz_nfq_hook;
+
+// TCP options cap at 40 bytes (data-offset <= 15 words => header <= 60 bytes, 20 of
+// them the fixed header). A length-grow graft must keep the grown TCP header within
+// this; the engine also sanity-bounds it (a returned length implying doff > 15 is
+// dropped rather than injected malformed). [RUN]-4: grafting onto a carrier already
+// near the cap can exceed it -- the graft op must target a low-option carrier.
+#define MPTCP_TCP_MAX_OPT_SPACE 40
+#define MPTCP_TCP_MAX_HDR 60 // 20 fixed + 40 options; doff field max is 15 words
 
 static int syz_nfq_fd = -1;
 static int syz_nfq_setup_done;
@@ -62,12 +82,14 @@ static volatile int syz_nfq_worker_stop;
 #define NFQ_NLA_NEXT(a, len) ((len) -= NLA_ALIGN((a)->nla_len), \
 			      (struct nlattr*)((char*)(a) + NLA_ALIGN((a)->nla_len)))
 
-// ---- IPv4 TCP checksum recompute (after an in-place TCP-segment rewrite) ----
-// NOTE: this recomputes only the TCP checksum and assumes the hook mutated TCP
-// payload/option bytes, NOT the IP header. A hook that changes IP-header fields
-// (tot_len, ihl, addrs, ttl, ...) needs the IP header checksum recomputed too
-// (ip_rcv_core drops a bad one) and must not be trusted to bound this pass --
-// that is out of scope until a grammar needs it (see review round 2, F6).
+// ---- IPv4 checksum recompute (after an in-place TCP-segment rewrite) ----
+// The TCP pass (syz_nfq_tcp_csum_v4) recomputes only the TCP checksum, assuming the
+// IP header was untouched. A length-grow graft DOES change the IP header (tot_len)
+// and the TCP header (doff), so the engine additionally recomputes the IP-header
+// checksum (syz_nfq_ip_csum_v4) whenever the length changed -- ip_rcv_core drops a
+// bad IP csum. ([RUN]-5: loopback RX may carry CHECKSUM_UNNECESSARY, making the L4
+// recompute cosmetic, but the IP-header csum is validated regardless; recompute
+// both so the path is correct off-loopback too.)
 static inline uint16 syz_nfq_csum_fold(uint32 sum)
 {
 	sum = (sum >> 16) + (sum & 0xFFFF);
@@ -107,6 +129,15 @@ static inline void syz_nfq_tcp_csum_v4(struct tcphdr* tcph, const struct iphdr* 
 	sum += htons((uint16)l4_len);
 	tcph->check = 0;
 	tcph->check = syz_nfq_csum_buf(sum, (const uint16*)tcph, l4_len);
+}
+
+// IP-header checksum over ihl*4 bytes (standard ones-complement of the header with
+// the check field zeroed). Only needed after a length/IP-header change.
+static inline void syz_nfq_ip_csum_v4(struct iphdr* iph)
+{
+	int ihl = iph->ihl * 4;
+	iph->check = 0;
+	iph->check = syz_nfq_csum_buf(0, (const uint16*)iph, ihl);
 }
 
 // ---- raw-netlink NFQUEUE plumbing ----
@@ -629,16 +660,55 @@ static inline void* syz_nfq_worker_loop(void* arg)
 			}
 			a = NFQ_NLA_NEXT(a, alen);
 		}
-		int mutated = 0;
+		// Hook return contract (see syz_nfq_mutate_fn): 0 = pass through,
+		// >0 = new total length to re-inject, <0 = drop.
+		int ret = 0;
 		if (syz_nfq_hook && payload && plen >= (int)(sizeof(struct iphdr) + sizeof(struct tcphdr)))
-			mutated = syz_nfq_hook(payload, plen);
+			ret = syz_nfq_hook(payload, plen);
 		int vrc;
-		if (mutated) {
+		if (ret < 0) {
+			vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_DROP, NULL, 0);
+		} else if (ret > 0) {
+			int newlen = ret;
 			struct iphdr* ip = (struct iphdr*)payload;
 			int ihl = ip->ihl * 4;
-			if (ip->protocol == IPPROTO_TCP && plen >= ihl + (int)sizeof(struct tcphdr))
-				syz_nfq_tcp_csum_v4((struct tcphdr*)(payload + ihl), ip, plen - ihl);
-			vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, payload, (uint16)plen);
+			// IP tot_len is a 16-bit field; a sane loopback segment fits well
+			// under 64 KiB. Reject an out-of-range length rather than inject a
+			// malformed/buffer-overrunning packet (defensive against a buggy hook;
+			// the verdict builder also guards its own buffer).
+			if (newlen < ihl + (int)sizeof(struct tcphdr) || newlen > 65535) {
+				debug("syz_nfq_worker_loop: hook bad len=%d (plen=%d); passing original\n", newlen, plen);
+				vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, NULL, 0);
+			} else if (ip->protocol == IPPROTO_TCP) {
+				struct tcphdr* tcph = (struct tcphdr*)(payload + ihl);
+				int thl = tcph->doff * 4;
+				// Enforce the TCP option-space bound (design §4): a grown header
+				// past 60 bytes (doff > 15) can't be represented and would be
+				// malformed -- drop rather than inject it.
+				if (thl < (int)sizeof(struct tcphdr) || thl > MPTCP_TCP_MAX_HDR ||
+				    newlen < ihl + thl) {
+					debug("syz_nfq_worker_loop: TCP opt-space bound violated doff=%d; dropping\n", (int)tcph->doff);
+					vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_DROP, NULL, 0);
+				} else {
+					// On a length change the engine is authoritative for tot_len
+					// and recomputes the IP-header csum; the TCP csum pass always
+					// follows. A same-length rewrite leaves the IP header (and its
+					// csum) untouched -- exactly the pre-widening behaviour.
+					if (newlen != plen) {
+						ip->tot_len = htons((uint16)newlen);
+						syz_nfq_ip_csum_v4(ip);
+					}
+					syz_nfq_tcp_csum_v4(tcph, ip, newlen - ihl);
+					vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, payload, (uint16)newlen);
+				}
+			} else {
+				// Non-TCP length change: fix tot_len + IP csum, no L4 pass.
+				if (newlen != plen) {
+					ip->tot_len = htons((uint16)newlen);
+					syz_nfq_ip_csum_v4(ip);
+				}
+				vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, payload, (uint16)newlen);
+			}
 		} else {
 			vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, NULL, 0);
 		}
