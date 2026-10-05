@@ -1396,7 +1396,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		}
 		if (vr == MPTCP_SELFVERIFY_MATCH) {
 			debug("syz_mptcp_join_subflow: pair=%ld SELFVERIFY MATCH "
-			      "(R_B captured, recomputed ACK HMAC == kernel's)\n", pair_slot);
+			      "(R_B captured, recomputed ACK HMAC == kernel's)\n",
+			      pair_slot);
 		} else {
 			debug("syz_mptcp_join_subflow: pair=%ld SELFVERIFY result=%d "
 			      "(1=match -1=mismatch -2=no-keys -3=no-nonce 0=pending)\n",
