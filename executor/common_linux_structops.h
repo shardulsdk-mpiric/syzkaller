@@ -213,6 +213,8 @@ static long syz_sched_ext_exercise(volatile long a0)
 #define STRUCTOPS_BPF_PROG_TYPE_STRUCT_OPS 27
 #define STRUCTOPS_BPF_STRUCT_OPS_ATTACH 44 // enum bpf_attach_type BPF_STRUCT_OPS
 #define STRUCTOPS_BPF_F_LINK (1u << 13)
+#define STRUCTOPS_BPF_F_SLEEPABLE (1u << 4)
+#define STRUCTOPS_PROG_FLAG_SLEEPABLE (1u << 0) // recipe PROG record flags bit 0
 #define STRUCTOPS_BPF_PSEUDO_KFUNC_CALL 2
 #define STRUCTOPS_BPF_JMP_CALL 0x85 // BPF_JMP | BPF_CALL
 
@@ -642,6 +644,7 @@ struct structops_recipe_prog {
 	uint32 func_type_id;
 	uint32 nkfunc;
 	uint32 ninsn;
+	uint32 flags; // STRUCTOPS_PROG_FLAG_* (bit 0: sleepable -> BPF_F_SLEEPABLE)
 	const uint8* kfuncs; // nkfunc x { uint32 insn_idx; char name[64] }
 	const uint8* insns; // ninsn x 8
 };
@@ -727,6 +730,7 @@ static int structops_parse_recipe(const uint8* blob, uint32 len, struct structop
 			pr->func_type_id = structops_get32(p + hdr - 16);
 			pr->nkfunc = structops_get32(p + hdr - 12);
 			pr->ninsn = structops_get32(p + hdr - 8);
+			pr->flags = structops_get32(p + hdr - 4);
 			if (!pr->member || !pr->name || pr->nkfunc > STRUCTOPS_MAX_KFUNCS || pr->ninsn == 0 ||
 			    pr->ninsn > (1u << 20) ||
 			    n != hdr + pr->nkfunc * (4 + STRUCTOPS_KFUNC_NAME_LEN) + pr->ninsn * sizeof(struct structops_bpf_insn))
@@ -1063,6 +1067,11 @@ static long syz_bpf_struct_ops_load(volatile long a0, volatile long a1)
 		strncpy(pattr.prog_name, pr->member, sizeof(pattr.prog_name) - 1);
 		pattr.expected_attach_type = (uint32)member_idx;
 		pattr.attach_btf_id = struct_id;
+		// A callback the recipe marks sleepable (it was in "struct_ops.s")
+		// loads with BPF_F_SLEEPABLE; the kernel's ->check_member decides
+		// which members may sleep (sched_ext: init / exit, among others).
+		if (pr->flags & STRUCTOPS_PROG_FLAG_SLEEPABLE)
+			pattr.prog_flags |= STRUCTOPS_BPF_F_SLEEPABLE;
 		pattr.prog_btf_fd = (uint32)btf_fd;
 		pattr.func_info_rec_size = sizeof(finfo);
 		pattr.func_info = (uint64)(unsigned long)&finfo;
