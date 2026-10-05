@@ -119,6 +119,7 @@ package structops
 import (
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 // Rand is the source of randomness the generator draws from.  It is the
@@ -311,7 +312,7 @@ var mptcpSchedKfuncs = []Kfunc{
 // individually by the kfunc-call generator: the BPF verifier enforces
 // the lifecycle `new -> next* -> destroy` on EVERY path, so the renderer
 // only ever emits all three together as the atomic iterator idiom (see
-// renderSubflowIter).  Modelled here purely to carry the
+// renderIter).  Modelled here purely to carry the
 // `extern ... __ksym;` decls and the verbatim signatures.
 //
 //   - bpf_iter_mptcp_subflow_new(struct bpf_iter_mptcp_subflow *it,
@@ -469,8 +470,27 @@ var tcpCongWriteFields = []CtxField{
 //	select_cpu  SELECT_CPU | ENQUEUE  -> any (+ insert: terminal only)
 //	enqueue     SELECT_CPU | ENQUEUE  -> any (+ insert: terminal only)
 //	dispatch    ENQUEUE | DISPATCH    -> any + dispatch set
+//	                                     (+ dsq_move_to_local: fixed epilogue)
 //	running / stopping                -> any
-//	init / exit UNLOCKED              -> any (+ create_dsq: Phase 3)
+//	init / exit UNLOCKED, sleepable   -> any (+ create_dsq: init's fixed prologue)
+//
+// Row B (user DSQ): init is a SLEEPABLE program (bpf_scx_check_member
+// allows init / exit / init_task / cpu_online / cpu_offline / the cgroup
+// ops to sleep; every other member rejects BPF_F_SLEEPABLE with -EINVAL)
+// whose fixed prologue creates USER_DSQ with scx_bpf_create_dsq
+// (KF_SLEEPABLE, scx_kfunc_ids_unlocked); the enqueue terminal may insert
+// to USER_DSQ; dispatch's fixed epilogue drains one task from it with
+// scx_bpf_dsq_move_to_local (scx_kfunc_ids_dispatch) on EVERY call --
+// including prev == NULL (an idle CPU), which is why the generated dispatch
+// body sits inside `if (prev) { ... }` rather than behind an early return.
+// The liveness invariant is unchanged: a task inserted to USER_DSQ is
+// drained by the next ops.dispatch on any CPU, and the core calls dispatch
+// whenever a CPU's local DSQ runs dry (after the global DSQ, which it
+// consumes itself).  The DSQ iterator (bpf_iter_scx_dsq_*, scx_kfunc_ids_any,
+// KF_RCU_PROTECTED: fine in a non-sleepable program, which is implicitly
+// in an RCU section) walks USER_DSQ from the non-sleepable ops; it is not
+// offered in the sleepable init / exit, where it would need an explicit
+// bpf_rcu_read_lock the body generator does not model.
 //
 // Three kernel runtime checks shape the argument types:
 //   - a CPU argument must be a valid CPU id (scx_cpu_valid -> scx_error ->
@@ -487,12 +507,12 @@ var tcpCongWriteFields = []CtxField{
 //     -ENOENT, but LOCAL_ON with a stray cpu is an error, so it is an
 //     ArgCands set of the two builtins.
 //
-// Not in row A, with the reason: scx_bpf_dsq_move_to_local (user DSQs only,
-// find_user_dsq; Phase 3 with ops.init creating one), scx_bpf_create_dsq
-// (sleepable, init-only; Phase 3), scx_bpf_select_cpu_dfl and the idle
-// masks (Phase 4), every KF_RCU_PROTECTED / KF_ACQUIRE kfunc (needs an
-// explicit RCU section or a release the body generator does not model),
-// scx_bpf_dsq_insert_vtime (builtin DSQs cannot be priority queues).
+// Still left out, with the reason: scx_bpf_select_cpu_dfl and the idle
+// masks (Phase 4), scx_bpf_dsq_move / _vtime from the iterator (Phase 4:
+// a second drain form), every other KF_RCU_PROTECTED / KF_ACQUIRE kfunc
+// (needs an explicit RCU section or a release the body generator does not
+// model), scx_bpf_dsq_insert_vtime (USER_DSQ would have to be a priority
+// queue consistently; mixing FIFO and PRIQ inserts is a runtime error).
 var schedExtKfuncs = []Kfunc{
 	{
 		// __bpf_kfunc void scx_bpf_dsq_insert(struct task_struct *p,
@@ -546,7 +566,31 @@ var schedExtKfuncs = []Kfunc{
 		CDecl:    "extern __s32 scx_bpf_dsq_nr_queued(__u64 dsq_id) __ksym;",
 		RetType:  "int",
 		ArgTypes: []string{"scx_dsq_id"},
-		ArgCands: [][]string{{"SCX_DSQ_GLOBAL", "SCX_DSQ_LOCAL"}},
+		ArgCands: [][]string{{"SCX_DSQ_GLOBAL", "SCX_DSQ_LOCAL", "USER_DSQ"}},
+	},
+	{
+		// __bpf_kfunc s32 scx_bpf_create_dsq(u64 dsq_id, s32 node,
+		//	const struct bpf_prog_aux *aux)
+		// scx_kfunc_ids_unlocked, KF_SLEEPABLE: the fixed prologue of the
+		// sleepable init creates USER_DSQ (node -1 = NUMA_NO_NODE); a
+		// prologue kfunc, never a generated draw (a second create of the
+		// same id is -EEXIST, and the enable fails on init's error).
+		Name:     "scx_bpf_create_dsq",
+		CDecl:    "extern __s32 scx_bpf_create_dsq(__u64 dsq_id, __s32 node) __ksym;",
+		RetType:  "__s32",
+		ArgTypes: []string{"__u64", "__s32"},
+	},
+	{
+		// __bpf_kfunc bool scx_bpf_dsq_move_to_local(u64 dsq_id,
+		//	const struct bpf_prog_aux *aux)
+		// scx_kfunc_ids_dispatch: the fixed epilogue of dispatch drains one
+		// task from USER_DSQ to this CPU's local DSQ (the v1 name; ___v2
+		// adds enq_flags and is a Phase-4 mutation dimension).  A prologue
+		// kfunc, never a generated draw.
+		Name:     "scx_bpf_dsq_move_to_local",
+		CDecl:    "extern bool scx_bpf_dsq_move_to_local(__u64 dsq_id) __ksym;",
+		RetType:  "bool",
+		ArgTypes: []string{"__u64"},
 	},
 	{
 		// __bpf_kfunc u32 scx_bpf_cpuperf_cap(s32 cpu, const struct bpf_prog_aux *aux)
@@ -611,6 +655,81 @@ var schedExtAnyKfuncs = []string{
 // kernel's scx_kfunc_ids_dispatch members modelled in row A.
 var schedExtDispatchKfuncs = append([]string{"scx_bpf_dispatch_nr_slots"}, schedExtAnyKfuncs...)
 
+// schedExtDsqIterKfuncs are the open-coded DSQ iterator kfuncs
+// (kernel/sched/ext/ext.c, scx_kfunc_ids_any), in BPF-visible form (`new`
+// drops its implicit aux), new / next / destroy order as iterSpec needs:
+//
+//   - bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id,
+//     u64 flags)                  -> int, KF_ITER_NEW | KF_RCU_PROTECTED
+//   - bpf_iter_scx_dsq_next(it)   -> struct task_struct *, KF_ITER_NEXT | KF_RET_NULL
+//   - bpf_iter_scx_dsq_destroy(it) -> void, KF_ITER_DESTROY
+//
+// `struct bpf_iter_scx_dsq` (`u64 __opaque[6]`) is BTF-exported, so it
+// resolves from vmlinux.h.  Only a user DSQ can be iterated
+// (find_user_dsq; a builtin id is -ENOENT, which leaves `next` returning
+// NULL at once), so the generated `new` always names USER_DSQ.
+var schedExtDsqIterKfuncs = []Kfunc{
+	{
+		Name: "bpf_iter_scx_dsq_new",
+		CDecl: "extern int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, __u64 dsq_id, " +
+			"__u64 flags) __ksym;",
+		RetType:  "int",
+		ArgTypes: []string{"struct bpf_iter_scx_dsq *", "__u64", "__u64"},
+	},
+	{
+		Name:     "bpf_iter_scx_dsq_next",
+		CDecl:    "extern struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it) __ksym;",
+		RetType:  "struct task_struct *",
+		ArgTypes: []string{"struct bpf_iter_scx_dsq *"},
+		IsPtrRet: true,
+		RetNull:  true, // KF_ITER_NEXT | KF_RET_NULL
+	},
+	{
+		Name:     "bpf_iter_scx_dsq_destroy",
+		CDecl:    "extern void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it) __ksym;",
+		RetType:  "", // void
+		ArgTypes: []string{"struct bpf_iter_scx_dsq *"},
+	},
+}
+
+// schedExtDsqIter is the sched_ext iterator statement: walk USER_DSQ
+// (forward, or SCX_DSQ_ITER_REV -- the only user flag) with a short body
+// over each queued task `tN`.  Inside the loop `tN` is the trusted task
+// the iterator returned, so the body may store to its three writable
+// fields (re-based onto `tN`) and pass it to the `any` kfuncs; the loop
+// does not nest another iterator and never returns (noReturn), so
+// `destroy` runs on every path.
+var schedExtDsqIter = &iterSpec{
+	comment:    "/* Generated DSQ iterator. */",
+	elemPrefix: "t",
+	elemType:   "struct task_struct *",
+	newArgs:    []string{"USER_DSQ, 0", "USER_DSQ, SCX_DSQ_ITER_REV"},
+	loopScope: func(surf *Surface, tVar string) bodyScope {
+		fields := make([]ctxWriteField, len(surf.writeFields))
+		for i, f := range surf.writeFields {
+			fields[i] = ctxWriteField{accessor: tVar + "->" + f.Field, ctype: f.CType}
+		}
+		return bodyScope{
+			pool: []typedVal{
+				{expr: tVar, ctype: "struct task_struct *"},
+			},
+			writeFields: fields,
+			allowIter:   false,
+			noReturn:    true,
+			minStmt:     0,
+			maxStmt:     3,
+			kfuncAllow:  schedExtAnyKfuncs,
+		}
+	},
+}
+
+// schedExtPreamble names the row-B user DSQ for the fixed text and the
+// generated candidates.  Any id without SCX_DSQ_FLAG_BUILTIN (bit 63) is a
+// legal user DSQ id; it is per scheduler (sch->dsq_hash), so every
+// generated scheduler may use the same one.
+const schedExtPreamble = "/* The row-B user DSQ: created by init, inserted to by enqueue, drained by dispatch. */\n" +
+	"#define USER_DSQ 0x100ULL\n"
+
 // schedExtWriteFields is the writable task state a cpu-form sched_ext
 // program may store to, exactly bpf_scx_btf_struct_access
 // (kernel/sched/ext/ext.c): `p->scx.slice` and `p->scx.dsq_vtime` (u64),
@@ -658,14 +777,16 @@ const (
 	// rendered as part of this same statement); a scalar return is
 	// bound to a local; a void kfunc is emitted for effect.
 	StmtKfuncCall
-	// StmtSubflowIter -- the open-coded subflow iterator.
+	// StmtSubflowIter -- an open-coded kernel iterator (the surface's
+	// Surface.iter: MPTCP's subflow iterator, sched_ext's DSQ iterator).
 	// Rendered as ONE atomic compound statement: the iterator
-	// declaration, `bpf_iter_mptcp_subflow_new`, a
-	// `while ((sfN = bpf_iter_mptcp_subflow_next(&it)))` loop with a
-	// short generated body over `sfN`, and the mandatory
-	// `bpf_iter_mptcp_subflow_destroy`.  The verifier enforces the
+	// declaration, the `*_new` kfunc, a `while ((eN = *_next(&it)))` loop
+	// with a short generated body over the per-iteration element `eN`,
+	// and the mandatory `*_destroy`.  The verifier enforces the
 	// `new -> next* -> destroy` lifecycle on every path, so the three
-	// kfuncs are never emitted apart.
+	// kfuncs are never emitted apart.  The name keeps the fork's
+	// MPTCP-era spelling (it is a gob/spec constant); StmtIter is its
+	// surface-neutral alias.
 	StmtSubflowIter
 	// StmtIfElse -- a generated free-form `if/else` (Stage
 	// 2b).  Rendered as `if (<cond>) { <IfBody> }` optionally followed
@@ -689,6 +810,9 @@ const (
 	// carry the call exactly as a StmtKfuncCall does.
 	StmtDsqInsert
 )
+
+// StmtIter is the surface-neutral name of StmtSubflowIter.
+const StmtIter = StmtSubflowIter
 
 // Stmt is one statement of the BRF-generated get_send body.
 // All fields are exported so a Prog gob-serializes cleanly
@@ -741,18 +865,19 @@ type Stmt struct {
 	// in a void callback -- the renderer picks the form from the enclosing
 	// callback's return type).
 	NullGuard bool
-	// IterId is a per-statement unique id for a SubflowIter -- it
-	// names the iterator local (`itN`) and the loop variable
-	// (`sfN`), keeping nested/repeated iterators non-colliding.
+	// IterId is a per-statement unique id for an Iter -- it names the
+	// iterator local (`itN`); the loop variable is Var (`sfN` / `tN`),
+	// keeping nested/repeated iterators non-colliding.
 	IterId int
-	// IterSockExpr is the `struct sock *` expression passed to
-	// `bpf_iter_mptcp_subflow_new` -- the MPTCP socket, `(struct
-	// sock *)msk`.  Valid for SubflowIter.
+	// IterSockExpr is the argument text after `&itN` in the `*_new` call,
+	// drawn from the surface's iterSpec.newArgs: MPTCP's `(struct sock
+	// *)msk` (the one candidate, so never a draw), sched_ext's `USER_DSQ,
+	// <flags>`.  The MPTCP-era name is kept: it is a gob/spec field.
 	IterSockExpr string
-	// IterBody is the (possibly empty) short generated loop body of a
-	// SubflowIter, executed with the loop variable `sfN` in scope as
-	// a valid `struct mptcp_subflow_context *`.  Reuses the same
-	// Stmt kinds as the top-level body.
+	// IterBody is the (possibly empty) short generated loop body of an
+	// Iter, executed with the loop variable Var in scope as a valid
+	// element pointer (CType).  Reuses the same Stmt kinds as the
+	// top-level body.
 	IterBody []Stmt
 	// CondVar is the in-scope scalar local the condition tests --
 	// valid for IfElse.  Always a scalar (`int` / `unsigned long` /
@@ -820,6 +945,21 @@ type Callback struct {
 	Epilogue string
 	// Body is the BRF-generated middle of this callback.
 	Body []Stmt
+	// Sleepable marks a callback the kernel allows to be a sleepable
+	// struct_ops program (sched_ext's init / exit, bpf_scx_check_member):
+	// it renders in SEC("struct_ops.s"), Digest marks its PROG record, and
+	// the loader passes BPF_F_SLEEPABLE at PROG_LOAD.  A KF_SLEEPABLE
+	// kfunc (scx_bpf_create_dsq) is callable only from such a program.
+	// False everywhere on the older surfaces (their text is unchanged).
+	Sleepable bool
+	// BodyGuard, when set, wraps the generated body in `if (<guard>) {
+	// ... }` so a nullable ctx value is used only inside the block and
+	// the FIXED epilogue still runs on every call: sched_ext's dispatch
+	// guards `prev` (prev__nullable) and drains the user DSQ after the
+	// block whether or not there was a prev.  The body is generated under
+	// noReturn, so nothing inside the block can skip the epilogue.  Empty
+	// on every other callback.
+	BodyGuard string
 }
 
 // Prog is the per-program model of a generated struct_ops
@@ -1262,7 +1402,7 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 	if noFields {
 		kinds = []StmtKind{StmtArith, StmtKfuncCall}
 	}
-	if sc.allowIter {
+	if sc.allowIter && sop.surface().iter != nil {
 		kinds = append(kinds, StmtSubflowIter)
 	}
 	if sc.allowIf && sc.depth < ifElseMaxDepth {
@@ -1415,7 +1555,7 @@ func genBody(r *randGen, sop *Prog, sc bodyScope, varId *int) []Stmt {
 			}
 			body = append(body, st)
 		case StmtSubflowIter:
-			body = append(body, genSubflowIter(r, sop, varId))
+			body = append(body, genIter(r, sop, varId))
 		case StmtIfElse:
 			// readVars is non-empty here (the fallback above guarantees
 			// it); build the condition over an in-scope scalar local,
@@ -1558,51 +1698,68 @@ func genIfElse(r *randGen, sop *Prog, sc bodyScope, varId *int,
 	return st
 }
 
-// genSubflowIter builds one StmtSubflowIter: the open-coded
-// subflow iterator.  The verifier requires the `new -> next* -> destroy`
-// lifecycle on every path, so this statement is ALWAYS rendered as the
-// complete triple (see renderSubflowIter) -- it is never partial.
+// genIter builds one StmtSubflowIter from the surface's iterSpec: the
+// open-coded kernel iterator.  The verifier requires the `new -> next* ->
+// destroy` lifecycle on every path, so this statement is ALWAYS rendered
+// as the complete triple (see renderIter) -- it is never partial.
 //
-// The loop variable `sfN` is a valid `struct mptcp_subflow_context *`
-// inside the loop (the `while` condition is the KF_RET_NULL NULL-check),
-// so the loop body is generated with `sfN` seeded into a fresh pool and
-// the avg_pacing_rate write field re-based onto `sfN`.  The loop body
-// does NOT nest another iterator (allowIter false) and is kept short.
-func genSubflowIter(r *randGen, sop *Prog, varId *int) Stmt {
+// The loop variable (`sfN` / `tN`) is a valid element pointer inside the
+// loop (the `while` condition is the KF_RET_NULL NULL-check), so the loop
+// body is generated under the spec's loopScope with it seeded into a fresh
+// pool.  The loop body does NOT nest another iterator and is kept short.
+// Draw order: the `new` arguments (only when there is a choice), then the
+// loop body -- so the MPTCP sequence, whose one candidate costs no draw,
+// is exactly the fork's.
+func genIter(r *randGen, sop *Prog, varId *int) Stmt {
+	surf := sop.surface()
+	it := surf.iter
 	id := *varId
 	*varId++
-	sfVar := fmt.Sprintf("sf%d", id)
-
-	// The loop body sees `sfN` (the per-iteration subflow) plus the
-	// callback's `msk` and its `(struct sock *)` cast.  Writes are
-	// confined to the subflow field re-based onto `sfN`; reading/writing
-	// msk->snd_burst is also valid inside the loop.
-	loopScope := bodyScope{
-		pool: []typedVal{
-			{expr: "msk", ctype: "struct mptcp_sock *"},
-			{expr: mskSockExpr, ctype: "struct sock *"},
-			{expr: sfVar, ctype: "struct mptcp_subflow_context *"},
-		},
-		writeFields: []ctxWriteField{
-			{accessor: "msk->snd_burst", ctype: "int"},
-			{accessor: sfVar + "->avg_pacing_rate", ctype: "unsigned long"},
-		},
-		allowIter:    false,
-		requireWrite: false,
-		noReturn:     true, // no `return` inside the loop -- see noReturn
-		minStmt:      0,
-		maxStmt:      3,
+	elem := fmt.Sprintf("%s%d", it.elemPrefix, id)
+	args := it.newArgs[0]
+	if len(it.newArgs) > 1 {
+		args = it.newArgs[r.Intn(len(it.newArgs))]
 	}
-	loopBody := genBody(r, sop, loopScope, varId)
-
+	loopBody := genBody(r, sop, it.loopScope(surf, elem), varId)
 	return Stmt{
 		Kind:         StmtSubflowIter,
 		IterId:       id,
-		Var:          sfVar,
-		CType:        "struct mptcp_subflow_context *",
-		IterSockExpr: "(struct sock *)msk",
+		Var:          elem,
+		CType:        it.elemType,
+		IterSockExpr: args,
 		IterBody:     loopBody,
 	}
+}
+
+// mptcpSubflowIter is the MPTCP surface's iterator: the open-coded subflow
+// iterator over `(struct sock *)msk`.  The loop body sees `sfN` (the
+// per-iteration subflow) plus the callback's `msk` and its `(struct sock
+// *)` cast.  Writes are confined to the subflow field re-based onto `sfN`;
+// reading/writing msk->snd_burst is also valid inside the loop.  The scope
+// is exactly the fork's (golden-pinned draw sequence).
+var mptcpSubflowIter = &iterSpec{
+	comment:    "/* BRF-generated subflow iterator. */",
+	elemPrefix: "sf",
+	elemType:   "struct mptcp_subflow_context *",
+	newArgs:    []string{"(struct sock *)msk"},
+	loopScope: func(surf *Surface, sfVar string) bodyScope {
+		return bodyScope{
+			pool: []typedVal{
+				{expr: "msk", ctype: "struct mptcp_sock *"},
+				{expr: mskSockExpr, ctype: "struct sock *"},
+				{expr: sfVar, ctype: "struct mptcp_subflow_context *"},
+			},
+			writeFields: []ctxWriteField{
+				{accessor: "msk->snd_burst", ctype: "int"},
+				{accessor: sfVar + "->avg_pacing_rate", ctype: "unsigned long"},
+			},
+			allowIter:    false,
+			requireWrite: false,
+			noReturn:     true, // no `return` inside the loop -- see noReturn
+			minStmt:      0,
+			maxStmt:      3,
+		}
+	},
 }
 
 // instanceField is one callback entry of a struct_ops instance: the
@@ -1693,6 +1850,32 @@ type callbackSpec struct {
 	// would make the BPF_PROG wrapper load ctx[0], which the verifier
 	// rejects against a zero-argument member prototype.
 	noCtx bool
+	// sleepable / bodyGuard are copied to Callback.Sleepable / BodyGuard;
+	// see there.
+	sleepable bool
+	bodyGuard string
+}
+
+// iterSpec describes a surface's open-coded kernel iterator: what the
+// StmtSubflowIter statement kind generates and renders for it.  The three
+// kfuncs come from Surface.iterKfuncs, in new / next / destroy order; the
+// iterator's opaque type is the first parameter type of `new`.
+type iterSpec struct {
+	// comment is the verbatim line rendered above the statement.
+	comment string
+	// elemPrefix names the loop variable (`sf` -> sf0, `t` -> t3); the id
+	// is the shared varId counter, so it never collides with a local.
+	elemPrefix string
+	// elemType is the C type of the loop variable, the `*_next` return.
+	elemType string
+	// newArgs are the candidate argument texts after `&itN` in the `*_new`
+	// call.  One is drawn only when there is more than one (a single
+	// candidate costs no draw, which keeps the MPTCP golden sequence).
+	newArgs []string
+	// loopScope builds the bodyScope the loop body is generated under,
+	// given the loop variable; it must be noReturn (a `return` inside the
+	// loop would skip `*_destroy`) and must not nest another iterator.
+	loopScope func(surf *Surface, elemVar string) bodyScope
 }
 
 // Surface captures everything that was hard-coded for the MPTCP
@@ -1722,9 +1905,18 @@ type Surface struct {
 	ctxType string
 	ctxVar  string
 	// kfuncs / iterKfuncs are the callable kfunc set and the (optional)
-	// iterator kfunc set for this surface.
+	// iterator kfunc set for this surface (new / next / destroy order).
 	kfuncs     []Kfunc
 	iterKfuncs []Kfunc
+	// iter describes the iterator statement built on iterKfuncs; nil
+	// means the surface has no iterator statement kind (allowIter scopes
+	// then never offer one).
+	iter *iterSpec
+	// preamble is verbatim C text rendered after the kfunc externs and
+	// before the callbacks (e.g. a `#define` the fixed prologue /
+	// epilogue text and the generated candidates name).  Empty on the
+	// older surfaces.
+	preamble string
 	// iterInPrologue is true when a callback's FIXED prologue text itself
 	// calls the iterator kfuncs (MPTCP get_send fetches its subflow
 	// through the iterator), so their externs are always rendered -- not
@@ -1845,6 +2037,7 @@ var MptcpSched = &Surface{
 	ctxVar:         "msk",
 	kfuncs:         mptcpSchedKfuncs,
 	iterKfuncs:     mptcpSubflowIterKfuncs,
+	iter:           mptcpSubflowIter,
 	iterInPrologue: true,
 	writeFields:    mptcpSchedWriteFields,
 	prologueKfuncNames: []string{
@@ -2048,7 +2241,7 @@ func schedExtTaskScope(surf *Surface, extra ...typedVal) bodyScope {
 	return bodyScope{
 		pool:         append(pool, extra...),
 		writeFields:  surf.resolveWriteFields(),
-		allowIter:    false,
+		allowIter:    true, // row B: the USER_DSQ iterator (schedExtDsqIter)
 		requireWrite: false,
 		noReturn:     true,
 		allowIf:      true,
@@ -2082,9 +2275,10 @@ const schedExtCpuPrologue = "\t__s32 cpu = scx_bpf_task_cpu(p);\n\n"
 
 // schedExtTerminal is the enqueue scope's terminal insert: every path of
 // ops.enqueue ends in exactly one scx_bpf_dsq_insert of `p` to a DRAINED
-// builtin DSQ -- the global DSQ (the core consumes it before and after
-// ops.dispatch), this CPU's local DSQ, or the task's CPU's local DSQ
-// (LOCAL_ON | cpu, the kernel kicks the target).  No user DSQ (row B).  The
+// DSQ -- the global DSQ (the core consumes it before and after
+// ops.dispatch), this CPU's local DSQ, the task's CPU's local DSQ
+// (LOCAL_ON | cpu, the kernel kicks the target), or (row B) USER_DSQ,
+// which dispatch's fixed epilogue drains on every call.  The
 // slice and enqueue flags are the fuzzed dimensions: slice 0 keeps the
 // residual slice, SCX_SLICE_INF makes the task run until it blocks or is
 // kicked (a stall of OTHER tasks queued behind a CPU-bound SLICE_INF task
@@ -2095,7 +2289,7 @@ const schedExtCpuPrologue = "\t__s32 cpu = scx_bpf_task_cpu(p);\n\n"
 var schedExtTerminal = &terminalInsert{
 	kfunc:    "scx_bpf_dsq_insert",
 	task:     "p",
-	dsqIDs:   []string{"SCX_DSQ_GLOBAL", "SCX_DSQ_LOCAL", "SCX_DSQ_LOCAL_ON | cpu"},
+	dsqIDs:   []string{"SCX_DSQ_GLOBAL", "SCX_DSQ_LOCAL", "SCX_DSQ_LOCAL_ON | cpu", "USER_DSQ"},
 	slices:   []string{"0", "SCX_SLICE_DFL", "SCX_SLICE_DFL / 4", "1000", "SCX_SLICE_INF"},
 	enqFlags: []string{"SCX_ENQ_PREEMPT", "SCX_ENQ_HEAD", "enq_flags"},
 }
@@ -2122,9 +2316,34 @@ var schedExtOpsFlagBits = []uint64{
 // and tooling that classify a generated scheduler.
 const SchedExtOpsSwitchPartial = uint64(1 << 3)
 
+// SchedExtOpsAlwaysEnqImmed is SCX_OPS_ALWAYS_ENQ_IMMED (bit 7).  Drawn at
+// a LOWER probability than the other bits (schedExtFlagTenths): with it
+// set every local insert is IMMED ("run now or be reenqueued"), and the
+// Phase-2 soak showed two PREEMPT|HEAD tasks on one busy CPU displacing
+// each other until the kernel's 256-reenqueue limit ejected the scheduler
+// -- a by-spec ejection, reached in 6 of the 21 programs (of 64) that drew
+// the bit at p=0.3, i.e. ~9% of all programs.  The bit stays reachable
+// (it is the only way into the 2026 IMMED / reenqueue-limit code), at a
+// rate that keeps the by-spec ejection to a few percent of programs.
+const SchedExtOpsAlwaysEnqImmed = uint64(1 << 7)
+
+// schedExtFlagTenths is the per-bit draw probability of `.flags`, in
+// tenths: 3 for most bits, 4 for SWITCH_PARTIAL (the design's p~0.3-0.5
+// fuzzed bit), 1 for ALWAYS_ENQ_IMMED (see SchedExtOpsAlwaysEnqImmed).
+func schedExtFlagTenths(bit uint64) int {
+	switch bit {
+	case SchedExtOpsSwitchPartial:
+		return 4
+	case SchedExtOpsAlwaysEnqImmed:
+		return 1
+	}
+	return 3
+}
+
 // SchedExt is the THIRD struct_ops surface: a fuzzed cpu-form
-// `sched_ext_ops` BPF scheduler, row A of the sched_ext design (builtin
-// DSQs, non-sleepable callbacks).  Ground truth is kernel/sched/ext/ext.c
+// `sched_ext_ops` BPF scheduler, row B of the sched_ext design (builtin
+// DSQs plus one user DSQ created by a sleepable init, drained by dispatch,
+// walked by the DSQ iterator).  Ground truth is kernel/sched/ext/ext.c
 // (writable task fields, kfunc sets and their per-op filter, init_member's
 // validation of the instance members) and internal.h / include/linux/
 // sched/ext.h (the enums the rendered text names); the shape follows
@@ -2149,14 +2368,18 @@ var SchedExt = &Surface{
 	ctxType:        "struct task_struct *",
 	ctxVar:         "p",
 	kfuncs:         schedExtKfuncs,
-	iterKfuncs:     nil,
+	iterKfuncs:     schedExtDsqIterKfuncs,
+	iter:           schedExtDsqIter,
+	preamble:       schedExtPreamble,
 	writeFields:    schedExtWriteFields,
 	prologueKfuncNames: []string{
 		"scx_bpf_task_cpu",
+		"scx_bpf_create_dsq",        // init's fixed prologue
+		"scx_bpf_dsq_move_to_local", // dispatch's fixed epilogue
 	},
 	kfuncExternComment: "/* sched_ext kfuncs (kernel/sched/ext/ext.c), BPF-visible prototypes. */",
-	iterExternComment:  "",
-	headerComment:      "/* Generated sched_ext struct_ops scheduler (row A: builtin DSQs). */",
+	iterExternComment:  "/* sched_ext DSQ-iterator kfuncs (kernel/sched/ext/ext.c). */",
+	headerComment:      "/* Generated sched_ext struct_ops scheduler (row B: builtin DSQs + one user DSQ). */",
 	instanceCallbackOrder: []instanceField{
 		{"_select_cpu", "\t\t"},
 		{"_enqueue", "\t\t"},
@@ -2183,11 +2406,7 @@ var SchedExt = &Surface{
 		{Field: "flags", Sep: "\t\t\t", gen: func(r *randGen) uint64 {
 			var v uint64
 			for _, bit := range schedExtOpsFlagBits {
-				p := 3
-				if bit == SchedExtOpsSwitchPartial {
-					p = 4
-				}
-				if r.Intn(10) < p {
+				if r.Intn(10) < schedExtFlagTenths(bit) {
 					v |= bit
 				}
 			}
@@ -2217,6 +2436,7 @@ var SchedExt = &Surface{
 						{expr: "wake_flags", ctype: "__u64"},
 					},
 					writeFields: surf.resolveWriteFields(),
+					allowIter:   true,
 					noReturn:    true,
 					allowIf:     true,
 					minStmt:     1,
@@ -2244,17 +2464,22 @@ var SchedExt = &Surface{
 		},
 		{
 			// void (*dispatch)(s32 cpu, struct task_struct *prev)
-			// `prev` is nullable (the kernel stub names it prev__nullable),
-			// so the prologue NULL-checks it; the body then sees it as the
-			// trusted task and may call the dispatch-only kfunc.  Row A
-			// dispatches nothing itself: the core drains the global DSQ
-			// around this call.
+			// `prev` is nullable (the kernel stub names it prev__nullable):
+			// the generated body runs inside `if (prev) { ... }`, where it
+			// sees prev as the trusted task and may call the dispatch-only
+			// kfunc; the FIXED epilogue then drains one task from USER_DSQ
+			// on EVERY call -- with prev == NULL too (an idle CPU looking
+			// for work), which an early-return guard would have skipped and
+			// so stalled anything enqueued to USER_DSQ.  The core drains the
+			// global DSQ around this call itself.
 			suffix:       "_dispatch",
 			retType:      "void",
 			ctxType:      "__s32 ", // a scalar ctx: the renderer joins type and name verbatim
 			ctxVar:       "cpu",
 			argsAfterCtx: []string{"struct task_struct *prev"},
-			prologue:     "\tif (!prev)\n\t\treturn;\n\n",
+			bodyGuard:    "prev",
+			epilogue: "\t/* Row-B drain: one task from the user DSQ to this CPU's local DSQ. */\n" +
+				"\tscx_bpf_dsq_move_to_local(USER_DSQ);\n",
 			scope: func(surf *Surface) bodyScope {
 				fields := make([]ctxWriteField, len(surf.writeFields))
 				for i, f := range surf.writeFields {
@@ -2266,6 +2491,7 @@ var SchedExt = &Surface{
 						{expr: "prev", ctype: "struct task_struct *"},
 					},
 					writeFields: fields,
+					allowIter:   true,
 					noReturn:    true,
 					allowIf:     true,
 					minStmt:     1,
@@ -2294,23 +2520,32 @@ var SchedExt = &Surface{
 			},
 		},
 		{
-			// s32 (*init)(void) -- no ctx at all (noCtx); returns 0 so the
-			// enable proceeds.
-			suffix:   "_init",
-			retType:  "__s32",
-			noCtx:    true,
+			// s32 (*init)(void) -- no ctx at all (noCtx).  Row B: a SLEEPABLE
+			// program whose fixed prologue creates USER_DSQ (KF_SLEEPABLE
+			// kfunc) and fails the enable on error (the only failures are
+			// -ENOMEM / -ENODEV; a scheduler whose user DSQ does not exist
+			// would eject on its first insert); returns 0 so the enable
+			// proceeds.
+			suffix:    "_init",
+			retType:   "__s32",
+			noCtx:     true,
+			sleepable: true,
+			prologue: "\t__s32 ret = scx_bpf_create_dsq(USER_DSQ, -1);\n\n" +
+				"\tif (ret)\n\t\treturn ret;\n\n",
 			epilogue: "\treturn 0;\n",
 			scope:    schedExtNoTaskScope,
 		},
 		{
 			// void (*exit)(struct scx_exit_info *info) -- the exit info is
 			// not exposed to the body (its fields are read-only ctx, and the
-			// scheduler is already disabled when this runs).
-			suffix:  "_exit",
-			retType: "void",
-			ctxType: "struct scx_exit_info *",
-			ctxVar:  "ei",
-			scope:   schedExtNoTaskScope,
+			// scheduler is already disabled when this runs).  Sleepable like
+			// init (the kernel allows it; the sleepable exit path is surface).
+			suffix:    "_exit",
+			retType:   "void",
+			ctxType:   "struct scx_exit_info *",
+			ctxVar:    "ei",
+			sleepable: true,
+			scope:     schedExtNoTaskScope,
 		},
 	},
 	renderOrder: []string{"_select_cpu", "_enqueue", "_dispatch", "_running", "_stopping", "_init", "_exit"},
@@ -2396,6 +2631,8 @@ func generate(r *randGen, surf *Surface) *Prog {
 			ArgsAfterCtx: spec.argsAfterCtx,
 			Prologue:     spec.prologue,
 			Epilogue:     spec.epilogue,
+			Sleepable:    spec.sleepable,
+			BodyGuard:    spec.bodyGuard,
 			Body:         genBody(r, sop, spec.scope(surf), &varId),
 		}
 	}
@@ -2519,7 +2756,7 @@ func (sop *Prog) renderBody(s *bytes.Buffer, body []Stmt, indent, guardRet strin
 			fmt.Fprintf(s, "%s/* Generated terminal insert (liveness). */\n", indent)
 			fmt.Fprintf(s, "%s%s(%s);\n", indent, kf.Name, joinArgs(st.KfuncArgs))
 		case StmtSubflowIter:
-			sop.renderSubflowIter(s, st, indent, guardRet)
+			sop.renderIter(s, st, indent, guardRet)
 		case StmtIfElse:
 			sop.renderIfElse(s, st, indent, guardRet)
 		}
@@ -2587,27 +2824,30 @@ func (sop *Prog) renderIfElse(s *bytes.Buffer, st Stmt, indent, guardRet string)
 	fmt.Fprintf(s, "%s}\n", indent)
 }
 
-// renderSubflowIter renders one SubflowIter as the complete,
-// verifier-required `new -> next* -> destroy` triple -- ALWAYS all three
-// together, never partial.  The `while` condition is the KF_RET_NULL
-// NULL-check on `bpf_iter_mptcp_subflow_next`; inside the loop `sfN` is a
-// valid `struct mptcp_subflow_context *`.  Modelled on the kernel
-// selftest `tools/testing/selftests/bpf/progs/mptcp_bpf_rr.c`, whose
-// `bpf_for_each(mptcp_subflow, subflow, (struct sock *)msk)` expands to
-// exactly this idiom; the socket argument is `(struct sock *)msk`.
-func (sop *Prog) renderSubflowIter(s *bytes.Buffer, st Stmt, indent, guardRet string) {
+// renderIter renders one Iter as the complete, verifier-required `new ->
+// next* -> destroy` triple -- ALWAYS all three together, never partial.
+// The `while` condition is the KF_RET_NULL NULL-check on `*_next`; inside
+// the loop the element variable is a valid element pointer.  Modelled on
+// the kernel selftest `tools/testing/selftests/bpf/progs/mptcp_bpf_rr.c`,
+// whose `bpf_for_each(mptcp_subflow, subflow, (struct sock *)msk)` expands
+// to exactly this idiom (and on scx_qmap's `bpf_for_each(scx_dsq, p,
+// dsq_id, flags)` for sched_ext).  The kfunc names come from the program's
+// IterKfuncs (new / next / destroy); the iterator's opaque type is `new`'s
+// first parameter type without its `*`.
+func (sop *Prog) renderIter(s *bytes.Buffer, st Stmt, indent, guardRet string) {
+	surf := sop.surface()
+	newKf, nextKf, destroyKf := sop.IterKfuncs[0], sop.IterKfuncs[1], sop.IterKfuncs[2]
+	itType := strings.TrimSuffix(newKf.ArgTypes[0], " *")
 	itVar := fmt.Sprintf("it%d", st.IterId)
-	sfVar := st.Var
-	fmt.Fprintf(s, "%s/* BRF-generated subflow iterator. */\n", indent)
-	fmt.Fprintf(s, "%sstruct bpf_iter_mptcp_subflow %s;\n", indent, itVar)
-	fmt.Fprintf(s, "%sstruct mptcp_subflow_context *%s;\n", indent, sfVar)
-	fmt.Fprintf(s, "%sbpf_iter_mptcp_subflow_new(&%s, %s);\n",
-		indent, itVar, st.IterSockExpr)
-	fmt.Fprintf(s, "%swhile ((%s = bpf_iter_mptcp_subflow_next(&%s))) {\n",
-		indent, sfVar, itVar)
+	elem := st.Var
+	fmt.Fprintf(s, "%s%s\n", indent, surf.iter.comment)
+	fmt.Fprintf(s, "%s%s %s;\n", indent, itType, itVar)
+	fmt.Fprintf(s, "%s%s%s;\n", indent, st.CType, elem)
+	fmt.Fprintf(s, "%s%s(&%s, %s);\n", indent, newKf.Name, itVar, st.IterSockExpr)
+	fmt.Fprintf(s, "%swhile ((%s = %s(&%s))) {\n", indent, elem, nextKf.Name, itVar)
 	sop.renderBody(s, st.IterBody, indent+"\t", guardRet)
 	fmt.Fprintf(s, "%s}\n", indent)
-	fmt.Fprintf(s, "%sbpf_iter_mptcp_subflow_destroy(&%s);\n", indent, itVar)
+	fmt.Fprintf(s, "%s%s(&%s);\n", indent, destroyKf.Name, itVar)
 }
 
 // Render renders a generated struct_ops program to a complete BPF C
@@ -2647,6 +2887,9 @@ func (sop *Prog) Render() string {
 		}
 	}
 	fmt.Fprintf(s, "\n")
+	if surf.preamble != "" {
+		fmt.Fprintf(s, "%s\n", surf.preamble)
+	}
 
 	// Callbacks, in the surface's RENDER order (which may differ from the
 	// generation order that fixed the random-draw sequence).
@@ -2655,7 +2898,13 @@ func (sop *Prog) Render() string {
 		if cb == nil {
 			continue
 		}
-		fmt.Fprintf(s, "SEC(\"%s\")\n", surf.progSection)
+		if cb.Sleepable {
+			// libbpf's sleepable struct_ops section; Digest reads the
+			// section name back as the PROG record's sleepable flag.
+			fmt.Fprintf(s, "SEC(\"%s.s\")\n", surf.progSection)
+		} else {
+			fmt.Fprintf(s, "SEC(\"%s\")\n", surf.progSection)
+		}
 		// Signature: `<ret> BPF_PROG(<name><suffix>, <ctx> [, args...])`;
 		// the ctx arg is the surface's unless this callback overrides it.
 		if surf.callbackHasCtx(cb.Suffix) {
@@ -2673,11 +2922,21 @@ func (sop *Prog) Render() string {
 		if cb.Prologue != "" {
 			fmt.Fprint(s, cb.Prologue)
 		}
-		fmt.Fprintf(s, "\t/* BRF-generated body. */\n")
-		if len(cb.Body) == 0 {
-			fmt.Fprintf(s, "\t/* (empty) */\n")
+		// The generated body, inside `if (<guard>) { ... }` when the
+		// callback guards a nullable ctx value (Callback.BodyGuard).
+		indent := "\t"
+		if cb.BodyGuard != "" {
+			fmt.Fprintf(s, "\tif (%s) {\n", cb.BodyGuard)
+			indent = "\t\t"
 		}
-		sop.renderBody(s, cb.Body, "\t", guardReturn(cb.RetType))
+		fmt.Fprintf(s, "%s/* BRF-generated body. */\n", indent)
+		if len(cb.Body) == 0 {
+			fmt.Fprintf(s, "%s/* (empty) */\n", indent)
+		}
+		sop.renderBody(s, cb.Body, indent, guardReturn(cb.RetType))
+		if cb.BodyGuard != "" {
+			fmt.Fprintf(s, "\t}\n")
+		}
 		// Fixed epilogue (verbatim, already indented) -- preceded by a
 		// blank line, matching the MPTCP get_send layout.
 		if cb.Epilogue != "" {

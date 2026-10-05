@@ -1442,9 +1442,14 @@ func TestStructOpsGolden(t *testing.T) {
 			surf: SchedExt,
 			gen:  func(r *randGen) *Prog { return generate(r, SchedExt) },
 			// Pinned at introduction (2026-10, Phase 2 of the sched_ext
-			// surface design): the row-A tables, the enqueue terminal insert
-			// and the four instance fields.
-			want: "1b460cb29716a193ac40fd813076f5c600ea9c8648dfdc93d9e0eeb2c88818d7",
+			// surface design) at 1b460cb29716a193ac40fd813076f5c600ea9c86
+			// 48dfdc93d9e0eeb2c88818d7 (row A).  Re-pinned for row B (Phase
+			// 3): USER_DSQ as a 4th terminal candidate, the DSQ iterator
+			// statement in the non-sleepable scopes (one extra draw per
+			// iterator for its flags), dispatch's `if (prev) {}` guard + drain
+			// epilogue, the sleepable init / exit sections, and the
+			// ALWAYS_ENQ_IMMED bit at p=0.1 (same draw count).
+			want: "3e1fcac9f6f662845d5bef8a884f3f6aa229eca8706c1f6111704f8c6d0c74f1",
 		},
 	} {
 		h := sha256.New()
