@@ -187,6 +187,8 @@ func (spec *Spec) prog() (*Prog, error) {
 			ArgsAfterCtx: cs.argsAfterCtx,
 			Prologue:     cs.prologue,
 			Epilogue:     cs.epilogue,
+			Sleepable:    cs.sleepable,
+			BodyGuard:    cs.bodyGuard,
 			Body:         body,
 		}
 	}
