@@ -36,9 +36,15 @@ import (
 //	type 3 PROG      char member[32]   struct member this callback fills
 //	                 char name[32]     the function symbol (prog_name)
 //	                 u32 func_type_id  this prog's FUNC id in the BTF
-//	                 u32 nkfunc | u32 ninsn | u32 reserved
+//	                 u32 nkfunc | u32 ninsn | u32 flags
 //	                 nkfunc x { u32 insn_idx; char name[64] }
 //	                 ninsn  x 8-byte bpf_insn (kfunc call imm/off unpatched)
+//	                 flags bit 0 (SLEEPABLE): the callback was in section
+//	                 "struct_ops.s" (libbpf's sleepable struct_ops section;
+//	                 sched_ext init / exit) and the loader passes
+//	                 BPF_F_SLEEPABLE at PROG_LOAD.  The word was reserved
+//	                 (zero) before, so every older recipe reads as
+//	                 non-sleepable and no version bump is needed.
 //	type 4 SPEC      u64 kernel_key | spec blob (spec.go)
 //	                 the generative spec this recipe was materialized from
 //	                 and the KernelKey of the vmlinux.h it was compiled
@@ -77,7 +83,13 @@ const (
 	recSpec     = 4
 	recData     = 5
 
-	recipeInstanceFlagLink = 1 << 0
+	recipeInstanceFlagLink  = 1 << 0
+	recipeProgFlagSleepable = 1 << 0
+
+	// Callback programs live in ELF section "struct_ops" or, when
+	// sleepable, in libbpf's sibling "struct_ops" + sleepableSectionSuffix.
+	progSection            = "struct_ops"
+	sleepableSectionSuffix = ".s"
 
 	recipeStructNameLen = 64
 	recipeMemberLen     = 32
@@ -115,6 +127,9 @@ type RecipeProg struct {
 	FuncTypeID uint32
 	Kfuncs     []RecipeKfunc
 	Insns      []byte // ninsn * 8
+	// Sleepable: the callback was in section "struct_ops.s"; the loader
+	// passes BPF_F_SLEEPABLE (PROG flags bit 0).
+	Sleepable bool
 }
 
 // RecipeKfunc is one kfunc call site: the instruction index within the
@@ -274,30 +289,72 @@ func Digest(obj []byte) ([]byte, error) {
 		return ""
 	}
 
-	// --- Callback programs: FUNC symbols in section "struct_ops".
-	progData, progS, err := secData("struct_ops")
-	if err != nil {
-		return nil, err
-	}
-	if progS == nil {
-		return nil, fmt.Errorf("structops: object has no struct_ops program section")
-	}
-	progIdx := secIndex("struct_ops")
+	// --- Callback programs: FUNC symbols in section "struct_ops" and, for
+	// sleepable callbacks, "struct_ops.s" (the section name is the only
+	// thing that marks a program sleepable, exactly as libbpf reads it).
+	// Each section's kfunc call sites are the relocs of its own
+	// .rel<section> against undefined symbols.
 	type progSym struct {
-		sym   elf.Symbol
-		start uint64
-		end   uint64
+		sym       elf.Symbol
+		start     uint64
+		end       uint64
+		data      []byte // the program section's bytes
+		sleepable bool
 	}
 	var progSyms []progSym
-	for _, s := range syms {
-		if int(s.Section) == progIdx && elf.ST_TYPE(s.Info) == elf.STT_FUNC {
-			if s.Size == 0 || s.Size%bpfInsnSize != 0 || s.Value+s.Size > uint64(len(progData)) {
-				return nil, fmt.Errorf("structops: prog %s has bad extent", s.Name)
-			}
-			progSyms = append(progSyms, progSym{s, s.Value, s.Value + s.Size})
+	kfuncs := map[string][]RecipeKfunc{}
+	sawSection := false
+	for _, sec := range []string{progSection, progSection + sleepableSectionSuffix} {
+		progData, progS, err := secData(sec)
+		if err != nil {
+			return nil, err
 		}
+		if progS == nil {
+			continue
+		}
+		sawSection = true
+		progIdx := secIndex(sec)
+		var inSec []progSym
+		for _, s := range syms {
+			if int(s.Section) == progIdx && elf.ST_TYPE(s.Info) == elf.STT_FUNC {
+				if s.Size == 0 || s.Size%bpfInsnSize != 0 || s.Value+s.Size > uint64(len(progData)) {
+					return nil, fmt.Errorf("structops: prog %s has bad extent", s.Name)
+				}
+				inSec = append(inSec, progSym{s, s.Value, s.Value + s.Size, progData, sec != progSection})
+			}
+		}
+		sort.Slice(inSec, func(i, j int) bool { return inSec[i].start < inSec[j].start })
+		rel := ".rel" + sec
+		if err := forEachRel(f, rel, func(off uint64, typ uint32, symIdx uint32) error {
+			s, ok := symAt(symIdx)
+			if !ok {
+				return fmt.Errorf("structops: %s: bad symbol index %d", rel, symIdx)
+			}
+			if s.Section != elf.SHN_UNDEF {
+				return fmt.Errorf("structops: %s: reloc against defined symbol %s (subprog calls are not supported)", rel, s.Name)
+			}
+			if typ != rBPF64_32 {
+				return fmt.Errorf("structops: %s: unexpected reloc type %d for %s", rel, typ, s.Name)
+			}
+			if len(s.Name) >= recipeKfuncNameLen {
+				return fmt.Errorf("structops: kfunc name %q too long", s.Name)
+			}
+			for _, p := range inSec {
+				if off >= p.start && off < p.end {
+					kfuncs[p.sym.Name] = append(kfuncs[p.sym.Name],
+						RecipeKfunc{InsnIdx: uint32((off - p.start) / bpfInsnSize), Name: s.Name})
+					return nil
+				}
+			}
+			return fmt.Errorf("structops: %s: offset %#x in no program", rel, off)
+		}); err != nil {
+			return nil, err
+		}
+		progSyms = append(progSyms, inSec...)
 	}
-	sort.Slice(progSyms, func(i, j int) bool { return progSyms[i].start < progSyms[j].start })
+	if !sawSection {
+		return nil, fmt.Errorf("structops: object has no struct_ops program section")
+	}
 	if len(progSyms) == 0 {
 		return nil, fmt.Errorf("structops: no callback programs")
 	}
@@ -360,34 +417,6 @@ func Digest(obj []byte) ([]byte, error) {
 		data = append(data, RecipeData{Member: m.name, Size: size, Value: v})
 	}
 
-	// Kfunc call sites: .relstruct_ops relocs against undefined symbols.
-	kfuncs := map[string][]RecipeKfunc{}
-	if err := forEachRel(f, ".relstruct_ops", func(off uint64, typ uint32, symIdx uint32) error {
-		s, ok := symAt(symIdx)
-		if !ok {
-			return fmt.Errorf("structops: .relstruct_ops: bad symbol index %d", symIdx)
-		}
-		if s.Section != elf.SHN_UNDEF {
-			return fmt.Errorf("structops: .relstruct_ops: reloc against defined symbol %s (subprog calls are not supported)", s.Name)
-		}
-		if typ != rBPF64_32 {
-			return fmt.Errorf("structops: .relstruct_ops: unexpected reloc type %d for %s", typ, s.Name)
-		}
-		if len(s.Name) >= recipeKfuncNameLen {
-			return fmt.Errorf("structops: kfunc name %q too long", s.Name)
-		}
-		for _, p := range progSyms {
-			if off >= p.start && off < p.end {
-				kfuncs[p.sym.Name] = append(kfuncs[p.sym.Name],
-					RecipeKfunc{InsnIdx: uint32((off - p.start) / bpfInsnSize), Name: s.Name})
-				return nil
-			}
-		}
-		return fmt.Errorf("structops: .relstruct_ops: offset %#x in no program", off)
-	}); err != nil {
-		return nil, err
-	}
-
 	r := &Recipe{BTF: b.data, StructName: structName, Link: link, Data: data} // b.data: post-fixup (may be rebuilt)
 	for _, p := range progSyms {
 		member, ok := progMember[p.sym.Name]
@@ -406,7 +435,8 @@ func Digest(obj []byte) ([]byte, error) {
 			Name:       p.sym.Name,
 			FuncTypeID: funcID,
 			Kfuncs:     kfuncs[p.sym.Name],
-			Insns:      progData[p.start:p.end],
+			Insns:      p.data[p.start:p.end],
+			Sleepable:  p.sleepable,
 		})
 	}
 	return r.Marshal(), nil
@@ -488,7 +518,11 @@ func (r *Recipe) Marshal() []byte {
 		pw.u32(p.FuncTypeID)
 		pw.u32(uint32(len(p.Kfuncs)))
 		pw.u32(uint32(len(p.Insns) / bpfInsnSize))
-		pw.u32(0)
+		flags := uint32(0)
+		if p.Sleepable {
+			flags |= recipeProgFlagSleepable
+		}
+		pw.u32(flags)
 		for _, k := range p.Kfuncs {
 			pw.u32(k.InsnIdx)
 			pw.str(k.Name, recipeKfuncNameLen)
@@ -613,6 +647,7 @@ func ParseRecipe(data []byte) (*Recipe, error) {
 				Member:     cstr(p[:recipeMemberLen]),
 				Name:       cstr(p[recipeMemberLen : recipeMemberLen+recipeProgNameLen]),
 				FuncTypeID: le.Uint32(p[hdr-16:]),
+				Sleepable:  le.Uint32(p[hdr-4:])&recipeProgFlagSleepable != 0,
 			}
 			nk, ni := int(le.Uint32(p[hdr-12:])), int(le.Uint32(p[hdr-8:]))
 			q := hdr
