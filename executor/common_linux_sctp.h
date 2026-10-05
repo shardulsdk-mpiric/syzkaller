@@ -394,7 +394,6 @@ static long syz_sctp_pair_init(volatile long a0)
 			}
 		}
 		close(cap_fd);
-		cap_fd = -1;
 		// Vs (the server's tag) is the load-bearing one for the server-
 		// directed inject; mark valid once it is captured. The sequence
 		// rebase may need either initial TSN, so it is valid only with both.
