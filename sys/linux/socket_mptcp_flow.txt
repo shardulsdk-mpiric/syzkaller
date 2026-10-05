@@ -47,13 +47,20 @@ syz_mptcp_pair_close(pair mptcp_pair)
 # server SYN-ACK, captures R_A/R_B, and recomputes the ACK HMAC from the captured
 # nonces + MP_CAPABLE keys, asserting it matches the kernel's (debug-only oracle).
 # SELFVERIFY needs the pair created with MPTCP_INIT_CAPTURE_KEYS (else it reports
-# no-keys). Harness-only constants (see .const + #define).
+# no-keys). HMAC_FORGE (5) is ingress Phase 1: it OVERWRITES the client ACK HMAC
+# with a VALID value recomputed from the captured nonces + MP_CAPABLE keys (the
+# same value SELFVERIFY proved == the kernel's), so the subflow is ACCEPTED via a
+# harness-authored HMAC that crossed subflow_hmac_valid -- reaching the
+# subflow_syn_recv_sock ref-transfer region. Same-length rewrite. Like SELFVERIFY it
+# needs MPTCP_INIT_CAPTURE_KEYS (else it DROPs the ACK, fail-loud -> no accept).
+# Harness-only constants (see .const + #define).
 define MPTCP_MUT_NONE	0
 define MPTCP_MUT_HMAC_FLIP	1
 define MPTCP_MUT_HMAC_ZERO	2
 define MPTCP_MUT_NONCE_FLIP	3
 define MPTCP_MUT_CRYPTO_SELFVERIFY	4
-mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_MUT_NONCE_FLIP, MPTCP_MUT_CRYPTO_SELFVERIFY
+define MPTCP_MUT_HMAC_FORGE	5
+mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_MUT_NONCE_FLIP, MPTCP_MUT_CRYPTO_SELFVERIFY, MPTCP_MUT_HMAC_FORGE
 syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], mut_op flags[mptcp_mut_ops]) mptcp_subflow (remote_cover)
 syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 

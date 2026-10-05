@@ -1127,6 +1127,88 @@ static long syz_mptcp_pair_close(volatile long a0)
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
 
+// Pull one named SNMP counter out of the two-line "MPTcpExt:" block of
+// /proc/net/netstat: a header line of column names followed by a value line, both
+// prefixed "MPTcpExt:". Returns the value for `name`, or -1 if absent. Walks both
+// lines token-for-token so the column index need not be hard-coded. Debug-only.
+static inline long syz_mptcp_mib_get(const char* h, const char* h_end,
+				     const char* v, const char* v_end, const char* name)
+{
+	size_t namelen = strlen(name);
+	// skip the leading "MPTcpExt:" label on both lines
+	while (h < h_end && *h != ' ')
+		h++;
+	while (v < v_end && *v != ' ')
+		v++;
+	while (h < h_end) {
+		while (h < h_end && *h == ' ')
+			h++;
+		while (v < v_end && *v == ' ')
+			v++;
+		if (h >= h_end)
+			break;
+		const char* htok = h;
+		while (h < h_end && *h != ' ')
+			h++;
+		const char* vtok = v;
+		while (v < v_end && *v != ' ')
+			v++;
+		if ((size_t)(h - htok) == namelen && memcmp(htok, name, namelen) == 0) {
+			long x = 0;
+			for (const char* p = vtok; p < v_end && *p >= '0' && *p <= '9'; p++)
+				x = x * 10 + (*p - '0');
+			return x;
+		}
+	}
+	return -1;
+}
+
+// Debug-only Phase-1 directional oracle: read the MP_JOIN ACK accept/reject SNMP
+// counters from /proc/net/netstat IN THE CURRENT (worker) netns -- the netns the
+// join ran in, which the execprog child creates fresh per run, so each counter's
+// absolute value is its +N delta for this join. FORGE (accept) -> MPJoinAckRx +1 /
+// MPJoinAckHMacFailure +0; the HMAC-corrupting ops (reject) -> the reverse. Reads
+// nothing onto the wire and is stripped from the csource reproducer (debug-only).
+static inline void syz_mptcp_dbg_mib(const char* tag, long pair_slot)
+{
+	int fd = open("/proc/net/netstat", O_RDONLY);
+	if (fd < 0)
+		return;
+	static char nsbuf[16384];
+	int n = 0, r;
+	while (n < (int)sizeof(nsbuf) - 1 &&
+	       (r = read(fd, nsbuf + n, sizeof(nsbuf) - 1 - n)) > 0)
+		n += r;
+	close(fd);
+	nsbuf[n] = 0;
+	char* h = strstr(nsbuf, "MPTcpExt:");
+	if (!h)
+		return;
+	char* h_end = strchr(h, '\n');
+	if (!h_end)
+		return;
+	char* v = strstr(h_end, "MPTcpExt:");
+	if (!v)
+		return;
+	char* v_end = strchr(v, '\n');
+	if (!v_end)
+		v_end = nsbuf + n;
+	// Call syz_mptcp_mib_get directly in the debug() args (no intermediate locals
+	// -- an initialized-but-unread local trips -Werror=unused-variable in the
+	// debug-stripped csource reproducer, which -Wno-unused-but-set-variable does
+	// NOT cover). syz_mptcp_mib_get is static inline, so when csource strips this
+	// whole debug() call it simply goes unreferenced without an unused-function
+	// warning (same reason the other static-inline helpers are safe).
+	debug("syz_mptcp_join_subflow: pair=%ld %s MPTcpExt "
+	      "MPJoinAckRx=%ld MPJoinAckHMacFailure=%ld "
+	      "MPJoinSynAckRx=%ld MPJoinSynAckHMacFailure=%ld\n",
+	      pair_slot, tag,
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPJoinAckRx"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPJoinAckHMacFailure"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPJoinSynAckRx"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPJoinSynAckHMacFailure"));
+}
+
 // The MPTCP_EVENT_SUB_ESTABLISHED / MPTCP_ATTR_* values used below are mirrored
 // with the other uapi enums under the MPTCP_PM_NAME sentinel near the top of
 // this file.
@@ -1313,9 +1395,10 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 			__atomic_store_n(&syz_mptcp_subflow_pool[sub_slot].in_use, false, __ATOMIC_RELEASE);
 			return -1;
 		}
-		// keys/keys_valid are consumed only by MPTCP_MUT_CRYPTO_SELFVERIFY (Phase 0),
-		// which recomputes the ACK HMAC from the captured nonces + these MP_CAPABLE
-		// keys. The mutation ops ignore them. keys_valid requires the pair to have
+		// keys/keys_valid are consumed by MPTCP_MUT_CRYPTO_SELFVERIFY (Phase 0) and
+		// MPTCP_MUT_HMAC_FORGE (Phase 1): both recompute the ACK HMAC from the captured
+		// nonces + these MP_CAPABLE keys (SELFVERIFY to compare, FORGE to overwrite).
+		// The bit/zero mutation ops ignore them. keys_valid requires the pair to have
 		// been created with MPTCP_INIT_CAPTURE_KEYS.
 		syz_mptcp_mut_publish(local_addr_be, mut_op,
 				      pair->local_key, pair->remote_key,
@@ -1353,6 +1436,10 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	if (retries == MPTCP_SUBFLOW_INFO_MAX_RETRIES) {
 		debug("syz_mptcp_join_subflow: pair=%ld subflow not established within ~1s\n",
 		      pair_slot);
+		// Reject path: log the MP_JOIN ACK SNMP counters (same worker netns). A
+		// HMAC-corrupting op (FLIP/ZERO) shows MPJoinAckHMacFailure +1 / AckRx +0.
+		if (mut_op != MPTCP_MUT_NONE)
+			syz_mptcp_dbg_mib("REJECT", pair_slot);
 		if (evfd >= 0)
 			close(evfd);
 		if (mut_op != MPTCP_MUT_NONE)
@@ -1403,6 +1490,33 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 			      "(1=match -1=mismatch -2=no-keys -3=no-nonce 0=pending)\n",
 			      pair_slot, vr);
 		}
+	}
+
+	// Phase-1 FORGE oracle (design ingress_phase1_design.md §2). The join
+	// established (we are past the subflow-count poll), so the worker overwrote the
+	// client ACK HMAC with its computed-valid value and the server accepted it via
+	// subflow_hmac_valid -- a harness-authored accepted subflow. Grace-window the
+	// worker's forge-result release, then log it. debug()-only (stripped from the
+	// csource reproducer), like the SELFVERIFY oracle above.
+	if (mut_op == MPTCP_MUT_HMAC_FORGE) {
+		int fr = syz_mptcp_mut_forge_result();
+		for (int i = 0; i < 20 && fr == MPTCP_FORGE_PENDING; i++) {
+			usleep(5000); // up to ~100ms for the worker's release store
+			fr = syz_mptcp_mut_forge_result();
+		}
+		if (fr == MPTCP_FORGE_WROTE) {
+			debug("syz_mptcp_join_subflow: pair=%ld FORGE_WROTE "
+			      "(wrote a valid ACK HMAC; subflow accepted)\n",
+			      pair_slot);
+		} else {
+			debug("syz_mptcp_join_subflow: pair=%ld FORGE result=%d "
+			      "(1=wrote -2=no-keys -3=no-nonce 0=pending)\n",
+			      pair_slot, fr);
+		}
+		// Accept path: log the MP_JOIN ACK SNMP counters (same worker netns). FORGE
+		// shows MPJoinAckRx +1 / MPJoinAckHMacFailure +0 -- a harness-authored HMAC
+		// crossed subflow_hmac_valid (vs the reject ops' +0 / +1).
+		syz_mptcp_dbg_mib("ACCEPT", pair_slot);
 	}
 
 	// The egress ACK has been sent (and mutated, if requested) by now; retire the

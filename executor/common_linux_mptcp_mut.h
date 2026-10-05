@@ -46,6 +46,15 @@
 #define MPTCP_MUT_HMAC_ZERO 2 // zero the whole ACK HMAC
 #define MPTCP_MUT_NONCE_FLIP 3 // flip one bit of the SYN nonce
 #define MPTCP_MUT_CRYPTO_SELFVERIFY 4 // Phase 0: capture R_A/R_B, recompute+verify the ACK HMAC; no mutation
+// Ingress Phase 1: OVERWRITE the client ACK's 20-byte HMAC with a VALID value
+// recomputed from the captured nonces + MP_CAPABLE keys (the same value SELFVERIFY
+// proved == the kernel's). With unmutated nonces the written bytes are byte-identical
+// to the kernel's own HMAC, so the subflow is ACCEPTED -- but now via a harness-authored
+// HMAC that crossed subflow_hmac_valid, reaching subflow_syn_recv_sock's ref-transfer
+// region. Same-length rewrite (returns len). Needs captured keys + both nonces; if
+// either is missing it DROPs the ACK (fail-loud -> the oracle shows NO accept, rather
+// than letting the kernel's own genuine HMAC mask a capture miss as a clean join).
+#define MPTCP_MUT_HMAC_FORGE 5
 
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
@@ -68,6 +77,13 @@
 #define MPTCP_SELFVERIFY_MISMATCH (-1)
 #define MPTCP_SELFVERIFY_NO_KEYS (-2) // keys_valid was false (pair not CAPTURE_KEYS)
 #define MPTCP_SELFVERIFY_NO_NONCE (-3) // reached ACK before both nonces were captured
+
+// Phase-1 FORGE result codes (published by the worker on the ACK, read by the
+// syscall thread for the debug oracle). Mirror the SELFVERIFY codes.
+#define MPTCP_FORGE_PENDING 0
+#define MPTCP_FORGE_WROTE 1 // wrote a valid HMAC onto the ACK (same-length)
+#define MPTCP_FORGE_NO_KEYS (-2) // keys_valid was false (pair not CAPTURE_KEYS) -> dropped
+#define MPTCP_FORGE_NO_NONCE (-3) // reached ACK before both nonces were captured -> dropped
 
 // The published instruction. Single-writer (the joining syscall thread), single
 // reader class (the NFQUEUE worker). active is the release/acquire gate.
@@ -104,6 +120,9 @@ struct syz_mptcp_mut_spec {
 	uint8 wire_hmac[MPTCP_JOIN_HMAC_LEN]; // the ACK HMAC the kernel emitted
 	uint8 calc_hmac[MPTCP_JOIN_HMAC_LEN]; // our recompute from captured nonces+keys
 	volatile int verify_done; // MPTCP_SELFVERIFY_* (release on publish of result)
+
+	// --- Phase-1 FORGE result (worker-written, syscall-thread-read) ---
+	volatile int forge_done; // MPTCP_FORGE_* (release on publish of result)
 };
 static struct syz_mptcp_mut_spec syz_mptcp_mut;
 
@@ -122,6 +141,7 @@ static inline void syz_mptcp_mut_publish(uint32 src_addr_be, int op,
 	syz_mptcp_mut.have_r_a = 0;
 	syz_mptcp_mut.have_r_b = 0;
 	syz_mptcp_mut.verify_done = MPTCP_SELFVERIFY_PENDING;
+	syz_mptcp_mut.forge_done = MPTCP_FORGE_PENDING;
 	__atomic_store_n(&syz_mptcp_mut.active, 1, __ATOMIC_RELEASE);
 }
 
@@ -135,6 +155,12 @@ static inline void syz_mptcp_mut_retire(void)
 static inline int syz_mptcp_mut_verify_result(void)
 {
 	return __atomic_load_n(&syz_mptcp_mut.verify_done, __ATOMIC_ACQUIRE);
+}
+
+// FORGE result for the syscall thread (MPTCP_FORGE_*). Acquire-loaded.
+static inline int syz_mptcp_mut_forge_result(void)
+{
+	return __atomic_load_n(&syz_mptcp_mut.forge_done, __ATOMIC_ACQUIRE);
 }
 
 // Phase-0 SELFVERIFY: observe one MP_JOIN option (o points at its kind byte, olen
@@ -186,6 +212,58 @@ static inline void syz_mptcp_mut_selfverify_capture(const uint8* o, uint8 olen, 
 	}
 }
 
+// Phase-1 FORGE: observe one MP_JOIN option (o points at its kind byte, olen its
+// length). Reuses the SELFVERIFY capture stash: on the client SYN it stashes R_A, on
+// the server SYN-ACK it stashes R_B (both pass through unmodified), and on the client
+// ACK it OVERWRITES the 20-byte HMAC with HMAC-SHA256(be64(client_key)||be64(server_key),
+// R_A||R_B)[0:20] -- the exact value SELFVERIFY proved equals the kernel's -- so the
+// server accepts a harness-authored HMAC. Returns the engine code: 0 = pass through
+// (SYN/SYN-ACK), len = same-length rewrite (ACK), <0 = drop (fail-loud on missing
+// keys/nonces so the oracle shows no accept rather than a kernel-HMAC masked join).
+static inline int syz_mptcp_mut_forge(uint8* o, uint8 olen, int from_client, int len)
+{
+	if (from_client && olen == MPTCP_JOIN_SYN_OLEN) {
+		// client SYN carries R_A (the real nonce -- Phase 1 does NOT mutate it;
+		// §3b: a mutated SYN nonce makes the client reset on the SYN-ACK thmac).
+		memcpy(syz_mptcp_mut.r_a, o + MPTCP_JOIN_SYN_NONCE_OFF, MPTCP_JOIN_NONCE_LEN);
+		__atomic_store_n(&syz_mptcp_mut.have_r_a, 1, __ATOMIC_RELEASE);
+		return 0; // pass through
+	}
+	if (!from_client && olen == MPTCP_JOIN_SYNACK_OLEN) {
+		// server SYN-ACK carries R_B (seen via the broadened direction gate).
+		memcpy(syz_mptcp_mut.r_b, o + MPTCP_JOIN_SYNACK_NONCE_OFF, MPTCP_JOIN_NONCE_LEN);
+		__atomic_store_n(&syz_mptcp_mut.have_r_b, 1, __ATOMIC_RELEASE);
+		return 0; // pass through
+	}
+	if (from_client && olen == MPTCP_JOIN_ACK_OLEN) {
+		if (!syz_mptcp_mut.keys_valid) {
+			// Fail LOUD: drop the ACK so the oracle shows NO accept, rather than
+			// letting the kernel's own genuine HMAC mask a capture miss.
+			__atomic_store_n(&syz_mptcp_mut.forge_done, MPTCP_FORGE_NO_KEYS, __ATOMIC_RELEASE);
+			return -1; // NF_DROP
+		}
+		if (!__atomic_load_n(&syz_mptcp_mut.have_r_a, __ATOMIC_ACQUIRE) ||
+		    !__atomic_load_n(&syz_mptcp_mut.have_r_b, __ATOMIC_ACQUIRE)) {
+			__atomic_store_n(&syz_mptcp_mut.forge_done, MPTCP_FORGE_NO_NONCE, __ATOMIC_RELEASE);
+			return -1; // NF_DROP
+		}
+		uint8* hmac = o + MPTCP_JOIN_HMAC_OFF;
+		// Same construction SELFVERIFY proved == the wire ACK HMAC (and == what the
+		// server's subflow_hmac_valid recomputes): client key first, server key second,
+		// message = be32(R_A)||be32(R_B) (r_a/r_b hold the raw wire be bytes).
+		uint8 msg[2 * MPTCP_JOIN_NONCE_LEN];
+		uint8 digest[32];
+		memcpy(msg, syz_mptcp_mut.r_a, MPTCP_JOIN_NONCE_LEN);
+		memcpy(msg + MPTCP_JOIN_NONCE_LEN, syz_mptcp_mut.r_b, MPTCP_JOIN_NONCE_LEN);
+		syz_mptcp_join_hmac(syz_mptcp_mut.local_key, syz_mptcp_mut.remote_key,
+				    msg, sizeof(msg), digest);
+		memcpy(hmac, digest, MPTCP_JOIN_HMAC_LEN); // overwrite (truncate 32 -> 20)
+		__atomic_store_n(&syz_mptcp_mut.forge_done, MPTCP_FORGE_WROTE, __ATOMIC_RELEASE);
+		return len; // same-length in-place rewrite
+	}
+	return 0;
+}
+
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
 // see common_linux_mptcp_nfq.h): >0 = the packet's new total IP length (the engine
 // re-injects that many bytes and recomputes checksums; == len for a same-length
@@ -210,7 +288,11 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 	// appearing as saddr or daddr (distinct per subflow, so no cross-talk on lo).
 	int from_client = (ip->saddr == syz_mptcp_mut.src_addr_be);
 	int to_client = (ip->daddr == syz_mptcp_mut.src_addr_be);
-	if (op == MPTCP_MUT_CRYPTO_SELFVERIFY) {
+	// SELFVERIFY and FORGE both need the server SYN-ACK (R_B), destined TO the
+	// client address, so they match EITHER direction of this subflow's handshake.
+	// The mutation ops act only on egress FROM the client, so they keep the saddr
+	// filter.
+	if (op == MPTCP_MUT_CRYPTO_SELFVERIFY || op == MPTCP_MUT_HMAC_FORGE) {
 		if (!from_client && !to_client)
 			return 0;
 	} else if (!from_client) {
@@ -243,6 +325,10 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 			if (op == MPTCP_MUT_CRYPTO_SELFVERIFY) {
 				syz_mptcp_mut_selfverify_capture(o, olen, from_client);
 				return 0;
+			}
+			// FORGE: capture nonces on SYN/SYN-ACK, write a valid HMAC on the ACK.
+			if (op == MPTCP_MUT_HMAC_FORGE) {
+				return syz_mptcp_mut_forge(o, olen, from_client, len);
 			}
 			// HMAC ops target the ACK (20-byte HMAC).
 			if (olen == MPTCP_JOIN_ACK_OLEN) {
