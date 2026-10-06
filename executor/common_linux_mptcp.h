@@ -1091,6 +1091,13 @@ static long syz_mptcp_pair_close(volatile long a0)
 {
 	long slot = a0;
 
+	// Disarm any DSS data-segment mutation still ARMED for this pair's subflows
+	// (Phase 2): the pair is going away. Idempotent for the handshake-scoped ops.
+	// Guarded to the mutation layer's include condition (join-less repro builds).
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+	syz_mptcp_mut_retire();
+#endif
+
 	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
 		debug("syz_mptcp_pair_close: slot %ld out of range\n", slot);
 		return -1;
@@ -1519,9 +1526,14 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		syz_mptcp_dbg_mib("ACCEPT", pair_slot);
 	}
 
-	// The egress ACK has been sent (and mutated, if requested) by now; retire the
-	// instruction so a later join reusing this per-slot address isn't corrupted.
-	if (mut_op != MPTCP_MUT_NONE)
+	// The egress ACK has been sent (and mutated, if requested) by now. The
+	// handshake-scoped ops (HMAC/NONCE/SELFVERIFY/FORGE/THMAC) have done their work
+	// on the JOIN exchange, so retire the instruction (a later join reusing this
+	// per-slot address must not be corrupted). The DSS data-segment ops (Phase 2)
+	// must instead stay ARMED for the later syz_mptcp_drive_traffic burst, so they
+	// are NOT retired here -- syz_mptcp_subflow_destroy / syz_mptcp_pair_close do it.
+	if (mut_op != MPTCP_MUT_NONE &&
+	    !(mut_op >= MPTCP_MUT_DSS_SEQ && mut_op <= MPTCP_MUT_DSS_DATA_FIN))
 		syz_mptcp_mut_retire();
 
 	// in_use already published by the atomic claim above. Record the
@@ -1546,6 +1558,14 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 	long sub_slot = a0;
 	long err = 0;
 	const uint32 remote_addr_be = htonl(0x7f000001);
+
+	// Disarm any DSS data-segment mutation that join_subflow left ARMED for this
+	// subflow's traffic (Phase 2): the subflow is going away. Idempotent / safe for
+	// the handshake-scoped ops, which were already retired at join time. Guarded to
+	// the mutation layer's include condition so a join-less reproducer still builds.
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+	syz_mptcp_mut_retire();
+#endif
 
 	if (sub_slot < 0 || sub_slot >= MPTCP_SUBFLOW_POOL_SIZE) {
 		debug("syz_mptcp_subflow_destroy: slot %ld out of range\n", sub_slot);
