@@ -1533,7 +1533,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// must instead stay ARMED for the later syz_mptcp_drive_traffic burst, so they
 	// are NOT retired here -- syz_mptcp_subflow_destroy / syz_mptcp_pair_close do it.
 	if (mut_op != MPTCP_MUT_NONE &&
-	    !(mut_op >= MPTCP_MUT_DSS_SEQ && mut_op <= MPTCP_MUT_DSS_DATA_FIN))
+	    !(mut_op >= MPTCP_MUT_DSS_SEQ && mut_op <= MPTCP_MUT_DSS_DATA_FIN) &&
+	    mut_op != MPTCP_MUT_ADD_ADDR_ECHO)
 		syz_mptcp_mut_retire();
 
 	// in_use already published by the atomic claim above. Record the
