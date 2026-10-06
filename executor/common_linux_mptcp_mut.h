@@ -84,6 +84,14 @@
 // add-addr HMAC over the captured keys, a P2 forge, not this op.)
 #define MPTCP_MUT_ADD_ADDR_ECHO 13
 
+// --- Phase 3b (A5 authenticated): length-growing graft of an AUTHENTICATED non-echo
+// ADD_ADDR option (16 bytes) carrying a computed add-addr HMAC over the captured keys
+// -- a P2 forge on the same crypto as the MP_JOIN HMAC. The server validates it
+// (add_addr_hmac_valid, options.c:1185) and, being non-echo, routes it to
+// mptcp_pm_add_addr_received -- the raced pm->remote single-slot (the 005/006-adjacent
+// target), which the echo path (Phase 3a) does NOT reach. Needs captured keys.
+#define MPTCP_MUT_ADD_ADDR_AUTH 14
+
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
@@ -115,6 +123,7 @@
 #define MPTCP_SUB_ADD_ADDR 3
 #define MPTCP_ADDR_ECHO_FLAG 0x01
 #define MPTCP_ADD_ADDR_ECHO_OLEN 8
+#define MPTCP_ADD_ADDR_AUTH_OLEN 16 // non-echo IPv4, no port, +8-byte ahmac (TCPOLEN_MPTCP_ADD_ADDR)
 #define MPTCP_ADD_ADDR_GRAFT_ID 0x9 // announced address id (arbitrary, distinct)
 #define MPTCP_MUT_MAX_TCP_HDR 60
 #define MPTCP_DSS_FLAG_A 0x01 // Data ACK present
@@ -393,33 +402,30 @@ static inline int syz_mptcp_mut_dss(uint8* o, uint8 olen, int op, int len)
 	return 0;
 }
 
-// Phase 3a (A5): graft an unauthenticated 8-byte ADD_ADDR echo option onto a client
-// egress MPTCP subflow segment. `pkt` is the mutable IP packet (len bytes, with
-// headroom in the engine's 128K buffer); `ihl` the IP header length; `th` the TCP
-// header. Returns the new total IP length (len + 8) on a graft, or 0 (pass
-// unmodified) when the segment carries no MPTCP option (not a subflow segment) or
-// has no option space. The engine recomputes tot_len + IP/TCP csums for the new
-// length; this helper only inserts the bytes and bumps th->doff.
-static inline int syz_mptcp_mut_add_addr_graft(uint8* pkt, int len, int ihl, struct tcphdr* th)
+// Shared length-grow graft: insert `optlen` bytes (`optbytes`, a well-formed TCP
+// option; optlen a multiple of 4) at the START of the TCP options of a client egress
+// ESTABLISHED, NON-HANDSHAKE segment that has option room. Returns len+optlen, or 0
+// (pass unmodified) if the segment is a handshake segment or has no room. The engine
+// recomputes tot_len + IP/TCP csums for the new length; this only inserts + bumps doff.
+//
+// Carrier rule (VM-run-hardened): reject MP_JOIN/MP_CAPABLE segments -- grafting an
+// ADD_ADDR there corrupts the handshake (options.c:266 forbids the coexistence) and
+// the subflow never establishes (the bug the first Phase-3a run caught). from_client
+// (checked by the hook) means saddr == the joined subflow's local addr, so any such
+// segment IS this subflow's traffic. The DSS-carrying data segments are option-full on
+// a timestamps connection ([RUN]-4) -- MPTCP_INIT_NO_TIMESTAMPS frees the room.
+static inline int syz_mptcp_mut_graft_opt(uint8* pkt, int len, int ihl,
+					  struct tcphdr* th, const uint8* optbytes, int optlen)
 {
 	int thl = th->doff * 4;
 	uint8* opt = pkt + ihl + sizeof(struct tcphdr);
 	uint8* oend = pkt + ihl + thl;
-	// Graft onto an ESTABLISHED, NON-HANDSHAKE segment with option room. The first VM
-	// run caught that grafting onto an MP_JOIN/MP_CAPABLE segment corrupts the
-	// handshake (the kernel's ADD_ADDR constraint, options.c:266, forbids ADD_ADDR
-	// alongside MP_JOIN/MPC), so reject those. We do NOT require a DSS option: the
-	// DSS-carrying data segments are option-FULL on a timestamps connection (thl=60,
-	// 40 bytes of options -> no room for +8, design [RUN]-4), while the segments with
-	// room are timestamp-only established segments. A lone ADD_ADDR on an established
-	// subflow segment (identified by from_client saddr == the joined subflow's addr,
-	// so it IS this subflow's traffic) is valid and reaches the kernel's option parser.
 	int forbidden = 0;
 	for (uint8* o = opt; o < oend;) {
 		uint8 k = o[0];
 		if (k == 0)
-			break; // end of option list
-		if (k == 1) { // NOP
+			break;
+		if (k == 1) {
 			o++;
 			continue;
 		}
@@ -431,33 +437,74 @@ static inline int syz_mptcp_mut_add_addr_graft(uint8* pkt, int len, int ihl, str
 		if (k == MPTCP_TCPOPT && ol >= 3) {
 			uint8 sub = o[2] >> 4;
 			if (sub == MPTCP_SUB_MP_CAPABLE || sub == MPTCP_SUB_JOIN)
-				forbidden = 1; // handshake segment -- must not graft here
+				forbidden = 1;
 		}
 		o += ol;
 	}
 	if (forbidden)
 		return 0;
-	// Option-space bound (design §4 / [RUN]-4): the grown TCP header must stay <= 60
-	// bytes (doff <= 15 words). Skip carriers without room rather than inject malformed
-	// (the full DSS data segments land here and are correctly passed through).
-	if (thl + MPTCP_ADD_ADDR_ECHO_OLEN > MPTCP_MUT_MAX_TCP_HDR)
+	// Grown TCP header must stay <= 60 bytes (doff <= 15 words); skip full carriers.
+	if (thl + optlen > MPTCP_MUT_MAX_TCP_HDR)
 		return 0;
-	// Insert 8 bytes at the START of the TCP options (4-aligned boundary, keeps the
-	// rest aligned): shift [options .. end-of-packet] right by 8, then write the option.
 	int optstart = ihl + (int)sizeof(struct tcphdr);
 	int tail = len - optstart;
-	memmove(pkt + optstart + MPTCP_ADD_ADDR_ECHO_OLEN, pkt + optstart, (size_t)tail);
-	uint8* a = pkt + optstart;
-	a[0] = MPTCP_TCPOPT; // kind 30
-	a[1] = MPTCP_ADD_ADDR_ECHO_OLEN; // opsize 8 (TCPOLEN_MPTCP_ADD_ADDR_BASE)
-	a[2] = (MPTCP_SUB_ADD_ADDR << 4) | MPTCP_ADDR_ECHO_FLAG; // subtype 3 | echo bit
-	a[3] = MPTCP_ADD_ADDR_GRAFT_ID; // address id
-	a[4] = 127; // announced IPv4 127.0.0.8 (unauthenticated echo; value is cosmetic)
-	a[5] = 0;
-	a[6] = 0;
-	a[7] = 8;
-	th->doff += MPTCP_ADD_ADDR_ECHO_OLEN / 4; // +2 32-bit words
-	return len + MPTCP_ADD_ADDR_ECHO_OLEN;
+	memmove(pkt + optstart + optlen, pkt + optstart, (size_t)tail);
+	memcpy(pkt + optstart, optbytes, (size_t)optlen);
+	th->doff += optlen / 4;
+	return len + optlen;
+}
+
+// Phase 3a: unauthenticated echo ADD_ADDR (8 bytes) -> mptcp_pm_add_addr_echoed.
+static inline int syz_mptcp_mut_add_addr_echo(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	uint8 o[MPTCP_ADD_ADDR_ECHO_OLEN];
+	o[0] = MPTCP_TCPOPT; // kind 30
+	o[1] = MPTCP_ADD_ADDR_ECHO_OLEN; // opsize 8 (TCPOLEN_MPTCP_ADD_ADDR_BASE)
+	o[2] = (MPTCP_SUB_ADD_ADDR << 4) | MPTCP_ADDR_ECHO_FLAG; // subtype 3 | echo bit
+	o[3] = MPTCP_ADD_ADDR_GRAFT_ID;
+	o[4] = 127; // 127.0.0.8 (echo: value cosmetic)
+	o[5] = 0;
+	o[6] = 0;
+	o[7] = 8;
+	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_ADD_ADDR_ECHO_OLEN);
+}
+
+// Phase 3b: AUTHENTICATED non-echo ADD_ADDR (16 bytes) -> mptcp_pm_add_addr_received.
+// The server validates via add_addr_generate_hmac(remote_key, local_key, addr) =
+// HMAC-SHA256(be64(client_key)||be64(server_key), id||addr||port) truncated to the
+// LAST 8 bytes of the 32-byte digest. We hold client_key=local_key, server_key=
+// remote_key (captured), so syz_mptcp_join_hmac(local_key, remote_key, msg) gives the
+// matching keyed digest; the wire ahmac is digest[24..31] (the kernel compares via
+// get_unaligned_be64 on both sides, so byte-for-byte equality suffices). msg layout
+// (options.c:699) = id, addr(4, AF_INET), port_hi, port_lo (port 0). Needs keys.
+static inline int syz_mptcp_mut_add_addr_auth(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	if (!syz_mptcp_mut.keys_valid)
+		return 0; // no captured keys -> can't forge a valid ahmac
+	uint8 id = MPTCP_ADD_ADDR_GRAFT_ID;
+	uint8 addr0 = 127, addr1 = 0, addr2 = 0, addr3 = 8; // 127.0.0.8
+	uint8 msg[7];
+	msg[0] = id;
+	msg[1] = addr0;
+	msg[2] = addr1;
+	msg[3] = addr2;
+	msg[4] = addr3;
+	msg[5] = 0; // port high (port 0)
+	msg[6] = 0; // port low
+	uint8 digest[32];
+	syz_mptcp_join_hmac(syz_mptcp_mut.local_key, syz_mptcp_mut.remote_key,
+			    msg, sizeof(msg), digest);
+	uint8 o[MPTCP_ADD_ADDR_AUTH_OLEN];
+	o[0] = MPTCP_TCPOPT; // kind 30
+	o[1] = MPTCP_ADD_ADDR_AUTH_OLEN; // opsize 16 (TCPOLEN_MPTCP_ADD_ADDR)
+	o[2] = (MPTCP_SUB_ADD_ADDR << 4); // subtype 3, NO echo bit -> add_addr_received path
+	o[3] = id;
+	o[4] = addr0;
+	o[5] = addr1;
+	o[6] = addr2;
+	o[7] = addr3;
+	memcpy(o + 8, digest + 24, 8); // ahmac = last 8 bytes of the digest (be64 on wire)
+	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_ADD_ADDR_AUTH_OLEN);
 }
 
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
@@ -509,10 +556,13 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 	// Phase 3a (A5): length-growing ADD_ADDR echo graft (whole-segment op, not a
 	// per-option rewrite). from_client only (reaches the server RX). Returns len+8 on
 	// a graft, 0 if the segment is not a graftable MPTCP subflow segment.
-	if (op == MPTCP_MUT_ADD_ADDR_ECHO) {
-		int r = syz_mptcp_mut_add_addr_graft(pkt, len, ihl, th);
+	if (op == MPTCP_MUT_ADD_ADDR_ECHO || op == MPTCP_MUT_ADD_ADDR_AUTH) {
+		int r = (op == MPTCP_MUT_ADD_ADDR_ECHO)
+			    ? syz_mptcp_mut_add_addr_echo(pkt, len, ihl, th)
+			    : syz_mptcp_mut_add_addr_auth(pkt, len, ihl, th);
 		if (r != 0)
-			debug("syz_mptcp_mut_add_addr: grafted echo ADD_ADDR (+8), newlen=%d\n", r);
+			debug("syz_mptcp_mut_add_addr: grafted %s ADD_ADDR, newlen=%d\n",
+			      op == MPTCP_MUT_ADD_ADDR_ECHO ? "echo" : "auth", r);
 		return r;
 	}
 	uint8* o = pkt + ihl + sizeof(struct tcphdr);
