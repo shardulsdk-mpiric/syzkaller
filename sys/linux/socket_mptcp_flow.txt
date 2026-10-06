@@ -132,7 +132,10 @@ syz_mptcp_listener_close_race(n_unaccepted int8[1:8]) (remote_cover)
 # "defined for none of the arches". Must match the executor #defines + the .const.
 define MPTCP_INIT_RWND_CLAMP	1
 define MPTCP_INIT_CAPTURE_KEYS	2
-mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS
+# MPTCP_INIT_NO_TIMESTAMPS: disable TCP timestamps in the netns -> frees 12 bytes of
+# TCP option space, required for the Phase-3 length-grow graft ops (ADD_ADDR etc).
+define MPTCP_INIT_NO_TIMESTAMPS	4
+mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS
 
 # syz_mptcp_drive_traffic(): push data client->server on an established pair.
 # On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains

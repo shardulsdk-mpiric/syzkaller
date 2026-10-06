@@ -223,6 +223,13 @@ enum {
 // MP_CAPABLE handshake off loopback (AF_PACKET) and store both keys on the pair,
 // so the mutation layer can recompute MP_JOIN HMACs -- replaces MPTCP_DEBUG_KEYS.
 #define MPTCP_INIT_CAPTURE_KEYS 2
+// MPTCP_INIT_NO_TIMESTAMPS (harness flag; mirrored in .txt + .const): disable TCP
+// timestamps in the executor's netns before any socket is created, so this pair's
+// segments carry no 12-byte TS option. This FREES TCP option space -- required for
+// the Phase-3 length-grow graft ops (ADD_ADDR etc): a timestamps+full-DSS data
+// segment already fills the 40-byte option cap (design [RUN]-4), leaving no room for
+// an 8-byte graft. Opt-in, so Phase 0-2 progs are unaffected.
+#define MPTCP_INIT_NO_TIMESTAMPS 4
 
 struct syz_mptcp_pair_slot {
 	bool in_use;
@@ -905,6 +912,20 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	if (mptcp_pm_ensure_setup() < 0) {
 		debug("syz_mptcp_pair_init: userspace-PM setup failed\n");
 		goto fail;
+	}
+
+	// Phase 3: free TCP option room for the length-grow graft ops by disabling TCP
+	// timestamps in this (unshared) netns before any socket exists. Per-netns sysctl;
+	// best-effort (a failure just leaves TS on -> the graft finds no roomy carrier).
+	if (init_flags & MPTCP_INIT_NO_TIMESTAMPS) {
+		int tsfd = open("/proc/sys/net/ipv4/tcp_timestamps", O_WRONLY);
+		if (tsfd >= 0) {
+			if (write(tsfd, "0\n", 2) != 2)
+				debug("syz_mptcp_pair_init: tcp_timestamps disable short write errno=%d\n", errno);
+			close(tsfd);
+		} else {
+			debug("syz_mptcp_pair_init: open tcp_timestamps errno=%d\n", errno);
+		}
 	}
 
 	server_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
