@@ -73,6 +73,17 @@
 // client) -> client-side subflow_thmac_valid (subflow_finish_connect) reject path.
 #define MPTCP_MUT_THMAC_FLIP 12
 
+// --- Phase 3a (A5): length-GROWING graft, the first op to exercise the NFQUEUE
+// length-grow path (design ingress_injection_design.md §4; all ops before this were
+// same-length). Graft an unauthenticated ADD_ADDR *echo* option onto a client egress
+// MPTCP subflow segment: +8 bytes of TCP option, doff bumped, engine recomputes
+// tot_len + IP/TCP csums. Unauthenticated (add_addr_hmac_valid returns true for echo,
+// net/mptcp/options.c:1182) -> reaches mptcp_pm_add_addr_echoed. (The authenticated
+// NON-echo variant that reaches mptcp_pm_add_addr_received -- the raced pm->remote
+// single-slot, the 005/006-adjacent target -- is Phase 3b: it needs a computed
+// add-addr HMAC over the captured keys, a P2 forge, not this op.)
+#define MPTCP_MUT_ADD_ADDR_ECHO 13
+
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
@@ -95,6 +106,16 @@
 //   then, in order: Data ACK (A? a?8:4), then the mapping if M set:
 //   DSN (m?8:4) | Subflow-Seq(4) | Data-Level-Length(2) | Checksum(2, if negotiated)
 #define MPTCP_SUB_DSS 2
+// ADD_ADDR graft (Phase 3a). Subtype 3 (MPTCPOPT_ADD_ADDR); echo flag = BIT(0)
+// (MPTCP_ADDR_ECHO). Echo IPv4-no-port option = 8 bytes (TCPOLEN_MPTCP_ADD_ADDR_BASE):
+// [kind=30][len=8][subtype<<4 | echo][addr_id][IPv4 addr:4]. Grown TCP header must
+// stay <= 60 bytes (doff field max 15 words); named distinctly from the nfq header's
+// MPTCP_TCP_MAX_HDR, which is not yet included where this header sits.
+#define MPTCP_SUB_ADD_ADDR 3
+#define MPTCP_ADDR_ECHO_FLAG 0x01
+#define MPTCP_ADD_ADDR_ECHO_OLEN 8
+#define MPTCP_ADD_ADDR_GRAFT_ID 0x9 // announced address id (arbitrary, distinct)
+#define MPTCP_MUT_MAX_TCP_HDR 60
 #define MPTCP_DSS_FLAG_A 0x01 // Data ACK present
 #define MPTCP_DSS_FLAG_a 0x02 // Data ACK is 8 octets (else 4)
 #define MPTCP_DSS_FLAG_M 0x04 // mapping (DSN/SSN/len/csum) present
@@ -371,6 +392,63 @@ static inline int syz_mptcp_mut_dss(uint8* o, uint8 olen, int op, int len)
 	return 0;
 }
 
+// Phase 3a (A5): graft an unauthenticated 8-byte ADD_ADDR echo option onto a client
+// egress MPTCP subflow segment. `pkt` is the mutable IP packet (len bytes, with
+// headroom in the engine's 128K buffer); `ihl` the IP header length; `th` the TCP
+// header. Returns the new total IP length (len + 8) on a graft, or 0 (pass
+// unmodified) when the segment carries no MPTCP option (not a subflow segment) or
+// has no option space. The engine recomputes tot_len + IP/TCP csums for the new
+// length; this helper only inserts the bytes and bumps th->doff.
+static inline int syz_mptcp_mut_add_addr_graft(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	int thl = th->doff * 4;
+	uint8* opt = pkt + ihl + sizeof(struct tcphdr);
+	uint8* oend = pkt + ihl + thl;
+	// Only graft onto a genuine MPTCP subflow segment (one already carrying an MPTCP
+	// option) -- the grafted ADD_ADDR then coexists with DSS/etc, which the kernel
+	// permits (options.c ADD_ADDR constraint allows DSS/RM_ADDR/PRIO alongside).
+	int has_mptcp = 0;
+	for (uint8* o = opt; o < oend;) {
+		uint8 k = o[0];
+		if (k == 0)
+			break; // end of option list
+		if (k == 1) { // NOP
+			o++;
+			continue;
+		}
+		if (o + 1 >= oend)
+			break;
+		uint8 ol = o[1];
+		if (ol < 2 || o + ol > oend)
+			break;
+		if (k == MPTCP_TCPOPT)
+			has_mptcp = 1;
+		o += ol;
+	}
+	if (!has_mptcp)
+		return 0;
+	// Option-space bound (design §4 / [RUN]-4): the grown TCP header must stay <= 60
+	// bytes (doff <= 15 words). Skip carriers without room rather than inject malformed.
+	if (thl + MPTCP_ADD_ADDR_ECHO_OLEN > MPTCP_MUT_MAX_TCP_HDR)
+		return 0;
+	// Insert 8 bytes at the START of the TCP options (4-aligned boundary, keeps the
+	// rest aligned): shift [options .. end-of-packet] right by 8, then write the option.
+	int optstart = ihl + (int)sizeof(struct tcphdr);
+	int tail = len - optstart;
+	memmove(pkt + optstart + MPTCP_ADD_ADDR_ECHO_OLEN, pkt + optstart, (size_t)tail);
+	uint8* a = pkt + optstart;
+	a[0] = MPTCP_TCPOPT; // kind 30
+	a[1] = MPTCP_ADD_ADDR_ECHO_OLEN; // opsize 8 (TCPOLEN_MPTCP_ADD_ADDR_BASE)
+	a[2] = (MPTCP_SUB_ADD_ADDR << 4) | MPTCP_ADDR_ECHO_FLAG; // subtype 3 | echo bit
+	a[3] = MPTCP_ADD_ADDR_GRAFT_ID; // address id
+	a[4] = 127; // announced IPv4 127.0.0.8 (unauthenticated echo; value is cosmetic)
+	a[5] = 0;
+	a[6] = 0;
+	a[7] = 8;
+	th->doff += MPTCP_ADD_ADDR_ECHO_OLEN / 4; // +2 32-bit words
+	return len + MPTCP_ADD_ADDR_ECHO_OLEN;
+}
+
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
 // see common_linux_mptcp_nfq.h): >0 = the packet's new total IP length (the engine
 // re-injects that many bytes and recomputes checksums; == len for a same-length
@@ -417,6 +495,15 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 	int thl = th->doff * 4;
 	if (thl < (int)sizeof(struct tcphdr) || len < ihl + thl)
 		return 0;
+	// Phase 3a (A5): length-growing ADD_ADDR echo graft (whole-segment op, not a
+	// per-option rewrite). from_client only (reaches the server RX). Returns len+8 on
+	// a graft, 0 if the segment is not a graftable MPTCP subflow segment.
+	if (op == MPTCP_MUT_ADD_ADDR_ECHO) {
+		int r = syz_mptcp_mut_add_addr_graft(pkt, len, ihl, th);
+		if (r != 0)
+			debug("syz_mptcp_mut_add_addr: grafted echo ADD_ADDR (+8), newlen=%d\n", r);
+		return r;
+	}
 	uint8* o = pkt + ihl + sizeof(struct tcphdr);
 	uint8* end = pkt + ihl + thl;
 	while (o < end) {
