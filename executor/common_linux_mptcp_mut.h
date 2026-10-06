@@ -56,6 +56,23 @@
 // than letting the kernel's own genuine HMAC mask a capture miss as a clean join).
 #define MPTCP_MUT_HMAC_FORGE 5
 
+// --- Phase 2 (A1/B2): same-length inbound grammar, engine unchanged. ---
+// DSS mapping-corruption set (the classic MPTCP "MAP_*" mutations). Each acts on
+// the DSS option (subtype 2) of an egress DATA segment FROM the client subflow
+// address, rewriting a mapping field IN PLACE (same length -> returns len). They
+// reach the server's mapping validation in softirq (subflow_check_data_avail ->
+// validate_mapping / mptcp_validate_data_csum, net/mptcp/subflow.c), the
+// "accept-but-wrong" region that the reject-only JOIN ops cannot touch.
+#define MPTCP_MUT_DSS_SEQ 6 // corrupt the Data Sequence Number (stale/forward DSN)
+#define MPTCP_MUT_DSS_SUBSEQ 7 // off-by-one the Subflow Sequence Number (hole/overlap)
+#define MPTCP_MUT_DSS_LEN_INF 8 // Data-Level Length = 0 (the "infinite mapping" special case)
+#define MPTCP_MUT_DSS_LEN_OFF 9 // Data-Level Length += 1 (mapping over/under-run)
+#define MPTCP_MUT_DSS_CSUM 10 // corrupt the DSS checksum (mptcp_validate_data_csum drop path)
+#define MPTCP_MUT_DSS_DATA_FIN 11 // set the F (DATA_FIN) flag on a data segment
+// B2: flip a bit of the server SYN-ACK thmac (seen at LOCAL_OUT, destined TO the
+// client) -> client-side subflow_thmac_valid (subflow_finish_connect) reject path.
+#define MPTCP_MUT_THMAC_FLIP 12
+
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
@@ -70,6 +87,21 @@
 #define MPTCP_JOIN_ACK_OLEN 24
 #define MPTCP_JOIN_HMAC_OFF 4 // hmac after the 4-byte option header
 #define MPTCP_JOIN_HMAC_LEN 20
+#define MPTCP_JOIN_SYNACK_THMAC_OFF 4 // thmac after kind,len,sub|bkup,join_id
+#define MPTCP_JOIN_SYNACK_THMAC_LEN 8
+
+// DSS option (RFC 8684 Fig.9; net/mptcp/options.c mptcp_parse_option / subtype 2):
+//   [kind=30][len][subtype(hi nibble)=2 | rsv][rsv..F m M a A]
+//   then, in order: Data ACK (A? a?8:4), then the mapping if M set:
+//   DSN (m?8:4) | Subflow-Seq(4) | Data-Level-Length(2) | Checksum(2, if negotiated)
+#define MPTCP_SUB_DSS 2
+#define MPTCP_DSS_FLAG_A 0x01 // Data ACK present
+#define MPTCP_DSS_FLAG_a 0x02 // Data ACK is 8 octets (else 4)
+#define MPTCP_DSS_FLAG_M 0x04 // mapping (DSN/SSN/len/csum) present
+#define MPTCP_DSS_FLAG_m 0x08 // DSN is 8 octets (else 4)
+#define MPTCP_DSS_FLAG_F 0x10 // DATA_FIN
+#define MPTCP_DSS_FLAGS_OFF 3 // the flags byte within the option
+#define MPTCP_DSS_FIELDS_OFF 4 // first variable field (Data ACK or mapping)
 
 // Self-verify result codes (published by the worker, read by the syscall thread).
 #define MPTCP_SELFVERIFY_PENDING 0
@@ -264,6 +296,81 @@ static inline int syz_mptcp_mut_forge(uint8* o, uint8 olen, int from_client, int
 	return 0;
 }
 
+// Phase 2 (A1): same-length DSS mapping-field corruption. `o` points at the DSS
+// option's kind byte, `olen` is its length. Parses the flags byte to locate the
+// mapping fields, rewrites exactly one in place, and returns `len` (same length).
+// Returns 0 (pass unmodified) when the option does not carry the field the op
+// targets -- a flagless / Data-ACK-only DSS is not falsely mutated, and a truncated
+// mapping is left alone rather than written out of bounds.
+static inline int syz_mptcp_mut_dss(uint8* o, uint8 olen, int op, int len)
+{
+	if (olen < MPTCP_DSS_FIELDS_OFF + 1)
+		return 0;
+	uint8 flags = o[MPTCP_DSS_FLAGS_OFF];
+
+	// DATA_FIN sets the F flag; valid on any DSS (even ack-only), so handle it first.
+	if (op == MPTCP_MUT_DSS_DATA_FIN) {
+		o[MPTCP_DSS_FLAGS_OFF] = flags | MPTCP_DSS_FLAG_F;
+		return len;
+	}
+
+	// Every other op corrupts the mapping block. Skip the Data ACK if present.
+	int off = MPTCP_DSS_FIELDS_OFF;
+	if (flags & MPTCP_DSS_FLAG_A)
+		off += (flags & MPTCP_DSS_FLAG_a) ? 8 : 4;
+	if (!(flags & MPTCP_DSS_FLAG_M))
+		return 0; // no mapping present to corrupt
+	int dsn_len = (flags & MPTCP_DSS_FLAG_m) ? 8 : 4;
+	int dsn_off = off;
+	int subseq_off = dsn_off + dsn_len;
+	int dlen_off = subseq_off + 4;
+	int csum_off = dlen_off + 2;
+	if (dlen_off + 2 > (int)olen)
+		return 0; // DSN + Subflow-Seq + Data-Level-Length must fit the option
+
+	switch (op) {
+	case MPTCP_MUT_DSS_SEQ: {
+		// Push the low 32 bits of the DSN out of the expected data window.
+		uint8* p = o + dsn_off + dsn_len - 4;
+		uint32 v = ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | p[3];
+		v -= 0x00010000u;
+		p[0] = v >> 24;
+		p[1] = v >> 16;
+		p[2] = v >> 8;
+		p[3] = v;
+		return len;
+	}
+	case MPTCP_MUT_DSS_SUBSEQ: {
+		// Off-by-one the subflow sequence number -> mapping hole / overlap.
+		uint8* p = o + subseq_off;
+		uint32 v = ((uint32)p[0] << 24) | ((uint32)p[1] << 16) | ((uint32)p[2] << 8) | p[3];
+		v += 1;
+		p[0] = v >> 24;
+		p[1] = v >> 16;
+		p[2] = v >> 8;
+		p[3] = v;
+		return len;
+	}
+	case MPTCP_MUT_DSS_LEN_INF:
+		o[dlen_off] = 0; // Data-Level Length 0 == the "infinite mapping" special case
+		o[dlen_off + 1] = 0;
+		return len;
+	case MPTCP_MUT_DSS_LEN_OFF: {
+		uint16 v = ((uint16)o[dlen_off] << 8) | o[dlen_off + 1];
+		v += 1; // mapping over/under-run by one byte
+		o[dlen_off] = v >> 8;
+		o[dlen_off + 1] = v;
+		return len;
+	}
+	case MPTCP_MUT_DSS_CSUM:
+		if (csum_off + 2 > (int)olen)
+			return 0; // checksum not negotiated / absent -> nothing to corrupt
+		o[csum_off] ^= 0x01; // bad DSS csum -> mptcp_validate_data_csum drop path
+		return len;
+	}
+	return 0;
+}
+
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
 // see common_linux_mptcp_nfq.h): >0 = the packet's new total IP length (the engine
 // re-injects that many bytes and recomputes checksums; == len for a same-length
@@ -292,7 +399,12 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 	// client address, so they match EITHER direction of this subflow's handshake.
 	// The mutation ops act only on egress FROM the client, so they keep the saddr
 	// filter.
-	if (op == MPTCP_MUT_CRYPTO_SELFVERIFY || op == MPTCP_MUT_HMAC_FORGE) {
+	// SELFVERIFY/FORGE need the server SYN-ACK (R_B), and THMAC_FLIP rewrites that
+	// SYN-ACK (destined TO the client) -- all three match EITHER direction of this
+	// subflow's handshake. The JOIN HMAC/NONCE ops and all DSS data-segment ops act
+	// only on egress FROM the client, so they keep the saddr-only filter.
+	if (op == MPTCP_MUT_CRYPTO_SELFVERIFY || op == MPTCP_MUT_HMAC_FORGE ||
+	    op == MPTCP_MUT_THMAC_FLIP) {
 		if (!from_client && !to_client)
 			return 0;
 	} else if (!from_client) {
@@ -330,6 +442,14 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 			if (op == MPTCP_MUT_HMAC_FORGE) {
 				return syz_mptcp_mut_forge(o, olen, from_client, len);
 			}
+			// THMAC flip (B2): corrupt the server SYN-ACK's 8-byte thmac (seen
+			// here at LOCAL_OUT, destined to the client) -> client-side
+			// subflow_thmac_valid reject in subflow_finish_connect.
+			if (op == MPTCP_MUT_THMAC_FLIP && to_client &&
+			    olen == MPTCP_JOIN_SYNACK_OLEN) {
+				o[MPTCP_JOIN_SYNACK_THMAC_OFF] ^= 0x01;
+				return len; // same-length in-place rewrite
+			}
 			// HMAC ops target the ACK (20-byte HMAC).
 			if (olen == MPTCP_JOIN_ACK_OLEN) {
 				uint8* hmac = o + MPTCP_JOIN_HMAC_OFF;
@@ -347,6 +467,14 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 				o[MPTCP_JOIN_SYN_NONCE_OFF] ^= 0x01;
 				return len; // same-length in-place rewrite
 			}
+		}
+		// Phase 2 (A1): DSS mapping corruption on egress data segments. Subtype 2;
+		// gated to the DSS op range so a DSS option is never touched by a JOIN op.
+		if (kind == MPTCP_TCPOPT && (o[2] >> 4) == MPTCP_SUB_DSS &&
+		    op >= MPTCP_MUT_DSS_SEQ && op <= MPTCP_MUT_DSS_DATA_FIN) {
+			int r = syz_mptcp_mut_dss(o, olen, op, len);
+			if (r != 0)
+				return r;
 		}
 		o += olen;
 	}
