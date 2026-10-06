@@ -89,6 +89,7 @@
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
 // ACK:     [kind][len=24][rsv][rsv][hmac:20]
 #define MPTCP_TCPOPT 30
+#define MPTCP_SUB_MP_CAPABLE 0
 #define MPTCP_SUB_JOIN 1
 #define MPTCP_JOIN_SYN_OLEN 12
 #define MPTCP_JOIN_SYN_NONCE_OFF 8 // nonce after kind,len,sub|bkup,join_id,token:4
@@ -404,10 +405,16 @@ static inline int syz_mptcp_mut_add_addr_graft(uint8* pkt, int len, int ihl, str
 	int thl = th->doff * 4;
 	uint8* opt = pkt + ihl + sizeof(struct tcphdr);
 	uint8* oend = pkt + ihl + thl;
-	// Only graft onto a genuine MPTCP subflow segment (one already carrying an MPTCP
-	// option) -- the grafted ADD_ADDR then coexists with DSS/etc, which the kernel
-	// permits (options.c ADD_ADDR constraint allows DSS/RM_ADDR/PRIO alongside).
-	int has_mptcp = 0;
+	// Graft onto an ESTABLISHED, NON-HANDSHAKE segment with option room. The first VM
+	// run caught that grafting onto an MP_JOIN/MP_CAPABLE segment corrupts the
+	// handshake (the kernel's ADD_ADDR constraint, options.c:266, forbids ADD_ADDR
+	// alongside MP_JOIN/MPC), so reject those. We do NOT require a DSS option: the
+	// DSS-carrying data segments are option-FULL on a timestamps connection (thl=60,
+	// 40 bytes of options -> no room for +8, design [RUN]-4), while the segments with
+	// room are timestamp-only established segments. A lone ADD_ADDR on an established
+	// subflow segment (identified by from_client saddr == the joined subflow's addr,
+	// so it IS this subflow's traffic) is valid and reaches the kernel's option parser.
+	int forbidden = 0;
 	for (uint8* o = opt; o < oend;) {
 		uint8 k = o[0];
 		if (k == 0)
@@ -421,14 +428,18 @@ static inline int syz_mptcp_mut_add_addr_graft(uint8* pkt, int len, int ihl, str
 		uint8 ol = o[1];
 		if (ol < 2 || o + ol > oend)
 			break;
-		if (k == MPTCP_TCPOPT)
-			has_mptcp = 1;
+		if (k == MPTCP_TCPOPT && ol >= 3) {
+			uint8 sub = o[2] >> 4;
+			if (sub == MPTCP_SUB_MP_CAPABLE || sub == MPTCP_SUB_JOIN)
+				forbidden = 1; // handshake segment -- must not graft here
+		}
 		o += ol;
 	}
-	if (!has_mptcp)
+	if (forbidden)
 		return 0;
 	// Option-space bound (design §4 / [RUN]-4): the grown TCP header must stay <= 60
-	// bytes (doff <= 15 words). Skip carriers without room rather than inject malformed.
+	// bytes (doff <= 15 words). Skip carriers without room rather than inject malformed
+	// (the full DSS data segments land here and are correctly passed through).
 	if (thl + MPTCP_ADD_ADDR_ECHO_OLEN > MPTCP_MUT_MAX_TCP_HDR)
 		return 0;
 	// Insert 8 bytes at the START of the TCP options (4-aligned boundary, keeps the
