@@ -1237,6 +1237,42 @@ static inline void syz_mptcp_dbg_mib(const char* tag, long pair_slot)
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPJoinSynAckHMacFailure"));
 }
 
+// ADD_ADDR receipt oracle (Phase 3a/3b). AddAddr = non-echo ADD_ADDR received with a
+// VALID add-addr HMAC (MPTCP_MIB_ADDADDR, options.c:1271 -> add_addr_received, the
+// raced pm->remote target); EchoAdd = echo ADD_ADDR received (options.c:1274). So
+// AddAddr>0 after a drive with MPTCP_MUT_ADD_ADDR_AUTH is the definitive proof the
+// FORGED add-addr HMAC validated. Read in the worker netns (same as syz_mptcp_dbg_mib).
+static inline void syz_mptcp_dbg_addaddr_mib(const char* tag, long pair_slot)
+{
+	int fd = open("/proc/net/netstat", O_RDONLY);
+	if (fd < 0)
+		return;
+	static char nsbuf[16384];
+	int n = 0, r;
+	while (n < (int)sizeof(nsbuf) - 1 &&
+	       (r = read(fd, nsbuf + n, sizeof(nsbuf) - 1 - n)) > 0)
+		n += r;
+	close(fd);
+	nsbuf[n] = 0;
+	char* h = strstr(nsbuf, "MPTcpExt:");
+	if (!h)
+		return;
+	char* h_end = strchr(h, '\n');
+	if (!h_end)
+		return;
+	char* v = strstr(h_end, "MPTcpExt:");
+	if (!v)
+		return;
+	char* v_end = strchr(v, '\n');
+	if (!v_end)
+		v_end = nsbuf + n;
+	debug("syz_mptcp_addaddr: pair=%ld %s MPTcpExt AddAddr=%ld EchoAdd=%ld AddAddrDrop=%ld\n",
+	      pair_slot, tag,
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "AddAddr"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "EchoAdd"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "AddAddrDrop"));
+}
+
 // The MPTCP_EVENT_SUB_ESTABLISHED / MPTCP_ATTR_* values used below are mirrored
 // with the other uapi enums under the MPTCP_PM_NAME sentinel near the top of
 // this file.
@@ -1587,6 +1623,10 @@ static long syz_mptcp_subflow_destroy(volatile long a0)
 	// the mutation layer's include condition so a join-less reproducer still builds.
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
 	syz_mptcp_mut_retire();
+	// Post-drive ADD_ADDR receipt oracle: AddAddr>0 proves a forged non-echo ADD_ADDR
+	// HMAC validated (reached add_addr_received). Runs here (after drive_traffic) in
+	// the worker netns; stripped from the csource reproducer with the debug() call.
+	syz_mptcp_dbg_addaddr_mib("post-drive", a0);
 #endif
 
 	if (sub_slot < 0 || sub_slot >= MPTCP_SUBFLOW_POOL_SIZE) {
@@ -2131,6 +2171,19 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile
 		}
 		drained = recv(pair->server_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT | MSG_NOSIGNAL);
 		(void)drained;
+		// Reverse traffic: have the SERVER send so the client kernel emits pure ACKs
+		// (DSS data-ack only, light TCP options ~thl 32) -- the low-option from_client
+		// carrier that a >=16-byte graft needs (Phase 3b auth ADD_ADDR, Phase 4). The
+		// client's OWN data segments are option-full (DSS mapping -> no room for +16).
+		// Additive: client->server data still flows, so the same-length DSS ops
+		// (Phase 2) and the 8-byte echo graft (Phase 3a) are unaffected. Bounded.
+		for (int i = 0; i < 16; i++) {
+			ssize_t rn = send(pair->server_fd, data, data_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+			if (rn <= 0)
+				break;
+			// Drain on the client so its window stays open and it keeps ACKing.
+			recv(pair->client_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT | MSG_NOSIGNAL);
+		}
 	} else {
 		sent = send(pair->client_fd, data, data_len, MSG_DONTWAIT | MSG_NOSIGNAL);
 		// Bounded drain so the RX buffer doesn't fill and EAGAIN later sends.
