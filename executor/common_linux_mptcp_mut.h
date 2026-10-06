@@ -473,8 +473,10 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 		if (kind == MPTCP_TCPOPT && (o[2] >> 4) == MPTCP_SUB_DSS &&
 		    op >= MPTCP_MUT_DSS_SEQ && op <= MPTCP_MUT_DSS_DATA_FIN) {
 			int r = syz_mptcp_mut_dss(o, olen, op, len);
-			if (r != 0)
+			if (r != 0) {
+				debug("syz_mptcp_mut_dss: op=%d fired (same-length DSS mapping rewrite)\n", op);
 				return r;
+			}
 		}
 		o += olen;
 	}
