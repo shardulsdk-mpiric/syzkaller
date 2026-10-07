@@ -147,7 +147,9 @@ define MPTCP_INIT_CAPTURE_KEYS	2
 # MPTCP_INIT_NO_TIMESTAMPS: disable TCP timestamps in the netns -> frees 12 bytes of
 # TCP option space, required for the Phase-3 length-grow graft ops (ADD_ADDR etc).
 define MPTCP_INIT_NO_TIMESTAMPS	4
-mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS
+# MPTCP_INIT_CHECKSUM: negotiate DSS checksums -> activates DSS_CSUM + validate_data_csum.
+define MPTCP_INIT_CHECKSUM	8
+mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS, MPTCP_INIT_CHECKSUM
 
 # syz_mptcp_drive_traffic(): push data client->server on an established pair.
 # On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains
