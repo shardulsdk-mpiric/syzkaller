@@ -1,0 +1,49 @@
+From b9f3b0eb0baad32b21e7f6f531a017475ac06bcd Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Wed, 7 Oct 2026 13:53:03 +0530
+Subject: [PATCH 3/3] =?UTF-8?q?quic:=20annotate=20quic=5Fbacklog=5Frcv()?=
+ =?UTF-8?q?=20too=20=E2=80=94=20cover=20the=20lock-contended=20backlog-dra?=
+ =?UTF-8?q?in=20path?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The softirq fast-path annotation in quic_packet_rcv() brackets only the direct
+sk_backlog_rcv() dispatch (socket not busy). When the sock lock is held the packet
+is queued via sk_add_backlog() and drained later from release_sock() ->
+quic_backlog_rcv() in process context, which the fast-path bracket does not cover
+(reported by Xin Long). Bracket quic_packet_process() in quic_backlog_rcv() on the
+same connection kcov handle so lock-contended packets are attributed too.
+---
+ net/quic/socket.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/net/quic/socket.c b/net/quic/socket.c
+index 09cc48f89df8c..c5bdf96ebf9b3 100644
+--- a/net/quic/socket.c
++++ b/net/quic/socket.c
+@@ -2903,7 +2903,20 @@ static void quic_shutdown(struct sock *sk, int how)
+ 
+ static int quic_backlog_rcv(struct sock *sk, struct sk_buff *skb)
+ {
+-	return quic_packet_process(sk, skb, GFP_ATOMIC);
++	int ret;
++
++	/* Backlog-drain path: the socket was busy (lock held) when the packet
++	 * arrived, so quic_packet_rcv() queued it with sk_add_backlog() and it
++	 * is processed here from release_sock() in process context. The softirq
++	 * fast-path annotation in quic_packet_rcv() does NOT bracket this path
++	 * (reported by Xin Long), so lock-contended packets would miss remote
++	 * kcov attribution. Bracket the same quic_packet_process() dispatch here
++	 * on the connection's kcov handle; a no-op when the handle is zero.
++	 */
++	quic_kcov_remote_start(quic_sk(sk)->kcov_handle);
++	ret = quic_packet_process(sk, skb, GFP_ATOMIC);
++	quic_kcov_remote_stop();
++	return ret;
+ }
+ 
+ struct proto quic_prot = {
+-- 
+2.34.1
+

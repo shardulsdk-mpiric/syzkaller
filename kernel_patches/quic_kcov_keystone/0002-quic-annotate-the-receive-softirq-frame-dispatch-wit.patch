@@ -1,7 +1,7 @@
 From a11d90dffff053927f99cef3e714a714a465b00a Mon Sep 17 00:00:00 2001
 From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Sun, 4 Oct 2026 00:52:26 +0530
-Subject: [PATCH 2/2] quic: annotate the receive-softirq frame dispatch with
+Subject: [PATCH 2/3] quic: annotate the receive-softirq frame dispatch with
  kcov remote coverage
 
 quic_packet_rcv() runs under the UDP tunnel encap receive softirq and,
