@@ -230,6 +230,13 @@ enum {
 // segment already fills the 40-byte option cap (design [RUN]-4), leaving no room for
 // an 8-byte graft. Opt-in, so Phase 0-2 progs are unaffected.
 #define MPTCP_INIT_NO_TIMESTAMPS 4
+// MPTCP_INIT_CHECKSUM (harness flag; mirrored in .txt + .const): set
+// net.mptcp.checksum_enabled=1 in the netns before any socket, so the MP_CAPABLE
+// handshake negotiates DSS checksums (msk->csum_enabled) and every DSS mapping
+// carries a checksum. This ACTIVATES the Phase-2 DSS_CSUM op (inert without
+// negotiation) and lights up the validate_data_csum RX path (subflow.c:1034) --
+// a mapping-validation path we otherwise never reach. Opt-in.
+#define MPTCP_INIT_CHECKSUM 8
 
 struct syz_mptcp_pair_slot {
 	bool in_use;
@@ -928,6 +935,19 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		}
 	}
 
+	// Phase 2 follow-up: negotiate DSS checksums so the DSS_CSUM op is live and the
+	// validate_data_csum RX path runs. Per-netns sysctl; set before any socket.
+	if (init_flags & MPTCP_INIT_CHECKSUM) {
+		int cfd = open("/proc/sys/net/mptcp/checksum_enabled", O_WRONLY);
+		if (cfd >= 0) {
+			if (write(cfd, "1\n", 2) != 2)
+				debug("syz_mptcp_pair_init: checksum_enabled short write errno=%d\n", errno);
+			close(cfd);
+		} else {
+			debug("syz_mptcp_pair_init: open checksum_enabled errno=%d\n", errno);
+		}
+	}
+
 	server_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
 	if (server_listen_fd < 0) {
 		debug("syz_mptcp_pair_init: server socket: %d\n", errno);
@@ -1266,7 +1286,7 @@ static inline void syz_mptcp_dbg_addaddr_mib(const char* tag, long pair_slot)
 	char* v_end = strchr(v, '\n');
 	if (!v_end)
 		v_end = nsbuf + n;
-	debug("syz_mptcp_addaddr: pair=%ld %s MPTcpExt AddAddr=%ld EchoAdd=%ld AddAddrDrop=%ld MPFailRx=%ld MPFastcloseRx=%ld RmAddr=%ld MPPrioRx=%ld\n",
+	debug("syz_mptcp_addaddr: pair=%ld %s MPTcpExt AddAddr=%ld EchoAdd=%ld AddAddrDrop=%ld MPFailRx=%ld MPFastcloseRx=%ld RmAddr=%ld MPPrioRx=%ld DataCsumErr=%ld\n",
 	      pair_slot, tag,
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "AddAddr"),
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "EchoAdd"),
@@ -1274,7 +1294,8 @@ static inline void syz_mptcp_dbg_addaddr_mib(const char* tag, long pair_slot)
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPFailRx"),
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPFastcloseRx"),
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "RmAddr"),
-	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPPrioRx"));
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPPrioRx"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "DataCsumErr"));
 }
 
 // The MPTCP_EVENT_SUB_ESTABLISHED / MPTCP_ATTR_* values used below are mirrored
