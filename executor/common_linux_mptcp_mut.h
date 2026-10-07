@@ -107,6 +107,14 @@
 // maximally 005/006-shaped. Needs CAPTURE_KEYS (uses remote_key).
 #define MPTCP_MUT_MP_FASTCLOSE 16
 
+// --- Phase 4 (C1/A?): RM_ADDR + MP_PRIO grafts, the remaining unauthenticated
+// lifecycle ops on a live msk. RM_ADDR (subtype 4) -> mptcp_pm_rm_addr_received (PM
+// addr-list churn, rm_list_rx). MP_PRIO (subtype 5) -> mptcp_pm_mp_prio_received
+// (pm.c:858, flips subflow->backup UNLOCKED -- a classic race-sensitive site). Both
+// round out the inbound graft family; both feed the teardown race as PM-state churn.
+#define MPTCP_MUT_RM_ADDR 17
+#define MPTCP_MUT_MP_PRIO 18
+
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
@@ -150,6 +158,17 @@
 // [kind=30][len=12][subtype<<4|rsv][rsv][rcvr_key:be64]. rcvr_key = the receiver's key.
 #define MPTCP_SUB_MP_FASTCLOSE 7
 #define MPTCP_MP_FASTCLOSE_OLEN 12
+// RM_ADDR graft (subtype 4): [kind=30][len=4][subtype<<4|rsv][addr_id] = base(3)+1 id.
+#define MPTCP_SUB_RM_ADDR 4
+#define MPTCP_RM_ADDR_OLEN 4
+#define MPTCP_RM_ADDR_ID 0x1
+// MP_PRIO graft (subtype 5): 3-byte option [kind=30][len=3][subtype<<4|bkup] + 1 NOP
+// pad for 4-byte alignment -> grafted as 4 bytes. bkup = MPTCP_PRIO_BKUP (BIT 0).
+#define MPTCP_SUB_MP_PRIO 5
+#define MPTCP_MP_PRIO_LEN 3
+#define MPTCP_MP_PRIO_OLEN 4
+#define MPTCP_PRIO_BKUP_BIT 0x1
+#define MPTCP_TCPOPT_NOP 1
 #define MPTCP_MUT_MAX_TCP_HDR 60
 #define MPTCP_DSS_FLAG_A 0x01 // Data ACK present
 #define MPTCP_DSS_FLAG_a 0x02 // Data ACK is 8 octets (else 4)
@@ -579,6 +598,29 @@ static inline int syz_mptcp_mut_mp_fastclose(uint8* pkt, int len, int ihl, struc
 	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_MP_FASTCLOSE_OLEN);
 }
 
+// Phase 4 (C1): RM_ADDR graft (1 id) -> mptcp_pm_rm_addr_received (PM addr-list churn).
+static inline int syz_mptcp_mut_rm_addr(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	uint8 o[MPTCP_RM_ADDR_OLEN];
+	o[0] = MPTCP_TCPOPT; // kind 30
+	o[1] = MPTCP_RM_ADDR_OLEN; // 4 (base 3 + 1 id)
+	o[2] = (MPTCP_SUB_RM_ADDR << 4); // subtype 4, rsv 0
+	o[3] = MPTCP_RM_ADDR_ID; // the addr id to remove
+	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_RM_ADDR_OLEN);
+}
+
+// Phase 4: MP_PRIO graft -> mptcp_pm_mp_prio_received (flips subflow->backup unlocked).
+// 3-byte option + 1 NOP pad = 4 bytes grafted (4-aligned).
+static inline int syz_mptcp_mut_mp_prio(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	uint8 o[MPTCP_MP_PRIO_OLEN];
+	o[0] = MPTCP_TCPOPT; // kind 30
+	o[1] = MPTCP_MP_PRIO_LEN; // 3
+	o[2] = (MPTCP_SUB_MP_PRIO << 4) | MPTCP_PRIO_BKUP_BIT; // subtype 5 | backup bit
+	o[3] = MPTCP_TCPOPT_NOP; // NOP pad to 4-byte alignment
+	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_MP_PRIO_OLEN);
+}
+
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
 // see common_linux_mptcp_nfq.h): >0 = the packet's new total IP length (the engine
 // re-injects that many bytes and recomputes checksums; == len for a same-length
@@ -649,6 +691,19 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 		int r = syz_mptcp_mut_mp_fastclose(pkt, len, ihl, th);
 		if (r != 0)
 			debug("syz_mptcp_mut_mp_fastclose: grafted MP_FASTCLOSE, newlen=%d\n", r);
+		return r;
+	}
+	// Phase 4: RM_ADDR / MP_PRIO grafts (PM addr-list churn / unlocked backup flip).
+	if (op == MPTCP_MUT_RM_ADDR) {
+		int r = syz_mptcp_mut_rm_addr(pkt, len, ihl, th);
+		if (r != 0)
+			debug("syz_mptcp_mut_rm_addr: grafted RM_ADDR, newlen=%d\n", r);
+		return r;
+	}
+	if (op == MPTCP_MUT_MP_PRIO) {
+		int r = syz_mptcp_mut_mp_prio(pkt, len, ihl, th);
+		if (r != 0)
+			debug("syz_mptcp_mut_mp_prio: grafted MP_PRIO, newlen=%d\n", r);
 		return r;
 	}
 	uint8* o = pkt + ihl + sizeof(struct tcphdr);
