@@ -79,7 +79,10 @@ define MPTCP_MUT_ADD_ADDR_ECHO	13
 # ADD_ADDR (16 bytes) with a computed add-addr HMAC -> mptcp_pm_add_addr_received
 # (the raced pm->remote single-slot). Needs MPTCP_INIT_CAPTURE_KEYS.
 define MPTCP_MUT_ADD_ADDR_AUTH	14
-mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_MUT_NONCE_FLIP, MPTCP_MUT_CRYPTO_SELFVERIFY, MPTCP_MUT_HMAC_FORGE, MPTCP_MUT_DSS_SEQ, MPTCP_MUT_DSS_SUBSEQ, MPTCP_MUT_DSS_LEN_INF, MPTCP_MUT_DSS_LEN_OFF, MPTCP_MUT_DSS_CSUM, MPTCP_MUT_DSS_DATA_FIN, MPTCP_MUT_THMAC_FLIP, MPTCP_MUT_ADD_ADDR_ECHO, MPTCP_MUT_ADD_ADDR_AUTH
+# Phase 4 (A3): MP_FAIL graft on a live msk -> mptcp_pm_mp_fail_received (fallback
+# machinery, the 006 cluster); to be raced vs teardown verbs.
+define MPTCP_MUT_MP_FAIL	15
+mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_MUT_NONCE_FLIP, MPTCP_MUT_CRYPTO_SELFVERIFY, MPTCP_MUT_HMAC_FORGE, MPTCP_MUT_DSS_SEQ, MPTCP_MUT_DSS_SUBSEQ, MPTCP_MUT_DSS_LEN_INF, MPTCP_MUT_DSS_LEN_OFF, MPTCP_MUT_DSS_CSUM, MPTCP_MUT_DSS_DATA_FIN, MPTCP_MUT_THMAC_FLIP, MPTCP_MUT_ADD_ADDR_ECHO, MPTCP_MUT_ADD_ADDR_AUTH, MPTCP_MUT_MP_FAIL
 syz_mptcp_join_subflow(pair mptcp_pair, addr_id int8, backup int8[0:1], mut_op flags[mptcp_mut_ops]) mptcp_subflow (remote_cover)
 syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 

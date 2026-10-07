@@ -1266,11 +1266,12 @@ static inline void syz_mptcp_dbg_addaddr_mib(const char* tag, long pair_slot)
 	char* v_end = strchr(v, '\n');
 	if (!v_end)
 		v_end = nsbuf + n;
-	debug("syz_mptcp_addaddr: pair=%ld %s MPTcpExt AddAddr=%ld EchoAdd=%ld AddAddrDrop=%ld\n",
+	debug("syz_mptcp_addaddr: pair=%ld %s MPTcpExt AddAddr=%ld EchoAdd=%ld AddAddrDrop=%ld MPFailRx=%ld\n",
 	      pair_slot, tag,
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "AddAddr"),
 	      syz_mptcp_mib_get(h, h_end, v, v_end, "EchoAdd"),
-	      syz_mptcp_mib_get(h, h_end, v, v_end, "AddAddrDrop"));
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "AddAddrDrop"),
+	      syz_mptcp_mib_get(h, h_end, v, v_end, "MPFailRx"));
 }
 
 // The MPTCP_EVENT_SUB_ESTABLISHED / MPTCP_ATTR_* values used below are mirrored
@@ -1591,7 +1592,8 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// are NOT retired here -- syz_mptcp_subflow_destroy / syz_mptcp_pair_close do it.
 	if (mut_op != MPTCP_MUT_NONE &&
 	    !(mut_op >= MPTCP_MUT_DSS_SEQ && mut_op <= MPTCP_MUT_DSS_DATA_FIN) &&
-	    mut_op != MPTCP_MUT_ADD_ADDR_ECHO && mut_op != MPTCP_MUT_ADD_ADDR_AUTH)
+	    mut_op != MPTCP_MUT_ADD_ADDR_ECHO && mut_op != MPTCP_MUT_ADD_ADDR_AUTH &&
+	    mut_op != MPTCP_MUT_MP_FAIL)
 		syz_mptcp_mut_retire();
 
 	// in_use already published by the atomic claim above. Record the

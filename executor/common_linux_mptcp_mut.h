@@ -92,6 +92,14 @@
 // target), which the echo path (Phase 3a) does NOT reach. Needs captured keys.
 #define MPTCP_MUT_ADD_ADDR_AUTH 14
 
+// --- Phase 4 (A3): MP_FAIL graft on a live msk. Unauthenticated 12-byte option ->
+// mptcp_pm_mp_fail_received (pm.c:872): takes msk->fallback_lock, flips allow_subflows
+// / arms the infinite-map fallback -- the 006 fallback machinery, "historically the
+// buggiest MPTCP corner". The Phase-4 point is to RACE this against the teardown verbs
+// (join_close_race/disconnect/close_server) = the 005/006 UAF cluster. First a
+// capability proof that the graft fires + reaches the handler; the race is the hunt.
+#define MPTCP_MUT_MP_FAIL 15
+
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
@@ -125,6 +133,12 @@
 #define MPTCP_ADD_ADDR_ECHO_OLEN 8
 #define MPTCP_ADD_ADDR_AUTH_OLEN 16 // non-echo IPv4, no port, +8-byte ahmac (TCPOLEN_MPTCP_ADD_ADDR)
 #define MPTCP_ADD_ADDR_GRAFT_ID 0x9 // announced address id (arbitrary, distinct)
+// MP_FAIL graft (Phase 4). Subtype 6; 12-byte option (TCPOLEN_MPTCP_FAIL):
+// [kind=30][len=12][subtype<<4|rsv][rsv][fail_seq:be64]. Unauthenticated; coexists
+// with DSS/RST only (options.c:405), which the DSS data/ack carriers satisfy.
+#define MPTCP_SUB_MP_FAIL 6
+#define MPTCP_MP_FAIL_OLEN 12
+#define MPTCP_MP_FAIL_SEQ 0x1000 // fail_seq (data-level seq for the infinite map; arbitrary)
 #define MPTCP_MUT_MAX_TCP_HDR 60
 #define MPTCP_DSS_FLAG_A 0x01 // Data ACK present
 #define MPTCP_DSS_FLAG_a 0x02 // Data ACK is 8 octets (else 4)
@@ -507,6 +521,29 @@ static inline int syz_mptcp_mut_add_addr_auth(uint8* pkt, int len, int ihl, stru
 	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_ADD_ADDR_AUTH_OLEN);
 }
 
+// Phase 4 (A3): graft an unauthenticated 12-byte MP_FAIL option -> mptcp_pm_mp_fail_received
+// (msk->fallback_lock, allow_subflows=false, arms infinite-map; the 006 fallback
+// machinery). Coexists only with DSS/RST (options.c:405) -- the DSS data/ack carriers
+// satisfy that, and the shared helper's handshake-reject carrier rule is enough.
+static inline int syz_mptcp_mut_mp_fail(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	uint8 o[MPTCP_MP_FAIL_OLEN];
+	o[0] = MPTCP_TCPOPT; // kind 30
+	o[1] = MPTCP_MP_FAIL_OLEN; // 12 (TCPOLEN_MPTCP_FAIL)
+	o[2] = (MPTCP_SUB_MP_FAIL << 4); // subtype 6, rsv nibble 0
+	o[3] = 0; // rsv byte (kernel skips subtype+this via ptr += 2, then reads fail_seq)
+	uint64 seq = MPTCP_MP_FAIL_SEQ;
+	o[4] = (uint8)(seq >> 56);
+	o[5] = (uint8)(seq >> 48);
+	o[6] = (uint8)(seq >> 40);
+	o[7] = (uint8)(seq >> 32);
+	o[8] = (uint8)(seq >> 24);
+	o[9] = (uint8)(seq >> 16);
+	o[10] = (uint8)(seq >> 8);
+	o[11] = (uint8)(seq);
+	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_MP_FAIL_OLEN);
+}
+
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
 // see common_linux_mptcp_nfq.h): >0 = the packet's new total IP length (the engine
 // re-injects that many bytes and recomputes checksums; == len for a same-length
@@ -563,6 +600,13 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 		if (r != 0)
 			debug("syz_mptcp_mut_add_addr: grafted %s ADD_ADDR, newlen=%d\n",
 			      op == MPTCP_MUT_ADD_ADDR_ECHO ? "echo" : "auth", r);
+		return r;
+	}
+	// Phase 4 (A3): MP_FAIL graft -> mptcp_pm_mp_fail_received (fallback machinery).
+	if (op == MPTCP_MUT_MP_FAIL) {
+		int r = syz_mptcp_mut_mp_fail(pkt, len, ihl, th);
+		if (r != 0)
+			debug("syz_mptcp_mut_mp_fail: grafted MP_FAIL, newlen=%d\n", r);
 		return r;
 	}
 	uint8* o = pkt + ihl + sizeof(struct tcphdr);
