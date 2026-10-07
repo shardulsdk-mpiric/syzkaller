@@ -100,6 +100,13 @@
 // capability proof that the graft fires + reaches the handler; the race is the hunt.
 #define MPTCP_MUT_MP_FAIL 15
 
+// --- Phase 4 (A4): MP_FASTCLOSE graft. 12-byte option carrying the RECEIVER's key
+// (rcvr_key == server msk->local_key == our captured remote_key); the server accepts
+// it (options.c:1260) -> rcv_fastclose + schedule_work TEARDOWN. Because it itself
+// drives a teardown, racing it vs the teardown verbs is a teardown-vs-teardown race --
+// maximally 005/006-shaped. Needs CAPTURE_KEYS (uses remote_key).
+#define MPTCP_MUT_MP_FASTCLOSE 16
+
 // MP_JOIN wire constants (RFC 8684; net/mptcp/options.c).
 // SYN:     [kind][len=12][sub|bkup][join_id][token:be32][nonce:be32]
 // SYN-ACK: [kind][len=16][sub|bkup][join_id][thmac:be64][nonce:be32]
@@ -139,6 +146,10 @@
 #define MPTCP_SUB_MP_FAIL 6
 #define MPTCP_MP_FAIL_OLEN 12
 #define MPTCP_MP_FAIL_SEQ 0x1000 // fail_seq (data-level seq for the infinite map; arbitrary)
+// MP_FASTCLOSE graft (Phase 4). Subtype 7; 12-byte option (TCPOLEN_MPTCP_FASTCLOSE):
+// [kind=30][len=12][subtype<<4|rsv][rsv][rcvr_key:be64]. rcvr_key = the receiver's key.
+#define MPTCP_SUB_MP_FASTCLOSE 7
+#define MPTCP_MP_FASTCLOSE_OLEN 12
 #define MPTCP_MUT_MAX_TCP_HDR 60
 #define MPTCP_DSS_FLAG_A 0x01 // Data ACK present
 #define MPTCP_DSS_FLAG_a 0x02 // Data ACK is 8 octets (else 4)
@@ -544,6 +555,30 @@ static inline int syz_mptcp_mut_mp_fail(uint8* pkt, int len, int ihl, struct tcp
 	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_MP_FAIL_OLEN);
 }
 
+// Phase 4 (A4): graft a 12-byte MP_FASTCLOSE carrying the receiver's key (rcvr_key ==
+// server msk->local_key == our captured remote_key) -> the server accepts it
+// (options.c:1260) and schedule_work()s a TEARDOWN. Coexists with DSS/RST. Needs keys.
+static inline int syz_mptcp_mut_mp_fastclose(uint8* pkt, int len, int ihl, struct tcphdr* th)
+{
+	if (!syz_mptcp_mut.keys_valid)
+		return 0; // need the server key (remote_key) as rcvr_key
+	uint8 o[MPTCP_MP_FASTCLOSE_OLEN];
+	o[0] = MPTCP_TCPOPT; // kind 30
+	o[1] = MPTCP_MP_FASTCLOSE_OLEN; // 12 (TCPOLEN_MPTCP_FASTCLOSE)
+	o[2] = (MPTCP_SUB_MP_FASTCLOSE << 4); // subtype 7, rsv nibble 0
+	o[3] = 0; // rsv byte (kernel skips subtype+this via ptr += 2, then reads rcvr_key)
+	uint64 k = syz_mptcp_mut.remote_key; // server's msk->local_key (the receiver)
+	o[4] = (uint8)(k >> 56);
+	o[5] = (uint8)(k >> 48);
+	o[6] = (uint8)(k >> 40);
+	o[7] = (uint8)(k >> 32);
+	o[8] = (uint8)(k >> 24);
+	o[9] = (uint8)(k >> 16);
+	o[10] = (uint8)(k >> 8);
+	o[11] = (uint8)(k);
+	return syz_mptcp_mut_graft_opt(pkt, len, ihl, th, o, MPTCP_MP_FASTCLOSE_OLEN);
+}
+
 // The NFQUEUE hook (matches syz_nfq_mutate_fn). Return contract (engine-shared,
 // see common_linux_mptcp_nfq.h): >0 = the packet's new total IP length (the engine
 // re-injects that many bytes and recomputes checksums; == len for a same-length
@@ -607,6 +642,13 @@ static inline int syz_mptcp_mut_hook(uint8* pkt, int len)
 		int r = syz_mptcp_mut_mp_fail(pkt, len, ihl, th);
 		if (r != 0)
 			debug("syz_mptcp_mut_mp_fail: grafted MP_FAIL, newlen=%d\n", r);
+		return r;
+	}
+	// Phase 4 (A4): MP_FASTCLOSE graft -> rcv_fastclose + schedule_work teardown.
+	if (op == MPTCP_MUT_MP_FASTCLOSE) {
+		int r = syz_mptcp_mut_mp_fastclose(pkt, len, ihl, th);
+		if (r != 0)
+			debug("syz_mptcp_mut_mp_fastclose: grafted MP_FASTCLOSE, newlen=%d\n", r);
 		return r;
 	}
 	uint8* o = pkt + ihl + sizeof(struct tcphdr);
