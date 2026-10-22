@@ -51,9 +51,12 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
 - **brief:** none yet; see `sys/linux/socket_sctp_flow.txt` +
   `executor/common_linux_sctp.h`.
 - **goal:** typed SCTP chunk grammars so the fuzzer reaches the real chunk
-  handlers. RECONF has landed; DATA / SACK / FORWARD-TSN grammars are the next
-  increments.
-- **keywords:** sctp, chunk, grammar, reconf, data, sack, fwd-tsn, vtag.
+  handlers. Increment 1 (RECONF, `5c9074abd`) and increment 2
+  (DATA / FORWARD-TSN / SACK + stream-reset-enable init flag, `efc9fc497`)
+  have both LANDED in protocol-flow-harness. Candidate next increments:
+  AUTH / ASCONF typed bodies, or deeper I-DATA reassembly / interleave state.
+- **keywords:** sctp, chunk, grammar, reconf, data, sack, fwd-tsn, i-data,
+  asconf, auth, vtag.
 
 ### structops_surfaces
 - **status:** open.
