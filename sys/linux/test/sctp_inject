@@ -1,0 +1,15 @@
+# requires: arch=amd64
+# Establish an SCTP association with verification-tag capture, drive data, and
+# inject a raw chunk and the typed RECONF/DATA/SACK/FORWARD-TSN chunks, then
+# close. Needs CONFIG_IP_SCTP and sandbox=none/namespace (CAP_NET_RAW).
+# Scoped to amd64: the SCTP protocol-flow harness (executor responders +
+# remote_cover) is built and campaigned on amd64 only.
+
+r0 = syz_sctp_pair_init(0x1)
+syz_sctp_drive_traffic(r0, &AUTO="00010203", 0x4)
+syz_sctp_inject_chunk$captured(r0, 0x40, &AUTO="00000000", 0x4, 0x0)
+syz_sctp_inject_typed$reconf(r0, &AUTO, AUTO, 0x3)
+syz_sctp_inject_typed$data(r0, &AUTO, AUTO, 0x1)
+syz_sctp_inject_typed$sack(r0, &AUTO, AUTO, 0x2)
+syz_sctp_inject_typed$fwdtsn(r0, &AUTO, AUTO, 0x1)
+syz_sctp_pair_close(r0)
