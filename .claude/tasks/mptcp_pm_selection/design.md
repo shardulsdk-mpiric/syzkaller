@@ -183,4 +183,55 @@ differential configs that enable whatever carrier is chosen.
   - `$variants` need no vminfo change.
   - Later synergy (not step 1): a narrow `syz_mptcp_set_sysctl` op on the §3.5
     save/restore infrastructure.
-- Pending: Shardul's go to start step-1 code.
+- 2026-10-30, Shardul: go for step-1 code.
+- 2026-10-30, step-1 implementation notes (where the code differs from §3):
+  - **Handles:** only `mptcp_client_userspace` exists in step 1. syzkaller's
+    compiler rejects a resource that no call consumes, and only `join_subflow`
+    consumes one today. The kernel-client handle comes with step 2, and the
+    server handles with step 3.
+  - **pair_init arguments:** pair_init takes `(…, flags, pm, client)`.
+    Kernel-client variants pass `client const[0]`, so all variants share one C
+    signature. Old 3-argument programs parse non-strict with
+    `pm=0` (userspace/userspace), and their join stays linked to the pair
+    (`TestMPTCPLegacyPairInitStillLinks`).
+  - **Order in pair_init:**
+    1. Take the netns lock and save the settings.
+    2. Write timestamps/checksum.
+    3. Write the client PM, then `socket()` the client.
+    4. Write the server PM, then listener, `connect`, `accept`.
+    5. Restore the settings and unlock.
+  - **Join:** re-applies the pair's timestamps setting around SUBFLOW_CREATE,
+    because the subflow SYN reads it during the call. Without that, a
+    `NO_TIMESTAMPS` pair's joins would regain timestamps once pair_init restores
+    the setting.
+  - **Disconnect:** re-applies both the server end's PM and the pair's checksum
+    setting (the kernel re-reads both, `protocol.c:3753-3754`).
+  - **Reset hook:** `checkpoint/reset_net_namespace` also record/restore
+    `path_manager`, `pm_type`, `checksum_enabled` and `tcp_timestamps`.
+  - **Behaviour change:** `listener_close_race` and any stock `socket$inet_mptcp`
+    now always get the netns default PM (in-kernel). That's what a fresh
+    reproducer sees; before, they got whatever an earlier pair_init had left
+    behind.
+  - **Residual nondeterminism:** under `-threaded`, a stock MPTCP socket created
+    by another thread while pair_init holds the lock still sees the temporary
+    setting. The harness can't serialize stock syscalls.
+- 2026-10-30, step 1 verified (MPTCP patched kernel, `open/run/pm_selection_test/`):
+  - **Run-tests:** `syz-manager -mode run-tests -tests mptcp`: 86 OK, 1 skip, 2
+    fail. The two failures are `mptcp_join_close_race` in threaded C modes
+    ("call is Blocked"). That flake predates step 1: 3/24 runs fail on the
+    pinned pre-change binaries, 1/24 on the new ones. Both new tests
+    (`mptcp_pm_kernel`, `mptcp_pm_mixed`) pass in every mode.
+  - **Coverage probe:** `mptcp_pm_kernel_init` runs only for in-kernel PM msks.
+    Every call matched the prediction:
+    - userspace/userspace pair_init and its disconnect: not covered;
+    - kernel/kernel pair_init and its disconnect: covered;
+    - the server-kernel pair's disconnect: covered;
+    - the client-kernel pair's disconnect: not covered (server stays userspace);
+    - `listener_close_race` after a userspace pair: covered, so the netns
+      default was restored.
+  - **Joins:** a userspace client joined a kernel-PM server successfully, and a
+    legacy 3-argument program's join still establishes.
+  - **Other checks:** single-call C reproducers build with `-Werror`, plain and
+    threaded with `net_reset`.
+  - `TestParsing` fails on `linux/loong64` only. That's pre-existing: the
+    `.const` arches line has never listed loong64.
