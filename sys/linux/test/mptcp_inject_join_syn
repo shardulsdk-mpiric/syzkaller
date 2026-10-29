@@ -5,7 +5,7 @@
 # injections succeed (return 0) and the pair remains usable (non-consuming), then
 # it is torn down.
 
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0)
 syz_mptcp_inject_join_syn(r0)
 syz_mptcp_inject_join_syn(r0)
 syz_mptcp_pair_close(r0)

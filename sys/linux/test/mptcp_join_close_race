@@ -9,5 +9,5 @@
 # join_close_race is TERMINAL: it consumes the pair (frees the slot) itself, like
 # pair_close -- so there is deliberately no pair_close after it.
 
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0)
 syz_mptcp_join_close_race(r0)

@@ -57,6 +57,7 @@
 
 #include <endian.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/ip.h>
@@ -238,6 +239,14 @@ enum {
 // a mapping-validation path we otherwise never reach. Opt-in.
 #define MPTCP_INIT_CHECKSUM 8
 
+// syz_mptcp_pair_init pm argument (harness constants; mirrored in .txt + .const):
+// bit 0 puts the client end on the in-kernel path manager, bit 1 the server end.
+// Clear bits mean the userspace path manager.
+#define MPTCP_PAIR_PM_USERSPACE 0
+#define MPTCP_PAIR_PM_CLIENT_KERNEL 1
+#define MPTCP_PAIR_PM_SERVER_KERNEL 2
+#define MPTCP_PAIR_PM_KERNEL 3
+
 struct syz_mptcp_pair_slot {
 	bool in_use;
 	int server_fd;
@@ -282,6 +291,16 @@ struct syz_mptcp_pair_slot {
 	// burst + partial-drain, leaving data on the msk send head for the
 	// softirq deferred-push path.
 	bool rwnd_clamped;
+
+	// The netns settings this pair was created with. The kernel re-reads them
+	// later for this pair (the PM and checksum setting on disconnect, the
+	// timestamps setting on a join SYN), so the calls that trigger those reads
+	// apply them again rather than leaving the pair at the mercy of whatever the
+	// netns holds by then.
+	bool client_kernel_pm;
+	bool server_kernel_pm;
+	bool checksum_enabled;
+	bool no_timestamps;
 
 	// Captured off the wire when MPTCP_INIT_CAPTURE_KEYS is set: the two
 	// MP_CAPABLE keys (client=local, server=remote), for userspace HMAC recompute.
@@ -352,38 +371,60 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 #define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || __NR_syz_mptcp_subflow_info)
 #define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
 #define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow)
+// The calls that apply netns settings for one pair (see mptcp_netns_save):
+// pair_init at creation, join for the subflow SYN, disconnect for the msk reset.
+// Only pair_init and disconnect switch the path manager.
+#define MPTCP_NEED_NETNS_SETTINGS (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_disconnect)
+#define MPTCP_NEED_PM_SWITCH (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_disconnect)
 
 #if MPTCP_NEED_SUBFLOW_CALL
 static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[MPTCP_SUBFLOW_POOL_SIZE];
 #endif
 
-// ---------- Userspace path-manager setup (needed for MP_JOIN) ----------
+#if MPTCP_NEED_NLMSG || MPTCP_NEED_NETNS_SETTINGS
+// Minimal spinlock over an int flag, used by the genl transactions, the one-time
+// netlink setup and the netns settings below. __atomic builtins need no header and
+// are available in every reproducer build; usleep is already used in this file.
+static void mptcp_spin_lock(volatile int* lock)
+{
+	while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE))
+		usleep(50);
+}
+
+static void mptcp_spin_unlock(volatile int* lock)
+{
+	__atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+}
+#endif
+
+// ---------- Path-manager selection and userspace-PM setup ----------
 //
-// syz_mptcp_join_subflow() asks the kernel's userspace path-manager to
-// create a subflow on an already-established msk
-// (MPTCP_PM_CMD_SUBFLOW_CREATE). Two preconditions have to be in place
-// before the first join on a given msk can succeed, and both reach back
-// into syz_mptcp_pair_init():
+// Each msk runs one path manager, fixed when the msk is created:
+// mptcp_pm_data_reset() (net/mptcp/pm.c) copies the netns setting
+// (net.mptcp.path_manager, or the older pm_type) into it. That happens inside
+// socket(IPPROTO_MPTCP) for the client, when the handshake clones the server msk
+// off the listener, and again on disconnect. syz_mptcp_pair_init() therefore
+// writes each end's choice right before that end's msk is created, under
+// mptcp_netns_lock, and restores the netns setting once the server end has been
+// accepted (see mptcp_netns_save). The choice is part of the program and nothing
+// outlives the call.
 //
-//   1. mptcp_pm_data_reset() (net/mptcp/pm.c) captures pm_type from the
-//      net.mptcp.pm_type sysctl at MSK CREATION time -- i.e. inside
-//      socket(IPPROTO_MPTCP) -- and never re-reads it later. Writing the
-//      sysctl to userspace-PM (1) only takes effect for msks created
-//      AFTER the write, so syz_mptcp_pair_init() has to call
-//      mptcp_pm_ensure_setup() before it creates either endpoint's
-//      socket, not merely before any later join.
-//   2. The server's acceptance gate for an incoming MP_JOIN in
-//      userspace-PM mode (mptcp_userspace_pm_active(), consulted from
-//      mptcp_can_accept_new_subflow() in net/mptcp/subflow.c) requires a
-//      live multicast listener on the "mptcp_pm_events" genl group --
-//      we never need to read an event, just to hold the subscription
-//      open.
+// A userspace-PM end additionally needs the one-time netlink setup in
+// mptcp_pm_ensure_netlink():
 //
-// mptcp_pm_ensure_setup() is idempotent (mptcp_pm_setup_done latches)
-// and is called from both syz_mptcp_pair_init() and
-// syz_mptcp_join_subflow(), so whichever runs first in a given process
-// does the one-time work -- a C reproducer that re-enters at either
-// pseudo-syscall still works.
+//   1. The genl family id, for MPTCP_PM_CMD_SUBFLOW_CREATE/DESTROY (join and
+//      subflow_destroy act on a userspace client end).
+//   2. A live listener on the "mptcp_pm_events" genl group: the server's
+//      acceptance gate for an incoming MP_JOIN in userspace-PM mode
+//      (mptcp_userspace_pm_active(), consulted from
+//      mptcp_can_accept_new_subflow() in net/mptcp/subflow.c) requires one. We
+//      never need to read an event, just to hold the subscription open.
+//
+// mptcp_pm_ensure_netlink() is idempotent (mptcp_pm_setup_done latches). It is
+// called from syz_mptcp_pair_init() when at least one end is userspace and from
+// syz_mptcp_join_subflow(), so a C reproducer that re-enters at either
+// pseudo-syscall still works. A pair with both ends on the in-kernel PM never
+// touches it.
 
 // ---------- Self-contained raw netlink message building ----------
 //
@@ -400,7 +441,7 @@ static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[MPTCP_SUBFLOW_POOL_S
 // avoids coupling to other subsystems' feature flags.
 //
 // Needed by (MPTCP_NEED_NLMSG): pair_init and join_subflow (both via
-// mptcp_pm_ensure_setup -> mptcp_pm_resolve_family) and subflow_destroy
+// mptcp_pm_ensure_netlink -> mptcp_pm_resolve_family) and subflow_destroy
 // (via mptcp_pm_subflow_destroy) -- every one of the four calls except
 // pair_close, which never touches netlink.
 #if MPTCP_NEED_NLMSG
@@ -420,20 +461,6 @@ static uint16 mptcp_pm_family_id;
 // (defence in depth against a stale datagram left in the socket buffer).
 static int mptcp_nlmsg_lock;
 static uint32 mptcp_nlmsg_seq_ctr;
-
-// Minimal spinlock over an int flag, used both here and by the one-time
-// userspace-PM setup below. __atomic builtins need no header and are
-// available in every reproducer build; usleep is already used in this file.
-static void mptcp_spin_lock(volatile int* lock)
-{
-	while (__atomic_exchange_n(lock, 1, __ATOMIC_ACQUIRE))
-		usleep(50);
-}
-
-static void mptcp_spin_unlock(volatile int* lock)
-{
-	__atomic_store_n(lock, 0, __ATOMIC_RELEASE);
-}
 
 static void mptcp_nlmsg_init(struct mptcp_nlmsg* m, int typ, const void* data, int size)
 {
@@ -564,12 +591,12 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 #endif // MPTCP_NEED_NLMSG
 
 // Needed by (MPTCP_NEED_PM_SETUP): pair_init and join_subflow only --
-// the two callers of mptcp_pm_ensure_setup(). subflow_destroy reads
+// the two callers of mptcp_pm_ensure_netlink(). subflow_destroy reads
 // mptcp_pm_genl_sock/mptcp_pm_family_id directly (see the NLMSG block
 // above) but never calls ensure_setup, so it doesn't need these.
 #if MPTCP_NEED_PM_SETUP
 static int mptcp_pm_setup_done;
-static int mptcp_pm_setup_lock; // serializes the one-time setup under -threaded
+static int mptcp_pm_setup_lock; // serializes the one-time netlink setup under -threaded
 static int mptcp_pm_event_sock = -1; // held open + subscribed so mptcp_userspace_pm_active() is true
 static uint32 mptcp_pm_event_grp_id; // "mptcp_pm_events" mcast group id, for per-join event sockets
 
@@ -647,7 +674,7 @@ static int mptcp_pm_resolve_family(int sock, uint16* family_id_out, uint32* even
 	return 0;
 }
 
-static int mptcp_pm_ensure_setup(void)
+static int mptcp_pm_ensure_netlink(void)
 {
 	struct sockaddr_nl sa;
 	uint32 event_grp_id = 0;
@@ -657,23 +684,19 @@ static int mptcp_pm_ensure_setup(void)
 	if (__atomic_load_n(&mptcp_pm_setup_done, __ATOMIC_ACQUIRE))
 		return 0;
 
-	// Serialize first-time setup: exactly one thread does the pm_type write,
-	// family resolve and event subscription; others wait and then observe
-	// setup_done. Idempotent re-entry from either pair_init or join_subflow.
+	// Serialize first-time setup: exactly one thread does the family resolve
+	// and event subscription; others wait and then observe setup_done.
+	// Idempotent re-entry from either pair_init or join_subflow. The path
+	// manager itself is chosen per msk by pair_init, not here.
 	mptcp_spin_lock(&mptcp_pm_setup_lock);
 	if (mptcp_pm_setup_done) {
 		mptcp_spin_unlock(&mptcp_pm_setup_lock);
 		return 0;
 	}
 
-	if (!write_file("/proc/sys/net/mptcp/pm_type", "1")) {
-		debug("mptcp_pm_ensure_setup: write pm_type=1: %d\n", errno);
-		goto fail;
-	}
-
 	sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 	if (sock < 0) {
-		debug("mptcp_pm_ensure_setup: socket(genl): %d\n", errno);
+		debug("mptcp_pm_ensure_netlink: socket(genl): %d\n", errno);
 		goto fail;
 	}
 	// Bound the reply recv in mptcp_nlmsg_send(): it runs while holding
@@ -687,7 +710,7 @@ static int mptcp_pm_ensure_setup(void)
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
 	if (bind(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-		debug("mptcp_pm_ensure_setup: bind(genl): %d\n", errno);
+		debug("mptcp_pm_ensure_netlink: bind(genl): %d\n", errno);
 		goto fail;
 	}
 	if (mptcp_pm_resolve_family(sock, &mptcp_pm_family_id, &event_grp_id) < 0)
@@ -695,17 +718,17 @@ static int mptcp_pm_ensure_setup(void)
 
 	event_sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
 	if (event_sock < 0) {
-		debug("mptcp_pm_ensure_setup: socket(event): %d\n", errno);
+		debug("mptcp_pm_ensure_netlink: socket(event): %d\n", errno);
 		goto fail;
 	}
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
 	if (bind(event_sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-		debug("mptcp_pm_ensure_setup: bind(event): %d\n", errno);
+		debug("mptcp_pm_ensure_netlink: bind(event): %d\n", errno);
 		goto fail;
 	}
 	if (setsockopt(event_sock, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &event_grp_id, sizeof(event_grp_id)) < 0) {
-		debug("mptcp_pm_ensure_setup: NETLINK_ADD_MEMBERSHIP mptcp_pm_events: %d\n", errno);
+		debug("mptcp_pm_ensure_netlink: NETLINK_ADD_MEMBERSHIP mptcp_pm_events: %d\n", errno);
 		goto fail;
 	}
 
@@ -713,7 +736,7 @@ static int mptcp_pm_ensure_setup(void)
 	mptcp_pm_event_sock = event_sock;
 	mptcp_pm_event_grp_id = event_grp_id;
 	__atomic_store_n(&mptcp_pm_setup_done, 1, __ATOMIC_RELEASE);
-	debug("mptcp_pm_ensure_setup: pm_type=1 family_id=%d event_grp_id=%d\n",
+	debug("mptcp_pm_ensure_netlink: family_id=%d event_grp_id=%d\n",
 	      mptcp_pm_family_id, event_grp_id);
 	mptcp_spin_unlock(&mptcp_pm_setup_lock);
 	return 0;
@@ -727,6 +750,97 @@ fail:
 	return -1;
 }
 #endif // MPTCP_NEED_PM_SETUP
+
+#if MPTCP_NEED_NETNS_SETTINGS
+// Netns settings the kernel reads when it creates an msk or a subflow. They are
+// per-netns, and the executor's netns outlives every program it runs, so a call
+// that changes one for its pair saves it first and restores it before returning
+// (all under mptcp_netns_lock, since threads share the netns). The pair records
+// its own values so the later calls that make the kernel re-read them can apply
+// them again. The executor's per-program netns reset (reset_net_namespace) puts
+// them back too, for a program killed in the middle of such a call.
+#define MPTCP_SYSCTL_PATH_MANAGER "/proc/sys/net/mptcp/path_manager"
+#define MPTCP_SYSCTL_PM_TYPE "/proc/sys/net/mptcp/pm_type"
+#define MPTCP_SYSCTL_CHECKSUM "/proc/sys/net/mptcp/checksum_enabled"
+#define MPTCP_SYSCTL_TIMESTAMPS "/proc/sys/net/ipv4/tcp_timestamps"
+
+static int mptcp_netns_lock;
+
+struct mptcp_netns_saved {
+	const char* pm_path; // path_manager, or pm_type on kernels without it; NULL if not saved
+	char pm[32];
+	char checksum[8]; // empty if not saved
+	char timestamps[8];
+};
+
+static bool mptcp_sysctl_read(const char* path, char* buf, int size)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	int n = read(fd, buf, size - 1);
+	close(fd);
+	if (n <= 0)
+		return false;
+	buf[n] = 0;
+	if (buf[n - 1] == '\n')
+		buf[n - 1] = 0;
+	return true;
+}
+
+static bool mptcp_sysctl_write(const char* path, const char* val)
+{
+	int fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		debug("mptcp_sysctl_write: open %s: %d\n", path, errno);
+		return false;
+	}
+	int len = strlen(val);
+	bool ok = write(fd, val, len) == len;
+	if (!ok)
+		debug("mptcp_sysctl_write: write %s=%s: %d\n", path, val, errno);
+	close(fd);
+	return ok;
+}
+
+// Saves the settings a call is about to change. The caller holds mptcp_netns_lock
+// until the matching mptcp_netns_restore().
+static void mptcp_netns_save(struct mptcp_netns_saved* saved, bool pm, bool checksum, bool timestamps)
+{
+	memset(saved, 0, sizeof(*saved));
+	if (pm) {
+		if (mptcp_sysctl_read(MPTCP_SYSCTL_PATH_MANAGER, saved->pm, sizeof(saved->pm)))
+			saved->pm_path = MPTCP_SYSCTL_PATH_MANAGER;
+		else if (mptcp_sysctl_read(MPTCP_SYSCTL_PM_TYPE, saved->pm, sizeof(saved->pm)))
+			saved->pm_path = MPTCP_SYSCTL_PM_TYPE;
+	}
+	if (checksum && !mptcp_sysctl_read(MPTCP_SYSCTL_CHECKSUM, saved->checksum, sizeof(saved->checksum)))
+		saved->checksum[0] = 0;
+	if (timestamps && !mptcp_sysctl_read(MPTCP_SYSCTL_TIMESTAMPS, saved->timestamps, sizeof(saved->timestamps)))
+		saved->timestamps[0] = 0;
+}
+
+static void mptcp_netns_restore(const struct mptcp_netns_saved* saved)
+{
+	if (saved->pm_path)
+		mptcp_sysctl_write(saved->pm_path, saved->pm);
+	if (saved->checksum[0])
+		mptcp_sysctl_write(MPTCP_SYSCTL_CHECKSUM, saved->checksum);
+	if (saved->timestamps[0])
+		mptcp_sysctl_write(MPTCP_SYSCTL_TIMESTAMPS, saved->timestamps);
+}
+#endif // MPTCP_NEED_NETNS_SETTINGS
+
+#if MPTCP_NEED_PM_SWITCH
+// Selects the path manager for msks created from now on in this netns. Prefers
+// path_manager (pm_type is deprecated since v6.15); older kernels only have pm_type.
+static bool mptcp_set_pm(bool kernel_pm)
+{
+	if (access(MPTCP_SYSCTL_PATH_MANAGER, F_OK) == 0)
+		return mptcp_sysctl_write(MPTCP_SYSCTL_PATH_MANAGER, kernel_pm ? "kernel" : "userspace");
+	return mptcp_sysctl_write(MPTCP_SYSCTL_PM_TYPE, kernel_pm ? "0" : "1");
+}
+#endif // MPTCP_NEED_PM_SWITCH
 
 // Needed only by syz_mptcp_join_subflow().
 #if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
@@ -865,17 +979,30 @@ static int mptcp_parse_mpcapable(const uint8* pkt, int len, uint64* sndr, uint64
 	return 0;
 }
 
-static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile long a2)
+static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile long a2, volatile long a3,
+				volatile long a4)
 {
 	// server_addr / client_addr: not yet consulted, see file comment.
 	(void)a0;
 	(void)a1;
 	unsigned long init_flags = (unsigned long)a2;
+	// MPTCP_PAIR_PM_*: which ends run the in-kernel path manager.
+	bool client_kernel_pm = ((unsigned long)a3 & MPTCP_PAIR_PM_CLIENT_KERNEL) != 0;
+	bool server_kernel_pm = ((unsigned long)a3 & MPTCP_PAIR_PM_SERVER_KERNEL) != 0;
+	// Typed handle for a userspace-PM client end (same value as the returned
+	// pair), NULL for the variants with a kernel-PM client. Invalid until the
+	// pair is established, so a failed call can't leave it aliasing slot 0.
+	long* client_out = (long*)a4;
+	if (client_out)
+		*client_out = -1;
 
 	struct sockaddr_in srv_addr;
 	socklen_t alen = sizeof(srv_addr);
 	int one = 1;
 	int server_listen_fd = -1, client_fd = -1, server_fd = -1, cap_fd = -1;
+	struct mptcp_netns_saved saved;
+	bool netns_locked = false;
+	bool checksum_enabled = false;
 
 	// Claim a free slot atomically: mark in_use with a compare-exchange so
 	// two pair_init calls running on separate threads (the default
@@ -912,14 +1039,23 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 			 __atomic_load_n(&syz_mptcp_pair_pool[slot].generation, __ATOMIC_RELAXED) + 1,
 			 __ATOMIC_RELEASE);
 
-	// Must run before either endpoint's socket(IPPROTO_MPTCP) call --
-	// see the "Userspace path-manager setup" comment above
-	// mptcp_pm_ensure_setup() for why pm_type has to be set before the
-	// msk exists, not merely before a later join.
-	if (mptcp_pm_ensure_setup() < 0) {
-		debug("syz_mptcp_pair_init: userspace-PM setup failed\n");
+	// A userspace-PM end needs the genl family and the event listener (see the
+	// "Path-manager selection" comment above mptcp_pm_ensure_netlink). Done before
+	// taking mptcp_netns_lock; it never touches netns settings.
+	if ((!client_kernel_pm || !server_kernel_pm) && mptcp_pm_ensure_netlink() < 0) {
+		debug("syz_mptcp_pair_init: userspace-PM netlink setup failed\n");
 		goto fail;
 	}
+
+	// Everything this pair changes in the netns is saved here and restored once
+	// the server end has been accepted. The kernel has read every setting by then:
+	// the PM and checksum setting when each msk is created, the timestamps setting
+	// in the handshake.
+	mptcp_spin_lock(&mptcp_netns_lock);
+	netns_locked = true;
+	mptcp_netns_save(&saved, true,
+			 (init_flags & MPTCP_INIT_CHECKSUM) != 0,
+			 (init_flags & MPTCP_INIT_NO_TIMESTAMPS) != 0);
 
 	// Phase 3: free TCP option room for the length-grow graft ops by disabling TCP
 	// timestamps in this (unshared) netns before any socket exists. Per-netns sysctl;
@@ -946,6 +1082,29 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		} else {
 			debug("syz_mptcp_pair_init: open checksum_enabled errno=%d\n", errno);
 		}
+	}
+	// Record the checksum setting the pair negotiates with (the flag's value, or
+	// the netns default), for disconnect to apply again.
+	{
+		char cbuf[8];
+		checksum_enabled = mptcp_sysctl_read(MPTCP_SYSCTL_CHECKSUM, cbuf, sizeof(cbuf)) && cbuf[0] == '1';
+	}
+
+	// The client msk takes its path manager in socket(), so create it now, under
+	// the client's choice. The server msk is cloned off the listener during the
+	// handshake, so the server's choice must be in place before connect().
+	if (!mptcp_set_pm(client_kernel_pm)) {
+		debug("syz_mptcp_pair_init: select client PM failed\n");
+		goto fail;
+	}
+	client_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+	if (client_fd < 0) {
+		debug("syz_mptcp_pair_init: client socket: %d\n", errno);
+		goto fail;
+	}
+	if (!mptcp_set_pm(server_kernel_pm)) {
+		debug("syz_mptcp_pair_init: select server PM failed\n");
+		goto fail;
 	}
 
 	server_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
@@ -995,11 +1154,6 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		}
 	}
 
-	client_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
-	if (client_fd < 0) {
-		debug("syz_mptcp_pair_init: client socket: %d\n", errno);
-		goto fail;
-	}
 	if (connect(client_fd, (struct sockaddr*)&srv_addr, sizeof(srv_addr)) < 0) {
 		debug("syz_mptcp_pair_init: connect: %d\n", errno);
 		goto fail;
@@ -1009,6 +1163,11 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		debug("syz_mptcp_pair_init: accept: %d\n", errno);
 		goto fail;
 	}
+	// Both msks exist and the handshake is complete: nothing below makes the
+	// kernel read the netns settings for this pair.
+	mptcp_netns_restore(&saved);
+	mptcp_spin_unlock(&mptcp_netns_lock);
+	netns_locked = false;
 	if (init_flags & MPTCP_INIT_RWND_CLAMP) {
 		int rcvbuf = MPTCP_CLAMP_RCVBUF;
 		setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -1106,12 +1265,23 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	syz_mptcp_pair_pool[slot].server_listen_fd = server_listen_fd;
 	syz_mptcp_pair_pool[slot].server_port_h = ntohs(srv_addr.sin_port);
 	syz_mptcp_pair_pool[slot].rwnd_clamped = (init_flags & MPTCP_INIT_RWND_CLAMP) != 0;
-	debug("syz_mptcp_pair_init: pair %d established, port %d, token %u gen %u\n",
+	syz_mptcp_pair_pool[slot].client_kernel_pm = client_kernel_pm;
+	syz_mptcp_pair_pool[slot].server_kernel_pm = server_kernel_pm;
+	syz_mptcp_pair_pool[slot].checksum_enabled = checksum_enabled;
+	syz_mptcp_pair_pool[slot].no_timestamps = (init_flags & MPTCP_INIT_NO_TIMESTAMPS) != 0;
+	if (client_out)
+		*client_out = slot;
+	debug("syz_mptcp_pair_init: pair %d established, port %d, token %u gen %u, pm client=%s server=%s\n",
 	      slot, ntohs(srv_addr.sin_port), syz_mptcp_pair_pool[slot].token,
-	      syz_mptcp_pair_pool[slot].generation);
+	      syz_mptcp_pair_pool[slot].generation,
+	      client_kernel_pm ? "kernel" : "userspace", server_kernel_pm ? "kernel" : "userspace");
 	return slot;
 
 fail:
+	if (netns_locked) {
+		mptcp_netns_restore(&saved);
+		mptcp_spin_unlock(&mptcp_netns_lock);
+	}
 	if (server_fd >= 0)
 		close(server_fd);
 	if (client_fd >= 0)
@@ -1393,14 +1563,19 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		return -1;
 	}
 
-	// Idempotent -- syz_mptcp_pair_init() already ran this for the
-	// common case, but a C reproducer could in principle call this
-	// pseudo-syscall path without going back through pair_init's own
-	// copy of the check (it can't, in practice: the pair resource this
-	// call consumes can only come from pair_init, so pair_init's call
-	// already ran). Kept for direct-re-entry safety per the file
-	// comment above mptcp_pm_ensure_setup().
-	if (mptcp_pm_ensure_setup() < 0)
+	// SUBFLOW_CREATE is a userspace-PM command; the kernel rejects it on a
+	// kernel-PM msk ("userspace PM not selected"). The description only hands
+	// this call a userspace client end, so this is a guard for a mismatched
+	// handle, not a path the generator aims at.
+	if (pair->client_kernel_pm) {
+		debug("syz_mptcp_join_subflow: pair slot %ld client runs the in-kernel PM\n", pair_slot);
+		return -1;
+	}
+
+	// Idempotent -- syz_mptcp_pair_init() already ran this for a pair with a
+	// userspace end. Kept for direct-re-entry safety per the comment above
+	// mptcp_pm_ensure_netlink().
+	if (mptcp_pm_ensure_netlink() < 0)
 		return -1;
 
 	if (addr_id == 0)
@@ -1494,9 +1669,22 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 				      pair->keys_valid ? 1 : 0);
 	}
 
-	if (mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
-				    local_addr_be, local_port_h,
-				    remote_addr_be, pair->server_port_h) < 0) {
+	// The new subflow's SYN reads the netns timestamps setting while
+	// SUBFLOW_CREATE runs, so apply the pair's own setting around it: a pair
+	// created with MPTCP_INIT_NO_TIMESTAMPS keeps timestamp-free subflows.
+	struct mptcp_netns_saved saved;
+	mptcp_spin_lock(&mptcp_netns_lock);
+	mptcp_netns_save(&saved, false, false, pair->no_timestamps);
+	if (pair->no_timestamps)
+		mptcp_sysctl_write(MPTCP_SYSCTL_TIMESTAMPS, "0");
+	int create_err = mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
+						 local_addr_be, local_port_h,
+						 remote_addr_be, pair->server_port_h);
+	int create_errno = errno;
+	mptcp_netns_restore(&saved);
+	mptcp_spin_unlock(&mptcp_netns_lock);
+	errno = create_errno;
+	if (create_err < 0) {
 		debug("syz_mptcp_join_subflow: SUBFLOW_CREATE: %d\n", errno);
 		if (evfd >= 0)
 			close(evfd);
@@ -2141,9 +2329,22 @@ static long syz_mptcp_disconnect(volatile long a0)
 	}
 	// connect(AF_UNSPEC): __inet_stream_connect routes to sk_prot->disconnect
 	// (= mptcp_disconnect) before the state switch, so it is state-agnostic.
+	// mptcp_disconnect re-reads the netns path-manager and checksum settings
+	// (mptcp_pm_data_reset, csum_enabled), so apply the server end's own values
+	// around it: the end keeps the PM its typed handle says it has.
+	struct mptcp_netns_saved saved;
+	mptcp_spin_lock(&mptcp_netns_lock);
+	mptcp_netns_save(&saved, true, true, false);
+	mptcp_set_pm(pair->server_kernel_pm);
+	mptcp_sysctl_write(MPTCP_SYSCTL_CHECKSUM, pair->checksum_enabled ? "1" : "0");
 	memset(&unspec, 0, sizeof(unspec));
 	unspec.sa_family = AF_UNSPEC;
-	if (connect(pair->server_fd, &unspec, sizeof(unspec)) < 0) {
+	int err = connect(pair->server_fd, &unspec, sizeof(unspec));
+	int connect_errno = errno;
+	mptcp_netns_restore(&saved);
+	mptcp_spin_unlock(&mptcp_netns_lock);
+	errno = connect_errno;
+	if (err < 0) {
 		debug("syz_mptcp_disconnect: connect(AF_UNSPEC): %d\n", errno);
 		return -1;
 	}

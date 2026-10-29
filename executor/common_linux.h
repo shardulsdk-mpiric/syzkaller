@@ -75,8 +75,7 @@ static int event_timedwait(event_t* ev, uint64 timeout)
     SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID ||               \
     SYZ_FAULT || SYZ_LEAK || SYZ_BINFMT_MISC || SYZ_SYSCTL ||                           \
     ((__NR_syz_usb_connect || __NR_syz_usb_connect_ath9k) && USB_DEBUG) ||              \
-    __NR_syz_usbip_server_init ||                                                       \
-    __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow
+    __NR_syz_usbip_server_init
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -3738,15 +3737,17 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 
 #if (SYZ_EXECUTOR || SYZ_NET_RESET) && SYZ_EXECUTOR_USES_FORK_SERVER
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <linux/net.h>
 
 // checkpoint/reset_net_namespace partially resets net namespace to initial state
-// after each test. Currently it resets only ipv4 netfilter state.
+// after each test. Currently it resets netfilter state and a few net sysctls.
 // Ideally, we just create a new net namespace for each test,
 // however it's too slow (1-1.5 seconds per namespace, not parallelizable).
 
@@ -4210,6 +4211,59 @@ static void reset_ebtables()
 	close(fd);
 }
 
+// Netns sysctls that pseudo-syscalls change for the duration of a call: the MPTCP
+// pseudo-syscalls switch the path manager and the checksum and timestamps settings
+// while they create a connection, and restore them afterwards. Resetting them here
+// covers a program killed in the middle of such a call. Missing files (e.g. no
+// MPTCP) are skipped.
+static const char* net_sysctls[] = {
+    "/proc/sys/net/mptcp/path_manager",
+    "/proc/sys/net/mptcp/pm_type",
+    "/proc/sys/net/mptcp/checksum_enabled",
+    "/proc/sys/net/ipv4/tcp_timestamps",
+};
+static char net_sysctl_values[sizeof(net_sysctls) / sizeof(net_sysctls[0])][32];
+
+static int read_net_sysctl(const char* path, char* buf, int size)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd == -1)
+		return -1;
+	int n = read(fd, buf, size - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	return n;
+}
+
+static void checkpoint_net_sysctls(void)
+{
+	for (unsigned i = 0; i < sizeof(net_sysctls) / sizeof(net_sysctls[0]); i++) {
+		if (read_net_sysctl(net_sysctls[i], net_sysctl_values[i], sizeof(net_sysctl_values[i])) < 0)
+			net_sysctl_values[i][0] = 0;
+	}
+}
+
+static void reset_net_sysctls(void)
+{
+	for (unsigned i = 0; i < sizeof(net_sysctls) / sizeof(net_sysctls[0]); i++) {
+		char cur[sizeof(net_sysctl_values[i])];
+		if (!net_sysctl_values[i][0])
+			continue;
+		if (read_net_sysctl(net_sysctls[i], cur, sizeof(cur)) > 0 && strcmp(cur, net_sysctl_values[i]) == 0)
+			continue;
+		debug("resetting %s\n", net_sysctls[i]);
+		int fd = open(net_sysctls[i], O_WRONLY);
+		if (fd == -1)
+			continue;
+		int len = strlen(net_sysctl_values[i]);
+		if (write(fd, net_sysctl_values[i], len) != len)
+			debug("failed to reset %s: %d\n", net_sysctls[i], errno);
+		close(fd);
+	}
+}
+
 static void checkpoint_net_namespace(void)
 {
 #if SYZ_EXECUTOR
@@ -4220,6 +4274,7 @@ static void checkpoint_net_namespace(void)
 	checkpoint_arptables();
 	checkpoint_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
 	checkpoint_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
+	checkpoint_net_sysctls();
 }
 
 static void reset_net_namespace(void)
@@ -4232,6 +4287,7 @@ static void reset_net_namespace(void)
 	reset_arptables();
 	reset_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
 	reset_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
+	reset_net_sysctls();
 }
 #endif
 

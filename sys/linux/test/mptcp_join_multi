@@ -5,9 +5,9 @@
 # with port) see 127.0.0.2:0 for both, so the second join failed EINVAL. The
 # per-slot local address (127.0.0.2 + slot) keeps concurrent subflows distinct.
 
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
-r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
-r2 = syz_mptcp_join_subflow(r0, 0x2, 0x0, 0x0)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0)
+r1 = syz_mptcp_join_subflow(r10, 0x1, 0x0, 0x0)
+r2 = syz_mptcp_join_subflow(r10, 0x2, 0x0, 0x0)
 syz_mptcp_subflow_destroy(r1)
 syz_mptcp_subflow_destroy(r2)
 syz_mptcp_pair_close(r0)

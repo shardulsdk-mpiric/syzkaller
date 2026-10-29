@@ -5,8 +5,8 @@
 # subflow_info freed the slot, the second info (and the destroy) would act on a
 # dead handle; both succeeding confirms the resource-model change.
 
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
-r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0)
+r1 = syz_mptcp_join_subflow(r10, 0x1, 0x0, 0x0)
 syz_mptcp_subflow_info(r1)
 syz_mptcp_subflow_info(r1)
 syz_mptcp_subflow_destroy(r1)

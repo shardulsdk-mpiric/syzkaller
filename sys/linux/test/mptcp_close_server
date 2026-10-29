@@ -4,6 +4,6 @@
 # must skip the already-closed server_fd (its `>= 0` guard; close_server set it to
 # -1) and clean up the listener/client.
 
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0)
 syz_mptcp_close_server(r0)
 syz_mptcp_pair_close(r0)
