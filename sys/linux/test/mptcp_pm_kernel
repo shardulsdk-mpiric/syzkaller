@@ -1,0 +1,9 @@
+# Both ends on the in-kernel path manager: establish the pair, push data, disconnect
+# the server end (which keeps its PM across the reset) and tear the pair down. The
+# netns path-manager setting is restored after pair_init, so nothing here leaks into
+# later programs.
+
+r0 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x3, 0x0)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_disconnect(r0)
+syz_mptcp_pair_close(r0)

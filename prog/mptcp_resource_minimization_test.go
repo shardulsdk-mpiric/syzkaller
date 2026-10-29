@@ -13,8 +13,9 @@ import (
 // executor/common_linux_mptcp.h): because every cross-call dependency is
 // modeled as a real syzkaller RESOURCE --
 //
-//	syz_mptcp_pair_init()      -> produces mptcp_pair
-//	syz_mptcp_join_subflow(p)  -> consumes mptcp_pair, produces mptcp_subflow
+//	syz_mptcp_pair_init()      -> produces mptcp_pair, and the client end's
+//	                              handle (mptcp_client_userspace)
+//	syz_mptcp_join_subflow(c)  -> consumes mptcp_client_userspace, produces mptcp_subflow
 //	syz_mptcp_subflow_destroy(s) -> consumes mptcp_subflow
 //	syz_mptcp_pair_close(p)    -> consumes mptcp_pair
 //
@@ -29,18 +30,18 @@ import (
 //
 // The base program under test mirrors sys/linux/test/mptcp_join_subflow:
 //
-//	r0 = syz_mptcp_pair_init(...)
-//	r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
-//	syz_mptcp_subflow_destroy(r1)
+//	r0 = syz_mptcp_pair_init(..., &AUTO=<r1=>0x0)
+//	r2 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
+//	syz_mptcp_subflow_destroy(r2)
 //	syz_mptcp_pair_close(r0)
 //
-// The join_subflow argument list is (pair, addr_id, backup, mut_op); mut_op=0
+// The join_subflow argument list is (client, addr_id, backup, mut_op); mut_op=0
 // (MPTCP_MUT_NONE) keeps this a plain, unmutated join -- the resource-chain
 // property under test is independent of the mutation op.
 const mptcpMinimizationBaseProg = `
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0)
-r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
-syz_mptcp_subflow_destroy(r1)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r1=>0x0)
+r2 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
+syz_mptcp_subflow_destroy(r2)
 syz_mptcp_pair_close(r0)
 `
 
@@ -61,6 +62,20 @@ func mptcpDeserializeBase(t *testing.T, target *Target) *Prog {
 		t.Fatalf("expected 4 calls in base program, got %v:\n%s", len(p.Calls), p.Serialize())
 	}
 	return p
+}
+
+// mptcpClientHandle returns the client handle pair_init produces through its
+// out pointer.
+func mptcpClientHandle(t *testing.T, pairInit *Call) *ResultArg {
+	ptr, ok := pairInit.Args[4].(*PointerArg)
+	if !ok || ptr.Res == nil {
+		t.Fatalf("syz_mptcp_pair_init's client argument is not a pointer to a handle")
+	}
+	res, ok := ptr.Res.(*ResultArg)
+	if !ok {
+		t.Fatalf("syz_mptcp_pair_init's client argument does not point to a resource")
+	}
+	return res
 }
 
 func callNames(p *Prog) []string {
@@ -90,12 +105,12 @@ func containsCall(p *Prog, name string) bool {
 // fail outright -- see syz_mptcp_join_subflow / syz_mptcp_subflow_destroy
 // in executor/common_linux_mptcp.h) from one driven by the real handle.
 //
-// Only the call's *input* arguments (c.Args) are examined -- not c.Ret.
-// c.Ret is the slot where a call DEFINES/produces a brand new resource
-// instance, so Res == nil there is normal (there is nothing upstream for a
-// producer's own Ret to point to); it is only a sign of orphaning on a
-// consuming argument, where the original, properly-linked program had a
-// real producer wired in.
+// Only consuming arguments are examined -- not c.Ret and not out-direction
+// arguments. Those are where a call DEFINES/produces a brand new resource
+// instance (pair_init's per-end handles are out pointers), so Res == nil there
+// is normal (there is nothing upstream for a producer to point to); it is only
+// a sign of orphaning on a consuming argument, where the original,
+// properly-linked program had a real producer wired in.
 func hasOrphanedResourceArg(p *Prog) bool {
 	orphaned := false
 	visit := func(arg Arg, _ *ArgCtx) {
@@ -104,6 +119,9 @@ func hasOrphanedResourceArg(p *Prog) bool {
 			return
 		}
 		if _, ok := res.Type().(*ResourceType); !ok {
+			return
+		}
+		if res.Dir() == DirOut {
 			return
 		}
 		if res.Res == nil {
@@ -160,13 +178,13 @@ func TestMPTCPMinimizationRetainsResourceChain(t *testing.T) {
 	}
 
 	// Directly verify the resource chain survives call-by-call, not just
-	// "no orphaned arg anywhere": join_subflow's pair argument must still
-	// be Res-linked to pair_init's Ret, and subflow_destroy's argument must
-	// still be Res-linked to join_subflow's Ret.
+	// "no orphaned arg anywhere": join_subflow's client argument must still
+	// be Res-linked to pair_init's client handle, and subflow_destroy's argument
+	// must still be Res-linked to join_subflow's Ret.
 	pairInit, joinSubflow, subflowDestroy := p1.Calls[0], p1.Calls[1], p1.Calls[2]
-	joinPairArg, ok := joinSubflow.Args[0].(*ResultArg)
-	if !ok || joinPairArg.Res != pairInit.Ret {
-		t.Errorf("syz_mptcp_join_subflow's pair argument is not linked to syz_mptcp_pair_init's resource")
+	joinClientArg, ok := joinSubflow.Args[0].(*ResultArg)
+	if !ok || joinClientArg.Res != mptcpClientHandle(t, pairInit) {
+		t.Errorf("syz_mptcp_join_subflow's client argument is not linked to syz_mptcp_pair_init's client handle")
 	}
 	destroyArg, ok := subflowDestroy.Args[0].(*ResultArg)
 	if !ok || destroyArg.Res != joinSubflow.Ret {
@@ -274,4 +292,35 @@ func TestMPTCPMinimizationNaivePresencePredicateIsInsufficient(t *testing.T) {
 			"got Res=%v", arg)
 	}
 	t.Logf("naive presence-only predicate over-minimized base program to: %s", p1.Serialize())
+}
+
+// TestMPTCPLegacyPairInitStillLinks pins the compatibility promise for programs
+// written before pair_init gained the pm argument and the per-end handles:
+// existing corpora and saved reproducers call syz_mptcp_pair_init with three
+// arguments and pass its return value to syz_mptcp_join_subflow. Non-strict
+// parsing (corpus loading, syz-execprog, syz-repro) must accept them, fill in
+// the userspace/userspace default, and keep the join linked to the pair.
+func TestMPTCPLegacyPairInitStillLinks(t *testing.T) {
+	target := mptcpMinimizationTarget(t)
+	legacy := `
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x9)
+r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
+syz_mptcp_subflow_destroy(r1)
+syz_mptcp_pair_close(r0)
+`
+	p, err := target.Deserialize([]byte(strings.TrimSpace(legacy)), NonStrict)
+	if err != nil {
+		t.Fatalf("failed to deserialize legacy mptcp program: %v", err)
+	}
+	pairInit, join := p.Calls[0], p.Calls[1]
+	if pairInit.Meta.Name != "syz_mptcp_pair_init" || len(pairInit.Args) != 5 {
+		t.Fatalf("legacy pair_init did not get the new argument list:\n%s", p.Serialize())
+	}
+	if pm, ok := pairInit.Args[3].(*ConstArg); !ok || pm.Val != 0 {
+		t.Fatalf("legacy pair_init should default to the userspace/userspace pm value 0:\n%s", p.Serialize())
+	}
+	arg, ok := join.Args[0].(*ResultArg)
+	if !ok || arg.Res != pairInit.Ret {
+		t.Fatalf("legacy join_subflow lost its link to pair_init:\n%s", p.Serialize())
+	}
 }
