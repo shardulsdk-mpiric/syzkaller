@@ -74,7 +74,9 @@ var (
 		"report a title as 'possibly patched-only' when it crashed patched at least this often and never on base")
 	flagIgnore = flag.String("ignore_titles", "",
 		"regexp of crash titles to ignore (the only way to drop e.g. KCSAN reports from the engine)")
-	flagDebug = flag.Bool("debug", false, "dump all VM output to console")
+	flagDebug      = flag.Bool("debug", false, "dump all VM output to console")
+	flagSaveCorpus = flag.Bool("save_corpus", true,
+		"save the patched kernel's corpus to <patched workdir>/corpus.db, so re-runs resume from it")
 )
 
 func main() {
@@ -197,6 +199,7 @@ func run(ctx context.Context, baseCfg, patchedCfg *mgrconfig.Config, store *mana
 
 			MaxTriageTime:      *flagTriage,
 			FuzzToReachPatched: *flagReach,
+			SaveCorpus:         *flagSaveCorpus,
 		}
 		if ignoreRe != nil {
 			cfg.IgnoreCrash = func(_ context.Context, title string) (bool, error) {

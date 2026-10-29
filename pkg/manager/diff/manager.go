@@ -41,6 +41,10 @@ type Config struct {
 	// trying to reach the modified code. The time is counted since the moment
 	// 99% of the corpus is triaged.
 	FuzzToReachPatched time.Duration
+	// If set, new corpus programs of the patched kernel are saved to its workdir's corpus.db,
+	// so that the next run resumes from them and corpora of several runs can be merged.
+	// The corpus.db is then opened in the repair mode.
+	SaveCorpus bool
 	// The callback may be used to consult external systems on whether
 	// the crash should be ignored. E.g. because it doesn't match the filter or
 	// the particular base kernel has already been seen to crash with the given title.
@@ -75,9 +79,20 @@ func Run(ctx context.Context, baseCfg, newCfg *mgrconfig.Config, cfg Config) err
 	}
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		info, err := manager.LoadSeeds(newCfg, true)
+		info, err := manager.LoadSeeds(newCfg, !cfg.SaveCorpus)
 		if err != nil {
 			return err
+		}
+		if cfg.SaveCorpus {
+			if info.Fresh {
+				// The programs we save are minimized by the current code,
+				// so they must not be re-minimized on the next start.
+				if err := info.CorpusDB.BumpVersion(manager.CurrentDBVersion); err != nil {
+					return fmt.Errorf("failed to set corpus database version: %w", err)
+				}
+			}
+			// Only the patched kernel is fuzzed, so only its corpus is worth keeping.
+			new.corpusDB = info.CorpusDB
 		}
 		select {
 		case new.candidates <- info.Candidates:
