@@ -109,8 +109,9 @@ static bool write_file(const char* file, const char* what, ...)
 }
 #endif
 
-#if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154 || \
-    __NR_syz_genetlink_get_family_id || __NR_syz_80211_inject_frame || __NR_syz_80211_join_ibss || SYZ_NIC_VF
+#if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154 ||         \
+    __NR_syz_genetlink_get_family_id || __NR_syz_80211_inject_frame || __NR_syz_80211_join_ibss || SYZ_NIC_VF || \
+    (SYZ_NET_RESET && SYZ_EXECUTOR_USES_FORK_SERVER)
 #include <arpa/inet.h>
 #include <errno.h>
 #include <net/if.h>
@@ -3436,11 +3437,14 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
 
 // MPTCP MP_CAPABLE pair + MP_JOIN subflow harness (see
 // executor/common_linux_mptcp.h).
-#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close || \
-    __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||         \
-    __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||         \
-    __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server ||         \
-    __NR_syz_mptcp_disconnect || __NR_syz_mptcp_drive_traffic
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close ||                           \
+    __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||                                   \
+    __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||                                   \
+    __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server ||                                   \
+    __NR_syz_mptcp_disconnect || __NR_syz_mptcp_drive_traffic || __NR_syz_mptcp_listener_close_race || \
+    __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_add_endpoint ||                                  \
+    __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags ||                          \
+    __NR_syz_mptcp_pm_flush_endpoints
 #include "common_linux_mptcp.h"
 #endif
 
@@ -4220,6 +4224,7 @@ static const char* net_sysctls[] = {
     "/proc/sys/net/mptcp/path_manager",
     "/proc/sys/net/mptcp/pm_type",
     "/proc/sys/net/mptcp/checksum_enabled",
+    "/proc/sys/net/mptcp/allow_join_initial_addr_port",
     "/proc/sys/net/ipv4/tcp_timestamps",
 };
 static char net_sysctl_values[sizeof(net_sysctls) / sizeof(net_sysctls[0])][32];
@@ -4264,6 +4269,88 @@ static void reset_net_sysctls(void)
 	}
 }
 
+// The in-kernel MPTCP path manager keeps endpoints and limits per netns, and the
+// MPTCP pseudo-syscalls configure them. Reset removes all endpoints and restores
+// the limits recorded at checkpoint. Commands and attributes are from
+// <linux/mptcp_pm.h>, spelled out because older headers lack them.
+#define NET_MPTCP_PM_CMD_FLUSH_ADDRS 4
+#define NET_MPTCP_PM_CMD_SET_LIMITS 5
+#define NET_MPTCP_PM_CMD_GET_LIMITS 6
+#define NET_MPTCP_PM_LIMITS_ATTR_MAX 8 // RCV_ADD_ADDRS = 2, SUBFLOWS = 3, SUBFLOW_RETRIES = 7
+static bool net_mptcp_limits_saved;
+static uint32 net_mptcp_limits[NET_MPTCP_PM_LIMITS_ATTR_MAX];
+static bool net_mptcp_limits_present[NET_MPTCP_PM_LIMITS_ATTR_MAX];
+
+static int net_mptcp_pm_open(struct nlmsg* nlmsg, int* family)
+{
+	char name[GENL_NAMSIZ] = "mptcp_pm";
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (sock == -1)
+		return -1;
+	*family = netlink_query_family_id(nlmsg, sock, name, false);
+	if (*family < 0) {
+		close(sock);
+		return -1;
+	}
+	return sock;
+}
+
+static void net_mptcp_pm_init(struct nlmsg* nlmsg, int family, int cmd)
+{
+	struct genlmsghdr genlhdr;
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = cmd;
+	genlhdr.version = 1;
+	netlink_init(nlmsg, family, 0, &genlhdr, sizeof(genlhdr));
+}
+
+static void checkpoint_mptcp_pm(void)
+{
+	struct nlmsg nlmsg;
+	int family = 0;
+	int sock = net_mptcp_pm_open(&nlmsg, &family);
+	if (sock == -1)
+		return;
+	net_mptcp_pm_init(&nlmsg, family, NET_MPTCP_PM_CMD_GET_LIMITS);
+	int n = 0;
+	if (netlink_send_ext(&nlmsg, sock, family, &n, false) == 0 && n > 0) {
+		struct nlattr* attr = (struct nlattr*)(nlmsg.buf + NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(struct genlmsghdr)));
+		for (; (char*)attr + sizeof(*attr) <= nlmsg.buf + n && attr->nla_len >= sizeof(*attr);
+		     attr = (struct nlattr*)((char*)attr + NLMSG_ALIGN(attr->nla_len))) {
+			int type = attr->nla_type & NLA_TYPE_MASK;
+			if (type < NET_MPTCP_PM_LIMITS_ATTR_MAX && attr->nla_len >= sizeof(*attr) + sizeof(uint32)) {
+				net_mptcp_limits[type] = *(uint32*)(attr + 1);
+				net_mptcp_limits_present[type] = true;
+			}
+		}
+		net_mptcp_limits_saved = true;
+		recv(sock, nlmsg.buf, sizeof(nlmsg.buf), 0); // recv ack
+	}
+	close(sock);
+}
+
+static void reset_mptcp_pm(void)
+{
+	if (!net_mptcp_limits_saved)
+		return;
+	struct nlmsg nlmsg;
+	int family = 0;
+	int sock = net_mptcp_pm_open(&nlmsg, &family);
+	if (sock == -1)
+		return;
+	net_mptcp_pm_init(&nlmsg, family, NET_MPTCP_PM_CMD_FLUSH_ADDRS);
+	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0)
+		debug("reset_mptcp_pm: flush failed: %d\n", errno);
+	net_mptcp_pm_init(&nlmsg, family, NET_MPTCP_PM_CMD_SET_LIMITS);
+	for (int type = 0; type < NET_MPTCP_PM_LIMITS_ATTR_MAX; type++) {
+		if (net_mptcp_limits_present[type])
+			netlink_attr(&nlmsg, type, &net_mptcp_limits[type], sizeof(net_mptcp_limits[type]));
+	}
+	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0)
+		debug("reset_mptcp_pm: set limits failed: %d\n", errno);
+	close(sock);
+}
+
 static void checkpoint_net_namespace(void)
 {
 #if SYZ_EXECUTOR
@@ -4275,6 +4362,7 @@ static void checkpoint_net_namespace(void)
 	checkpoint_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
 	checkpoint_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
 	checkpoint_net_sysctls();
+	checkpoint_mptcp_pm();
 }
 
 static void reset_net_namespace(void)
@@ -4288,6 +4376,7 @@ static void reset_net_namespace(void)
 	reset_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
 	reset_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
 	reset_net_sysctls();
+	reset_mptcp_pm();
 }
 #endif
 
