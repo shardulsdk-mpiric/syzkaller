@@ -235,3 +235,69 @@ differential configs that enable whatever carrier is chosen.
     threaded with `net_reset`.
   - `TestParsing` fails on `linux/loong64` only. That's pre-existing: the
     `.const` arches line has never listed loong64.
+- 2026-10-30, step 2 (in-kernel PM configuration), implemented and verified.
+  - **Feasibility** (VM, fresh netns, kernel/kernel loopback pair, `ip mptcp`):
+    - a `subflow` endpoint yields an extra subflow whether added before the
+      handshake or while the msk is live;
+    - signal-endpoint ADD_ADDR goes both ways, but the join to the announced
+      address only works when the listener is bound to 0.0.0.0;
+    - `fullmesh` works; limits 0 gives nothing.
+  - **Ops (netns-wide, valid by construction):**
+    - `syz_mptcp_pm_set_limits(subflows, add_addr_accepted, subflow_retries)`.
+      Retries are sent only when nonzero, and resent without the attribute on
+      EINVAL, so the op stays valid on a kernel without that limit (the
+      differential base).
+    - `syz_mptcp_pm_add_endpoint$subflow/$signal/$signal_port`,
+      `syz_mptcp_pm_del_endpoint`, `syz_mptcp_pm_set_endpoint_flags$subflow/$signal`,
+      `syz_mptcp_pm_flush_endpoints`.
+    - Endpoint idx uses id idx+1 and address 127.0.1.(idx+1) dev lo (clear of
+      join's 127.0.0.2+ range). Kinds are limited to the accepted combinations
+      (signal, subflow, signal+subflow, subflow+fullmesh; mods backup, laminar),
+      and a port only on a signal-only endpoint.
+    - Endpoints are resources: `mptcp_pm_endpoint` → `_subflow` / `_signal`.
+      del/set-flags are only generated for an added endpoint, and fullmesh only
+      for a non-signal one. These are endpoint handles, not per-msk handles; the
+      kernel-client handle stays deferred.
+  - **pair_init flags:**
+    - `MPTCP_INIT_LISTEN_ANY` (16): listener on 0.0.0.0.
+    - `MPTCP_INIT_DENY_JOIN_ID0` (32): `allow_join_initial_addr_port=0` under the
+      pair's save/restore, so the handshake carries the C flag.
+  - **Reset:** `checkpoint/reset_net_namespace` also record GET_LIMITS and, before
+    each program, flush endpoints and restore the limits.
+    `allow_join_initial_addr_port` joined the sysctl list. The netlink helpers'
+    gate now includes `SYZ_NET_RESET && SYZ_EXECUTOR_USES_FORK_SERVER`.
+  - **vminfo:** the five new base call names are registered.
+  - **Fixed on the way:** `listener_close_race` was missing from
+    common_linux.h's include gate, so a reproducer with only that call didn't
+    compile.
+  - **Realism caveat (documented in the executor and the descriptions):** both
+    ends share one netns, so they share one endpoint table. Both ends announce
+    signal endpoints, and the server's subflow attempts from subflow endpoints
+    fail (MPJoinSynTxCreatSkErr). A coverage read or finding on those paths must
+    not be read as a kernel bug.
+  - **Verification:**
+    - run-tests on audit2 base: 96/96 OK.
+    - run-tests on audit2 build A: 93 OK, 3 fails, all threaded-mode "Blocked"
+      timing flakes. Two are the known join_close_race flake; close_server then
+      passed 24/24 on reruns on both kernels.
+    - `mptcp_pm_endpoints` passes on both kernels in every mode, which exercises
+      the retries fallback on base.
+  - **Build-A coverage probe** (PCs symbolized with `addr2line -i`, which
+    includes inlined frames):
+    - fullmesh-skip-closed: `fill_remote_addresses_fullmesh` and
+      `mptcp_subflow_is_closed` are covered.
+    - c-flag: `fill_local_addresses_vec_c_flag` is covered (needs C flag,
+      add_addr_accepted=0, a subflow endpoint and a live signal endpoint).
+    - retries: `parse_limit` and `mptcp_pm_nl_check_work_pending` are covered.
+    - endpoint add/del/set-flags/flush handlers,
+      `mptcp_nl_add_subflow_or_signal_addr`,
+      `mptcp_pm_create_subflow_or_signal_addr`, `mptcp_pm_nl_set_flags_all`,
+      `mptcp_pm_rm_addr_or_subflow`, `mptcp_pm_nl_create_listen_socket`,
+      `__mptcp_subflow_connect` from the in-kernel PM, and
+      `mptcp_pm_nl_add_addr_received` are all covered.
+  - **Open:**
+    - The retry series' trigger (a kernel-PM subflow closed by an error, done in
+      the selftest by taking a link down) is not reachable with these ops.
+    - The server-side `mptcp_pm_allow_new_subflow` (the userspace cap) runs in
+      softirq and is not kcov-visible on this kernel. That's a keystone-scope
+      question, not reach.
