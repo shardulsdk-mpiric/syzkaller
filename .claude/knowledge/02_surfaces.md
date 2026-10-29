@@ -8,11 +8,11 @@ Status at a glance (capability, not findings):
 
 | surface | gate crossed | mechanism | carrier / descriptions | where it lives |
 |---|---|---|---|---|
-| MPTCP | MP_JOIN token + HMAC handshake; teardown-race orderings | echo-back + wire mutation | `common_linux_mptcp*.h` / `socket_mptcp_flow.txt` | `protocol-flow-harness` |
-| SCTP | verification tag + CRC32c; typed chunk grammars | echo-back + constructed validity | `common_linux_sctp.h` / `socket_sctp_flow.txt` | `protocol-flow-harness` |
+| MPTCP | MP_JOIN token + HMAC handshake; ingress option validation; teardown-race orderings | echo-back + forge-from-captured-keys + wire mutation/graft | `common_linux_mptcp*.h` / `socket_mptcp_flow.txt` | `protocol-flow-harness` |
+| SCTP | verification tag + CRC32c; sequence windows; typed chunk grammars | echo-back + constructed validity | `common_linux_sctp.h` / `socket_sctp_flow.txt` | `protocol-flow-harness` |
 | HID (uhid) | device GET/SET_REPORT init probes | content-aware responder | `common_linux_uhid.h` / `dev_uhid_responder.txt` | `protocol-flow-harness` |
-| eBPF struct_ops | the eBPF verifier | constructed validity | `pkg/structops/` + `common_linux_structops.h` / `bpf_struct_ops.txt` | `protocol-flow-harness` (+ a 3rd surface on a worktree) |
-| QUIC | fake-key handshake; PATH_CHALLENGE echo; wire mutation | echo-back + wire mutation | `common_linux_quic*.h` / `socket_quic.txt` | worktree `syzkaller_wt_quic`, branch `quic_surface` |
+| eBPF struct_ops | the eBPF verifier | constructed validity | `pkg/structops/` + `common_linux_structops.h` / `bpf_struct_ops.txt` | `protocol-flow-harness` (`$bpf_qdisc` on worktree `syzkaller_wt_bpf_qdisc`) |
+| QUIC | fake-key handshake; PATH_CHALLENGE echo; wire mutation | echo-back + wire mutation | `common_linux_quic*.h` / `socket_quic.txt` | `protocol-flow-harness` |
 
 ---
 
@@ -36,9 +36,9 @@ raw MP_JOIN SYN carrying the captured server token, and the NFQUEUE engine
 
 | op | kind | what it does |
 |---|---|---|
-| `syz_mptcp_pair_init` | producer -> `mptcp_pair` | establish an MP_CAPABLE pair; flags: `RWND_CLAMP` (pin the server rcvbuf so a send burst defers to softirq push), `CAPTURE_KEYS` |
+| `syz_mptcp_pair_init` | producer -> `mptcp_pair` | establish an MP_CAPABLE pair; flags: `RWND_CLAMP` (pin the server rcvbuf so a send burst defers to softirq push), `CAPTURE_KEYS` (record the MP_CAPABLE keys; required by the forge/authenticated-graft ops), `NO_TIMESTAMPS` (free 12 bytes of TCP option space for the length-growing grafts), `CHECKSUM` (negotiate DSS checksums so `DSS_CSUM` / `mptcp_validate_data_csum` are live) |
 | `syz_mptcp_pair_close` | consumer | close both fds, free the slot |
-| `syz_mptcp_join_subflow` | `mptcp_pair` -> `mptcp_subflow` | real MP_JOIN via PM netlink; `mut_op` selects an egress mutation (`NONE` / `HMAC_FLIP` / `HMAC_ZERO` / `NONCE_FLIP`) to exercise the HMAC-failure gate |
+| `syz_mptcp_join_subflow` | `mptcp_pair` -> `mptcp_subflow` | real MP_JOIN via PM netlink; `mut_op` selects an egress mutation or option graft (see "Wire mutation families" below) |
 | `syz_mptcp_subflow_destroy` | consumer | `MPTCP_PM_CMD_SUBFLOW_DESTROY` |
 | `syz_mptcp_subflow_info` | non-consuming | query the parent msk (`MPTCP_INFO`) without freeing the handle -- lets the generator sequence further ops on a live subflow |
 | `syz_mptcp_inject_join_syn` | non-consuming | raw MP_JOIN SYN with the captured server token: drives the incoming-join path cheaply |
@@ -51,6 +51,28 @@ raw MP_JOIN SYN carrying the captured server token, and the NFQUEUE engine
 The lifecycle verbs (`close_server`, `disconnect`) are deliberately
 non-consuming so syzkaller's own scheduler can interleave them with joins -- the
 race class then emerges from the engine's breadth rather than a hand-timed op.
+
+**Wire mutation families** (`mut_op` on `join_subflow`, the `MPTCP_MUT_*` enum;
+executor side in `common_linux_mptcp_mut.h` over the NFQUEUE engine). Built up in
+"ingress" phases, each reaching a receive-side validation path the socket API
+cannot express:
+
+| family | `MPTCP_MUT_*` | reaches |
+|---|---|---|
+| handshake negative controls | `HMAC_FLIP`, `HMAC_ZERO`, `NONCE_FLIP`, `THMAC_FLIP` | the MP_JOIN HMAC / truncated-HMAC failure gates (`subflow_hmac_valid`, `subflow_thmac_valid`); the join does not establish, by design |
+| forge from captured keys | `CRYPTO_SELFVERIFY`, `HMAC_FORGE` | SELFVERIFY recomputes the ACK HMAC from the captured nonces + MP_CAPABLE keys and asserts it equals the kernel's (oracle, no mutation); FORGE writes that harness-computed HMAC so the subflow is **accepted** past `subflow_hmac_valid` |
+| DSS mapping corruption (same-length) | `DSS_SEQ`, `DSS_SUBSEQ`, `DSS_LEN_INF`, `DSS_LEN_OFF`, `DSS_CSUM`, `DSS_DATA_FIN` | server mapping validation in softirq (`subflow_check_data_avail` -> `validate_mapping` / `mptcp_validate_data_csum`) |
+| option grafts (length-growing) | `ADD_ADDR_ECHO`, `ADD_ADDR_AUTH`, `MP_FAIL`, `MP_FASTCLOSE`, `RM_ADDR`, `MP_PRIO` | the PM receive handlers (`mptcp_pm_add_addr_echoed` / `_received`, `mptcp_pm_mp_fail_received`, fastclose teardown, RM_ADDR / MP_PRIO processing); `ADD_ADDR_AUTH` carries a computed ADD_ADDR HMAC |
+
+The forge and authenticated-graft ops need a pair made with `CAPTURE_KEYS`; the
+length-growing grafts want `NO_TIMESTAMPS` for option space. DSS ops stay armed
+past the join and retire at destroy/close.
+
+Reach limit (open work, `differential_audit_yield` in `tasks/index.md`): the
+op-set drives subflow create/join/close/traffic and the wire-level PM options
+above, but not the PM netlink *configuration* commands (endpoint add/flags,
+limits, flush, fullmesh), so the in-kernel PM's limit/flag/fullmesh logic is
+only reached incidentally.
 
 Deep background on the protocol: the kernel-side MPTCP knowledge base at
 `open/src/kernel/linux/.claude/knowledge/linux/net/mptcp/`.
@@ -77,11 +99,15 @@ socket (M-CARRY).
 
 | op | kind | what it does |
 |---|---|---|
-| `syz_sctp_pair_init` | producer -> `sctp_assoc` | establish association; `CAPTURE_VTAG` sniffs Vs/Vc |
+| `syz_sctp_pair_init` | producer -> `sctp_assoc` | establish association; `CAPTURE_VTAG` sniffs Vs/Vc (and both initial TSNs, for the sequence rebase); `ENABLE_STRRESET` sets `SCTP_ENABLE_STREAM_RESET` on both ends so stream-reset requests are performed rather than answered `DENIED` |
 | `syz_sctp_pair_close` | consumer | close fds, free slot |
 | `syz_sctp_drive_traffic` | non-consuming | `sctp_sendmsg()` -> DATA / reassembly path |
 | `syz_sctp_inject_chunk$captured` | non-consuming | craft + inject a chunk stamped with the **captured** vtag so `sctp_vtag_verify` passes and the chunk reaches its handler |
 | `syz_sctp_inject_chunk$zero` / `$wrong` | non-consuming | negative controls the gate rejects |
+| `syz_sctp_inject_typed$reconf` | non-consuming | grammar-built RECONF chunk (RFC 6525 params), request/response seqs rebased -> `net/sctp/stream.c` reset processing |
+| `syz_sctp_inject_typed$reconf_rawseq` | non-consuming | same body, no rebase: control proving the rebase (not structure alone) carries it past the seq window |
+| `syz_sctp_inject_typed$data` / `$fwdtsn` | non-consuming | grammar-built DATA / FORWARD-TSN, TSN rebased on the client's initial TSN -> tsnmap / reassembly / forward-TSN handling |
+| `syz_sctp_inject_typed$sack` | non-consuming | grammar-built SACK, `cum_tsn_ack` rebased on the server's initial TSN -> SACK processing |
 
 The vtag mode is bound per `$variant` (not a `flags[]` arg) on purpose: it keeps
 the fuzzer from spending ~2/3 of its injects on the two modes `sctp_vtag_verify`
@@ -89,11 +115,31 @@ drops before any handler runs. Coverage guidance keeps and mutates the
 `$captured` programs that reach handlers; `$zero`/`$wrong` stay selectable
 controls.
 
-`chunk_type` and `chunk_payload` are fuzzer-mutated across the
-DATA/SACK/RECONF/FORWARD-TSN surface. The **typed chunk grammars** (constructed
-validity, mechanism 2) give those chunks correct type/length/sequence structure
-so parsing reaches the handler -- RECONF has landed; DATA / SACK / FORWARD-TSN
-are the next increments. See the `sctp_chunk_grammar` thread in `tasks/index.md`.
+**Typed chunk grammars** (constructed validity, mechanism 2). An opaque
+`inject_chunk$captured` payload passes the vtag + CRC gates but almost never
+forms a valid chunk body, so coverage stalls at the chunk-type dispatch and most
+rejections tear the association down. `syz_sctp_inject_typed$*` instead takes a
+complete chunk (header + body) built by the syzlang grammar: `len[]` / `offsetof[]`
+are recomputed after every mutation, so the body stays structurally valid while
+the fuzzer varies which params, how many, which stream ids and which sequence
+deltas. The executor adds only what the grammar cannot know: ports, captured
+vtag, the `seq_mode` rebase, padding and CRC32c. `no_squash` keeps the mutator
+from flattening the typed body into an ANYBLOB.
+
+The **sequence rebase** is the second gate. Handlers compare 32-bit sequence
+fields against values seeded from the INIT / INIT-ACK initial TSNs (stream-reset
+`request_seq` against a 3-value window, DATA / FWD-TSN TSN against the tsnmap
+base, SACK `cum_tsn_ack` against `next_tsn`), so a random value is rejected
+almost always. `pair_init` captures both initial TSNs off the wire; the grammar
+emits a small delta and the executor adds the base selected by the variant's
+`seq_mode` (`CLIENT_TSN`, `SERVER_TSN`, `RECONF` per-param walk, or `NONE` as the
+control). The fuzzer then explores the window edges (fresh / duplicate /
+bad-seqno) instead of a 2^32 space.
+
+Landed: increment 1 (RECONF) and increment 2 (DATA / FORWARD-TSN / SACK +
+`ENABLE_STRRESET`). Candidate next increments: AUTH / ASCONF typed bodies, or
+I-DATA reassembly / interleave state. See the `sctp_chunk_grammar` thread in
+`tasks/index.md`.
 
 ---
 
@@ -170,7 +216,23 @@ fd_bpf_link (no_squash)`. The object travels as a `data array[int8]` blob;
 |---|---|---|---|
 | `$tcp_cong` | `tcp_congestion_ops` | `net/ipv4/bpf_tcp_ca.c` | mainline |
 | `$mptcp_sched` | `mptcp_sched_ops` | `net/mptcp/bpf.c` | mptcp/export |
-| `$bpf_qdisc` | `Qdisc_ops` | `net/sched/bpf_qdisc.c` | mainline (demonstrated on worktree `syzkaller_wt_bpf_qdisc`) |
+| `$sched_ext` | `sched_ext_ops` | `kernel/sched/ext/ext.c` | mainline (`CONFIG_SCHED_CLASS_EXT`) |
+| `$bpf_qdisc` | `Qdisc_ops` | `net/sched/bpf_qdisc.c` | mainline (demonstrated on worktree `syzkaller_wt_bpf_qdisc`, not on `protocol-flow-harness`) |
+
+`$sched_ext` notes: a loaded scheduler governs every `SCHED_NORMAL` task
+(including the executor) unless its fuzzed `.flags` carry
+`SCX_OPS_SWITCH_PARTIAL`, so the generated enqueue always ends in a
+dispatch-queue insert (liveness by construction) and `.timeout_ms` is pinned to
+1-3 s so the kernel watchdog ejects a stalled scheduler before syzkaller's
+program timeout. Callbacks may be sleepable (carried per program from the object
+to PROG_LOAD); the surface covers user DSQs and the DSQ iterator. The load's
+exercise tail runs short worker processes, and `syz_sched_ext_exercise(ms)`
+repeats that for a fuzzed duration while the program still holds the link.
+
+Known limit: the `$mptcp_sched` generator output can fail to compile against a
+kernel whose BTF changed the MPTCP subflow-iterator types (incomplete
+`struct bpf_iter_mptcp_subflow`), in which case that variant is sent inert.
+Open item; `$tcp_cong` / `$sched_ext` are unaffected.
 
 The third surface (`$bpf_qdisc`) is the evidence that adding a surface is "a
 table, not a fork": it cost a small per-surface table plus a small *generic*
@@ -195,9 +257,12 @@ using only public `queue`/`prog` APIs -- no syzkaller core change.
 
 ## QUIC
 
-In-kernel QUIC (`net/quic`, Xin Long / lxin, RFC 9000). On a separate worktree
-(`syzkaller_wt_quic`, branch `quic_surface`) because it needs a `net/quic=y`
-kernel; the carrier reuses the MPTCP NFQUEUE engine (UDP variant).
+In-kernel QUIC (`net/quic`, Xin Long / lxin, RFC 9000). Landed on
+`protocol-flow-harness` (phases 1-3); the target kernel needs `CONFIG_IP_QUIC`,
+which is not yet mainline, so build from the QUIC series / tree. The carrier
+reuses the MPTCP NFQUEUE engine (UDP variant). Async-path coverage comes from
+`kernel_patches/quic_kcov_keystone/` (0001 capture + helper, 0002 receive-softirq
+frame dispatch; the backlog drain runs inside 0002's section, so no third patch).
 
 **Gate(s):** the outer gate is TLS/AEAD. The carrier *removes* that in a test
 configuration -- fake per-level crypto secrets (`QUIC_SOCKOPT_CRYPTO_SECRET`) +
