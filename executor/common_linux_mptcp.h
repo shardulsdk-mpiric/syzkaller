@@ -114,6 +114,12 @@
 #define MPTCP_PM_ADDR_FLAG_FULLMESH (1U << 3)
 #define MPTCP_PM_ADDR_FLAG_IMPLICIT (1U << 4)
 #endif
+#ifndef MPTCP_PM_ADDR_FLAG_LAMINAR
+#define MPTCP_PM_ADDR_FLAG_LAMINAR (1U << 5)
+#endif
+// MPTCP_PM_ATTR_SUBFLOW_RETRIES is newer than most uapi headers (and absent on
+// kernels without the subflow-retries limit), so it gets its own name here.
+#define SYZ_MPTCP_PM_ATTR_SUBFLOW_RETRIES 7
 
 // MPTCP_PM_CMD_SUBFLOW_CREATE/DESTROY plus the MPTCP_PM_ATTR_TOKEN /
 // MPTCP_PM_ATTR_ADDR_REMOTE attributes they need are recent additions to
@@ -238,6 +244,16 @@ enum {
 // negotiation) and lights up the validate_data_csum RX path (subflow.c:1034) --
 // a mapping-validation path we otherwise never reach. Opt-in.
 #define MPTCP_INIT_CHECKSUM 8
+// MPTCP_INIT_LISTEN_ANY (harness flag; mirrored in .txt + .const): bind the
+// server's listener to 0.0.0.0 instead of 127.0.0.1, so subflows towards an
+// address announced by a signal endpoint (127.0.1.x) reach it. Opt-in, so
+// existing programs keep their listener.
+#define MPTCP_INIT_LISTEN_ANY 16
+// MPTCP_INIT_DENY_JOIN_ID0 (harness flag; mirrored in .txt + .const): set
+// net.mptcp.allow_join_initial_addr_port=0 while the pair is created, so the
+// handshake carries the MP_CAPABLE C flag (peer must not join the initial
+// address/port) and the in-kernel PM's c-flag handling runs.
+#define MPTCP_INIT_DENY_JOIN_ID0 32
 
 // syz_mptcp_pair_init pm argument (harness constants; mirrored in .txt + .const):
 // bit 0 puts the client end on the in-kernel path manager, bit 1 the server end.
@@ -352,7 +368,15 @@ struct syz_mptcp_info_short {
 	uint32 mptcpi_token;
 };
 
+// Every call except the in-kernel PM configuration ops and the self-contained
+// listener_close_race works on a pair.
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close ||                      \
+    __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||                              \
+    __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||                              \
+    __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server || __NR_syz_mptcp_disconnect || \
+    __NR_syz_mptcp_drive_traffic
 static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
+#endif
 
 // Which of the five pseudo-syscalls in this file end up compiled in
 // determines which of the shared pool/netlink/setup helpers below are
@@ -369,8 +393,11 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 // SUBFLOW_CREATE/DESTROY payloads nest attributes; GETFAMILY's request
 // doesn't) are needed by exactly this pair.
 #define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || __NR_syz_mptcp_subflow_info)
-#define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy)
-#define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow)
+// In-kernel PM configuration: the endpoint commands share one message builder.
+#define MPTCP_NEED_PM_ENDPOINT (SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags)
+#define MPTCP_NEED_PM_CONFIG (MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_flush_endpoints)
+#define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || MPTCP_NEED_PM_CONFIG)
+#define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || MPTCP_NEED_PM_CONFIG)
 // The calls that apply netns settings for one pair (see mptcp_netns_save):
 // pair_init at creation, join for the subflow SYN, disconnect for the msk reset.
 // Only pair_init and disconnect switch the path manager.
@@ -496,10 +523,10 @@ static void mptcp_nlmsg_attr(struct mptcp_nlmsg* m, int typ, const void* data, i
 	m->pos += NLMSG_ALIGN(attr->nla_len);
 }
 
-// Only SUBFLOW_CREATE/DESTROY payloads nest attributes (GETFAMILY's
-// request doesn't), so these two are needed by join_subflow and
-// subflow_destroy only -- see MPTCP_NEED_SUBFLOW_CALL.
-#if MPTCP_NEED_SUBFLOW_CALL
+// Only SUBFLOW_CREATE/DESTROY and the endpoint commands nest attributes
+// (GETFAMILY's request doesn't) -- see MPTCP_NEED_SUBFLOW_CALL and
+// MPTCP_NEED_PM_ENDPOINT.
+#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT
 static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_out, int typ)
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
@@ -520,7 +547,7 @@ static void mptcp_nlmsg_nest_end(struct mptcp_nlmsg* m, struct nlattr* nest)
 		return;
 	nest->nla_len = m->pos - (char*)nest;
 }
-#endif // MPTCP_NEED_SUBFLOW_CALL
+#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT
 
 // Sends m and waits for one reply datagram. Returns the number of bytes
 // received (>=0) on success -- for a bare NLM_F_ACK request (our
@@ -763,6 +790,7 @@ fail:
 #define MPTCP_SYSCTL_PM_TYPE "/proc/sys/net/mptcp/pm_type"
 #define MPTCP_SYSCTL_CHECKSUM "/proc/sys/net/mptcp/checksum_enabled"
 #define MPTCP_SYSCTL_TIMESTAMPS "/proc/sys/net/ipv4/tcp_timestamps"
+#define MPTCP_SYSCTL_JOIN_ID0 "/proc/sys/net/mptcp/allow_join_initial_addr_port"
 
 static int mptcp_netns_lock;
 
@@ -771,6 +799,7 @@ struct mptcp_netns_saved {
 	char pm[32];
 	char checksum[8]; // empty if not saved
 	char timestamps[8];
+	char join_id0[8];
 };
 
 static bool mptcp_sysctl_read(const char* path, char* buf, int size)
@@ -805,7 +834,8 @@ static bool mptcp_sysctl_write(const char* path, const char* val)
 
 // Saves the settings a call is about to change. The caller holds mptcp_netns_lock
 // until the matching mptcp_netns_restore().
-static void mptcp_netns_save(struct mptcp_netns_saved* saved, bool pm, bool checksum, bool timestamps)
+static void mptcp_netns_save(struct mptcp_netns_saved* saved, bool pm, bool checksum, bool timestamps,
+			     bool join_id0)
 {
 	memset(saved, 0, sizeof(*saved));
 	if (pm) {
@@ -818,6 +848,8 @@ static void mptcp_netns_save(struct mptcp_netns_saved* saved, bool pm, bool chec
 		saved->checksum[0] = 0;
 	if (timestamps && !mptcp_sysctl_read(MPTCP_SYSCTL_TIMESTAMPS, saved->timestamps, sizeof(saved->timestamps)))
 		saved->timestamps[0] = 0;
+	if (join_id0 && !mptcp_sysctl_read(MPTCP_SYSCTL_JOIN_ID0, saved->join_id0, sizeof(saved->join_id0)))
+		saved->join_id0[0] = 0;
 }
 
 static void mptcp_netns_restore(const struct mptcp_netns_saved* saved)
@@ -828,6 +860,8 @@ static void mptcp_netns_restore(const struct mptcp_netns_saved* saved)
 		mptcp_sysctl_write(MPTCP_SYSCTL_CHECKSUM, saved->checksum);
 	if (saved->timestamps[0])
 		mptcp_sysctl_write(MPTCP_SYSCTL_TIMESTAMPS, saved->timestamps);
+	if (saved->join_id0[0])
+		mptcp_sysctl_write(MPTCP_SYSCTL_JOIN_ID0, saved->join_id0);
 }
 #endif // MPTCP_NEED_NETNS_SETTINGS
 
@@ -933,6 +967,189 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
 }
 #endif // __NR_syz_mptcp_subflow_destroy
+
+// ---------- In-kernel path-manager configuration ----------
+//
+// The in-kernel PM acts on its own, from endpoints and limits configured per
+// netns: it opens subflows from "subflow" endpoints, announces "signal"
+// endpoints with ADD_ADDR, meshes "fullmesh" ones, and retries subflows closed
+// after an error. Configuration applies to every kernel-PM msk in the netns,
+// both before a pair is created (acted on when it is established) and while it
+// is live (the kernel walks existing msks). These ops only build valid commands:
+// endpoint i always uses id i+1 and address 127.0.1.(i+1) on lo (clear of the
+// 127.0.0.2+ range join_subflow uses), and the descriptions only offer flag
+// combinations the kernel accepts. The executor's per-program netns reset
+// flushes endpoints and restores the limits, so nothing outlives the program.
+//
+// Both ends of a pair live in the same netns, so they share one endpoint table:
+// both ends announce signal endpoints and both try to open subflows from
+// subflow endpoints (the server's attempts fail, the client is not listening).
+// Two real hosts would each have their own table.
+
+#if MPTCP_NEED_PM_ENDPOINT
+#define MPTCP_PM_ENDPOINT_MAX 8
+// Port of a signal endpoint created with a port: the kernel opens its own
+// listener there (mptcp_pm_nl_create_listen_socket). Per netns, so per proc.
+#define MPTCP_PM_ENDPOINT_PORT_BASE 26100
+
+// Builds and sends an endpoint command for endpoint idx. ADD_ADDR carries the
+// full address; DEL_ADDR and SET_FLAGS look the endpoint up by id.
+static int mptcp_pm_endpoint_cmd(int cmd, long idx, uint32 flags, uint16 port_h)
+{
+	struct mptcp_nlmsg m;
+	struct genlmsghdr genlhdr;
+	struct nlattr* nest = NULL;
+	uint8 id = (uint8)(idx + 1);
+
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = cmd;
+	genlhdr.version = MPTCP_PM_VER;
+	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	mptcp_nlmsg_nest_begin(&m, &nest, MPTCP_PM_ATTR_ADDR | NLA_F_NESTED);
+	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ID, &id, sizeof(id));
+	if (cmd == MPTCP_PM_CMD_ADD_ADDR) {
+		uint16 fam = AF_INET;
+		uint32 addr_be = htonl(0x7f000100 + id);
+		uint32 ifindex = if_nametoindex("lo");
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam, sizeof(fam));
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ADDR4, &addr_be, sizeof(addr_be));
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_IF_IDX, &ifindex, sizeof(ifindex));
+		if (port_h)
+			mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
+	}
+	// SET_FLAGS replaces the backup/fullmesh bits, so it always sends FLAGS (0 clears them).
+	if (flags || cmd == MPTCP_PM_CMD_SET_FLAGS)
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FLAGS, &flags, sizeof(flags));
+	mptcp_nlmsg_nest_end(&m, nest);
+	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
+}
+#endif // MPTCP_NEED_PM_ENDPOINT
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint
+// Adds endpoint idx and returns it as the endpoint handle. kind is one of the
+// flag combinations the kernel accepts (signal, subflow, signal+subflow,
+// subflow+fullmesh); mods adds backup and/or laminar. with_port only applies to
+// a signal-only endpoint, the one kind the kernel lets carry a port.
+static long syz_mptcp_pm_add_endpoint(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+{
+	long idx = a0;
+	uint32 flags = (uint32)a1 | (uint32)a2;
+	bool signal_only = (flags & (MPTCP_PM_ADDR_FLAG_SIGNAL | MPTCP_PM_ADDR_FLAG_SUBFLOW)) == MPTCP_PM_ADDR_FLAG_SIGNAL;
+	uint16 port_h = (a3 && signal_only) ? MPTCP_PM_ENDPOINT_PORT_BASE + idx : 0;
+
+	if (idx < 0 || idx >= MPTCP_PM_ENDPOINT_MAX)
+		return -1;
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	if (mptcp_pm_endpoint_cmd(MPTCP_PM_CMD_ADD_ADDR, idx, flags, port_h) < 0) {
+		debug("syz_mptcp_pm_add_endpoint: idx %ld flags 0x%x port %d: %d\n", idx, flags, port_h, errno);
+		return -1;
+	}
+	debug("syz_mptcp_pm_add_endpoint: idx %ld flags 0x%x port %d\n", idx, flags, port_h);
+	return idx;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_del_endpoint
+// Removes the endpoint: the kernel sends RM_ADDR for a signal endpoint and
+// closes subflows using a subflow endpoint, on every kernel-PM msk.
+static long syz_mptcp_pm_del_endpoint(volatile long a0)
+{
+	long idx = a0;
+
+	if (idx < 0 || idx >= MPTCP_PM_ENDPOINT_MAX)
+		return -1;
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	if (mptcp_pm_endpoint_cmd(MPTCP_PM_CMD_DEL_ADDR, idx, 0, 0) < 0) {
+		debug("syz_mptcp_pm_del_endpoint: idx %ld: %d\n", idx, errno);
+		return -1;
+	}
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_set_endpoint_flags
+// Sets the endpoint's backup and fullmesh bits. Changing backup sends MP_PRIO on
+// the subflows using it; fullmesh is only offered for non-signal endpoints.
+static long syz_mptcp_pm_set_endpoint_flags(volatile long a0, volatile long a1)
+{
+	long idx = a0;
+	uint32 flags = (uint32)a1 & (MPTCP_PM_ADDR_FLAG_BACKUP | MPTCP_PM_ADDR_FLAG_FULLMESH);
+
+	if (idx < 0 || idx >= MPTCP_PM_ENDPOINT_MAX)
+		return -1;
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	if (mptcp_pm_endpoint_cmd(MPTCP_PM_CMD_SET_FLAGS, idx, flags, 0) < 0) {
+		debug("syz_mptcp_pm_set_endpoint_flags: idx %ld flags 0x%x: %d\n", idx, flags, errno);
+		return -1;
+	}
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_flush_endpoints
+// Removes every endpoint at once (RM_ADDR / subflow close on all kernel-PM msks).
+static long syz_mptcp_pm_flush_endpoints(void)
+{
+	struct mptcp_nlmsg m;
+	struct genlmsghdr genlhdr;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = MPTCP_PM_CMD_FLUSH_ADDRS;
+	genlhdr.version = MPTCP_PM_VER;
+	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	if (mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0) {
+		debug("syz_mptcp_pm_flush_endpoints: %d\n", errno);
+		return -1;
+	}
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_set_limits
+static int mptcp_pm_send_limits(uint32 subflows, uint32 add_addr_accepted, uint32 subflow_retries)
+{
+	struct mptcp_nlmsg m;
+	struct genlmsghdr genlhdr;
+
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = MPTCP_PM_CMD_SET_LIMITS;
+	genlhdr.version = MPTCP_PM_VER;
+	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_RCV_ADD_ADDRS, &add_addr_accepted, sizeof(add_addr_accepted));
+	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_SUBFLOWS, &subflows, sizeof(subflows));
+	if (subflow_retries)
+		mptcp_nlmsg_attr(&m, SYZ_MPTCP_PM_ATTR_SUBFLOW_RETRIES, &subflow_retries, sizeof(subflow_retries));
+	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
+}
+
+// Sets the in-kernel PM limits: extra subflows per msk, accepted ADD_ADDRs, and
+// retries of subflows closed after an error. The retries limit only exists on
+// kernels with that feature; elsewhere the kernel rejects the attribute, so the
+// call falls back to the other two, keeping it valid on both sides of a
+// differential run.
+static long syz_mptcp_pm_set_limits(volatile long a0, volatile long a1, volatile long a2)
+{
+	uint32 subflows = (uint32)a0;
+	uint32 add_addr_accepted = (uint32)a1;
+	uint32 subflow_retries = (uint32)a2;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	int err = mptcp_pm_send_limits(subflows, add_addr_accepted, subflow_retries);
+	if (err < 0 && errno == EINVAL && subflow_retries)
+		err = mptcp_pm_send_limits(subflows, add_addr_accepted, 0);
+	if (err < 0) {
+		debug("syz_mptcp_pm_set_limits: %u/%u/%u: %d\n", subflows, add_addr_accepted, subflow_retries, errno);
+		return -1;
+	}
+	return 0;
+}
+#endif
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init
 // Parse a captured IP packet for an MP_CAPABLE option carrying both keys (the
@@ -1055,7 +1272,12 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	netns_locked = true;
 	mptcp_netns_save(&saved, true,
 			 (init_flags & MPTCP_INIT_CHECKSUM) != 0,
-			 (init_flags & MPTCP_INIT_NO_TIMESTAMPS) != 0);
+			 (init_flags & MPTCP_INIT_NO_TIMESTAMPS) != 0,
+			 (init_flags & MPTCP_INIT_DENY_JOIN_ID0) != 0);
+	// The C flag is decided while the MP_CAPABLE options are built, inside the
+	// handshake below.
+	if (init_flags & MPTCP_INIT_DENY_JOIN_ID0)
+		mptcp_sysctl_write(MPTCP_SYSCTL_JOIN_ID0, "0");
 
 	// Phase 3: free TCP option room for the length-grow graft ops by disabling TCP
 	// timestamps in this (unshared) netns before any socket exists. Per-netns sysctl;
@@ -1117,7 +1339,7 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	memset(&srv_addr, 0, sizeof(srv_addr));
 	srv_addr.sin_family = AF_INET;
 	srv_addr.sin_port = 0; // let the kernel pick an ephemeral port
-	srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	srv_addr.sin_addr.s_addr = htonl((init_flags & MPTCP_INIT_LISTEN_ANY) ? INADDR_ANY : INADDR_LOOPBACK);
 	if (bind(server_listen_fd, (struct sockaddr*)&srv_addr, sizeof(srv_addr)) < 0) {
 		debug("syz_mptcp_pair_init: bind: %d\n", errno);
 		goto fail;
@@ -1126,6 +1348,8 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 		debug("syz_mptcp_pair_init: getsockname: %d\n", errno);
 		goto fail;
 	}
+	// The client always connects to 127.0.0.1, whatever the listener is bound to.
+	srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	if (init_flags & MPTCP_INIT_RWND_CLAMP) {
 		// Pin the receiver window small on the listener BEFORE listen() so the
 		// accepted msk inherits a small window_clamp from its first
@@ -1674,7 +1898,7 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 	// created with MPTCP_INIT_NO_TIMESTAMPS keeps timestamp-free subflows.
 	struct mptcp_netns_saved saved;
 	mptcp_spin_lock(&mptcp_netns_lock);
-	mptcp_netns_save(&saved, false, false, pair->no_timestamps);
+	mptcp_netns_save(&saved, false, false, pair->no_timestamps, false);
 	if (pair->no_timestamps)
 		mptcp_sysctl_write(MPTCP_SYSCTL_TIMESTAMPS, "0");
 	int create_err = mptcp_pm_subflow_create(pair->token, addr_id, addr_flags,
@@ -2334,7 +2558,7 @@ static long syz_mptcp_disconnect(volatile long a0)
 	// around it: the end keeps the PM its typed handle says it has.
 	struct mptcp_netns_saved saved;
 	mptcp_spin_lock(&mptcp_netns_lock);
-	mptcp_netns_save(&saved, true, true, false);
+	mptcp_netns_save(&saved, true, true, false, false);
 	mptcp_set_pm(pair->server_kernel_pm);
 	mptcp_sysctl_write(MPTCP_SYSCTL_CHECKSUM, pair->checksum_enabled ? "1" : "0");
 	memset(&unspec, 0, sizeof(unspec));

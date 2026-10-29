@@ -179,10 +179,58 @@ define MPTCP_INIT_CAPTURE_KEYS	2
 define MPTCP_INIT_NO_TIMESTAMPS	4
 # MPTCP_INIT_CHECKSUM: negotiate DSS checksums -> activates DSS_CSUM + validate_data_csum.
 define MPTCP_INIT_CHECKSUM	8
-mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS, MPTCP_INIT_CHECKSUM
+# MPTCP_INIT_LISTEN_ANY: bind the server listener to 0.0.0.0, so subflows towards an
+# address announced by a signal endpoint (127.0.1.x) reach it.
+define MPTCP_INIT_LISTEN_ANY	16
+# MPTCP_INIT_DENY_JOIN_ID0: allow_join_initial_addr_port=0 while the pair is created,
+# so the handshake carries the MP_CAPABLE C flag.
+define MPTCP_INIT_DENY_JOIN_ID0	32
+mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS, MPTCP_INIT_CHECKSUM, MPTCP_INIT_LISTEN_ANY, MPTCP_INIT_DENY_JOIN_ID0
 
 # syz_mptcp_drive_traffic(): push data client->server on an established pair.
 # On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains
 # only partially, leaving data on the msk send head so the kernel flushes it
 # from the softirq deferred-push path.
 syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len[data]) (remote_cover)
+
+# In-kernel path-manager configuration (netns-wide, like ip-mptcp(8)): endpoints and
+# limits that the in-kernel PM acts on for every kernel-PM msk, both for pairs created
+# afterwards and for live ones. Endpoint idx uses id idx+1 and address 127.0.1.(idx+1)
+# on lo. The executor's per-program netns reset flushes endpoints and restores the
+# limits. Both ends of a pair share the netns, so they share the endpoint table.
+#
+# Endpoints are resources so that removing or changing one is only generated for an
+# endpoint that was added, and changing to fullmesh only for a non-signal one (the
+# kernel rejects fullmesh on a signal endpoint).
+resource mptcp_pm_endpoint[intptr]: 0xffffffffffffffff
+resource mptcp_pm_endpoint_subflow[mptcp_pm_endpoint]
+resource mptcp_pm_endpoint_signal[mptcp_pm_endpoint]
+
+# Harness constants (see .const): MPTCP_PM_ADDR_FLAG_* values, plus the combined
+# endpoint kinds the kernel accepts (signal+fullmesh and a port on anything but a
+# signal-only endpoint are rejected).
+define MPTCP_PM_ENDPOINT_SIGNAL	1
+define MPTCP_PM_ENDPOINT_SUBFLOW	2
+define MPTCP_PM_ENDPOINT_SIGNAL_SUBFLOW	3
+define MPTCP_PM_ENDPOINT_BACKUP	4
+define MPTCP_PM_ENDPOINT_FULLMESH	8
+define MPTCP_PM_ENDPOINT_SUBFLOW_FULLMESH	10
+define MPTCP_PM_ENDPOINT_LAMINAR	32
+mptcp_pm_endpoint_subflow_kinds = MPTCP_PM_ENDPOINT_SUBFLOW, MPTCP_PM_ENDPOINT_SUBFLOW_FULLMESH
+mptcp_pm_endpoint_signal_kinds = MPTCP_PM_ENDPOINT_SIGNAL, MPTCP_PM_ENDPOINT_SIGNAL_SUBFLOW
+mptcp_pm_endpoint_mods = MPTCP_PM_ENDPOINT_BACKUP, MPTCP_PM_ENDPOINT_LAMINAR
+mptcp_pm_endpoint_change_flags = MPTCP_PM_ENDPOINT_BACKUP, MPTCP_PM_ENDPOINT_FULLMESH
+mptcp_pm_endpoint_backup_flag = MPTCP_PM_ENDPOINT_BACKUP
+
+# subflows: extra subflows per msk; add_addr_accepted: ADD_ADDRs acted on;
+# subflow_retries: retries of a subflow closed after an error (kernels without that
+# limit ignore it).
+syz_mptcp_pm_set_limits(subflows int32[0:8], add_addr_accepted int32[0:8], subflow_retries int32[0:8])
+syz_mptcp_pm_add_endpoint$subflow(idx int8[0:7], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_subflow
+syz_mptcp_pm_add_endpoint$signal(idx int8[0:7], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
+# A signal-only endpoint with a port: the kernel opens its own listener on it.
+syz_mptcp_pm_add_endpoint$signal_port(idx int8[0:7], kind const[MPTCP_PM_ENDPOINT_SIGNAL], mods flags[mptcp_pm_endpoint_mods], port const[1]) mptcp_pm_endpoint_signal
+syz_mptcp_pm_del_endpoint(ep mptcp_pm_endpoint)
+syz_mptcp_pm_set_endpoint_flags$subflow(ep mptcp_pm_endpoint_subflow, flags flags[mptcp_pm_endpoint_change_flags])
+syz_mptcp_pm_set_endpoint_flags$signal(ep mptcp_pm_endpoint_signal, flags flags[mptcp_pm_endpoint_backup_flag])
+syz_mptcp_pm_flush_endpoints()
