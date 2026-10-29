@@ -99,8 +99,15 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
 - **keywords:** op-set reach, pm config ops, add_addr, set_limits, fullmesh,
   differential base, export tip, attribution, sockmap, tls-usage, audit yield,
   reach vs aim, dormant code.
+- **progress (2026-10-30):** item (1) root cause: the harness latches the PM
+  setting (and the checksum/timestamps settings) for the whole executor process,
+  so `pm_kernel.c` never runs. Design agreed with Shardul: per-end PM chosen by a
+  `pair_init` `$variant`, typed per-end handles (no certain-to-fail ops), settings
+  restored after pair creation, disconnect keeps the PM, per-program netns reset,
+  three steps. Note: `.claude/tasks/mptcp_pm_selection/design.md`. Awaiting brf-a1
+  review before code.
 - **owner:** Shardul (op-set items coordinated with brf-a1).
-- **last touched:** 2026-10-24.
+- **last touched:** 2026-10-30.
 
 ### diff_corpus_persistence
 - **status:** landed on the fork (`9c427517d`, 2026-10-29); upstream PR prep with the
