@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/corpus"
+	"github.com/google/syzkaller/pkg/db"
 	"github.com/google/syzkaller/pkg/execbackend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer"
@@ -46,6 +47,8 @@ type kernelContext struct {
 	candidates chan []fuzzer.Candidate
 	// Once candidates is assigned, candidatesCount holds their original count.
 	candidatesCount atomic.Int64
+	// If set before candidates are sent, new corpus programs are persisted there.
+	corpusDB *db.DB
 
 	coverFilters    manager.CoverageFilters
 	reportGenerator *manager.ReportGeneratorWrapper
@@ -160,8 +163,21 @@ func (kc *kernelContext) MachineChecked(features flatrpc.Feature,
 }
 
 func (kc *kernelContext) setupFuzzer(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) queue.Source {
+	var candidates []fuzzer.Candidate
+	var corpusUpdates chan corpus.NewItemEvent
+	select {
+	case candidates = <-kc.candidates:
+		if kc.corpusDB != nil {
+			corpusUpdates = make(chan corpus.NewItemEvent, 128)
+			go kc.saveCorpus(corpusUpdates)
+		}
+	case <-kc.ctx.Done():
+		// The loop will be aborted later.
+		break
+	}
+
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	corpusObj := corpus.NewFocusedCorpus(kc.ctx, nil, kc.coverFilters.Areas)
+	corpusObj := corpus.NewFocusedCorpus(kc.ctx, corpusUpdates, kc.coverFilters.Areas)
 	fuzzerObj := fuzzer.NewFuzzer(kc.ctx, &fuzzer.Config{
 		Corpus:   corpusObj,
 		Coverage: kc.cfg.Cover,
@@ -186,13 +202,6 @@ func (kc *kernelContext) setupFuzzer(features flatrpc.Feature, syscalls map[*pro
 		kc.http.Corpus.Store(corpusObj)
 	}
 
-	var candidates []fuzzer.Candidate
-	select {
-	case candidates = <-kc.candidates:
-	case <-kc.ctx.Done():
-		// The loop will be aborted later.
-		break
-	}
 	// We assign kc.fuzzer after kc.candidatesCount to simplify the triageProgress implementation.
 	kc.candidatesCount.Store(int64(len(candidates)))
 	kc.fuzzer.Store(fuzzerObj)
@@ -225,6 +234,26 @@ func (kc *kernelContext) setupFuzzer(features flatrpc.Feature, syscalls map[*pro
 		}
 	}()
 	return fuzzerObj
+}
+
+// saveCorpus persists new corpus programs, so that the next run resumes from them
+// and corpora of several runs can be merged with syz-db.
+func (kc *kernelContext) saveCorpus(updates <-chan corpus.NewItemEvent) {
+	for {
+		select {
+		case <-kc.ctx.Done():
+			return
+		case update := <-updates:
+			if update.Exists {
+				// We only save new progs into the corpus.db file.
+				continue
+			}
+			kc.corpusDB.Save(update.Sig, update.ProgData, 0)
+			if err := kc.corpusDB.Flush(); err != nil {
+				log.Errorf("%s: failed to save corpus database: %v", kc.name, err)
+			}
+		}
+	}
 }
 
 func (kc *kernelContext) CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
