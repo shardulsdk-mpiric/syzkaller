@@ -91,7 +91,9 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
   see `mptcp_kcov_keystone_ext`.
 
 ### mptcp_kcov_keystone_ext
-- **status:** in progress (opened 2026-10-30).
+- **status:** patches 0006-0009 approved by the keystone owner and committed
+  (2026-10-30); delegated-action branch of `mptcp_napi_poll` instrumented but
+  not yet triggered (reach item in `mptcp_reach_scenarios`).
 - **brief:** `.claude/tasks/mptcp_kcov_keystone_ext/CLAUDE.md`.
 - **goal:** keystone patches 0006+ so the MPTCP softirq paths still invisible
   to kcov (delegated-action NAPI poll, passive join accept, server-side
