@@ -4239,7 +4239,27 @@ static const char* net_sysctls[] = {
     "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback",
     "/proc/sys/net/mptcp/add_addr_v6_port_drop_ts",
 };
-static char net_sysctl_values[sizeof(net_sysctls) / sizeof(net_sysctls[0])][32];
+#define NET_SYSCTLS_COUNT (sizeof(net_sysctls) / sizeof(net_sysctls[0]))
+
+// The in-kernel MPTCP path manager keeps endpoints and limits per netns, and the
+// MPTCP pseudo-syscalls configure them. Reset removes all endpoints and restores
+// the limits recorded at checkpoint. Commands and attributes are from
+// <linux/mptcp_pm.h>, spelled out because older headers lack them.
+#define NET_MPTCP_PM_CMD_FLUSH_ADDRS 4
+#define NET_MPTCP_PM_CMD_SET_LIMITS 5
+#define NET_MPTCP_PM_CMD_GET_LIMITS 6
+#define NET_MPTCP_PM_LIMITS_ATTR_MAX 8 // RCV_ADD_ADDRS = 2, SUBFLOWS = 3, SUBFLOW_RETRIES = 7
+
+// Checkpointed values of the sysctls and MPTCP PM limits above, for one netns:
+// the executor's own (net_state), plus the MPTCP two-netns peer netns when one
+// exists (see common_linux_mptcp.h).
+struct net_reset_state {
+	char sysctl_values[NET_SYSCTLS_COUNT][32];
+	bool mptcp_limits_saved;
+	uint32 mptcp_limits[NET_MPTCP_PM_LIMITS_ATTR_MAX];
+	bool mptcp_limits_present[NET_MPTCP_PM_LIMITS_ATTR_MAX];
+};
+static struct net_reset_state net_state;
 
 static int read_net_sysctl(const char* path, char* buf, int size)
 {
@@ -4254,44 +4274,32 @@ static int read_net_sysctl(const char* path, char* buf, int size)
 	return n;
 }
 
-static void checkpoint_net_sysctls(void)
+static void checkpoint_net_sysctls(struct net_reset_state* st)
 {
-	for (unsigned i = 0; i < sizeof(net_sysctls) / sizeof(net_sysctls[0]); i++) {
-		if (read_net_sysctl(net_sysctls[i], net_sysctl_values[i], sizeof(net_sysctl_values[i])) < 0)
-			net_sysctl_values[i][0] = 0;
+	for (unsigned i = 0; i < NET_SYSCTLS_COUNT; i++) {
+		if (read_net_sysctl(net_sysctls[i], st->sysctl_values[i], sizeof(st->sysctl_values[i])) < 0)
+			st->sysctl_values[i][0] = 0;
 	}
 }
 
-static void reset_net_sysctls(void)
+static void reset_net_sysctls(const struct net_reset_state* st)
 {
-	for (unsigned i = 0; i < sizeof(net_sysctls) / sizeof(net_sysctls[0]); i++) {
-		char cur[sizeof(net_sysctl_values[i])];
-		if (!net_sysctl_values[i][0])
+	for (unsigned i = 0; i < NET_SYSCTLS_COUNT; i++) {
+		char cur[sizeof(st->sysctl_values[i])];
+		if (!st->sysctl_values[i][0])
 			continue;
-		if (read_net_sysctl(net_sysctls[i], cur, sizeof(cur)) > 0 && strcmp(cur, net_sysctl_values[i]) == 0)
+		if (read_net_sysctl(net_sysctls[i], cur, sizeof(cur)) > 0 && strcmp(cur, st->sysctl_values[i]) == 0)
 			continue;
 		debug("resetting %s\n", net_sysctls[i]);
 		int fd = open(net_sysctls[i], O_WRONLY);
 		if (fd == -1)
 			continue;
-		int len = strlen(net_sysctl_values[i]);
-		if (write(fd, net_sysctl_values[i], len) != len)
+		int len = strlen(st->sysctl_values[i]);
+		if (write(fd, st->sysctl_values[i], len) != len)
 			debug("failed to reset %s: %d\n", net_sysctls[i], errno);
 		close(fd);
 	}
 }
-
-// The in-kernel MPTCP path manager keeps endpoints and limits per netns, and the
-// MPTCP pseudo-syscalls configure them. Reset removes all endpoints and restores
-// the limits recorded at checkpoint. Commands and attributes are from
-// <linux/mptcp_pm.h>, spelled out because older headers lack them.
-#define NET_MPTCP_PM_CMD_FLUSH_ADDRS 4
-#define NET_MPTCP_PM_CMD_SET_LIMITS 5
-#define NET_MPTCP_PM_CMD_GET_LIMITS 6
-#define NET_MPTCP_PM_LIMITS_ATTR_MAX 8 // RCV_ADD_ADDRS = 2, SUBFLOWS = 3, SUBFLOW_RETRIES = 7
-static bool net_mptcp_limits_saved;
-static uint32 net_mptcp_limits[NET_MPTCP_PM_LIMITS_ATTR_MAX];
-static bool net_mptcp_limits_present[NET_MPTCP_PM_LIMITS_ATTR_MAX];
 
 static int net_mptcp_pm_open(struct nlmsg* nlmsg, int* family)
 {
@@ -4316,7 +4324,7 @@ static void net_mptcp_pm_init(struct nlmsg* nlmsg, int family, int cmd)
 	netlink_init(nlmsg, family, 0, &genlhdr, sizeof(genlhdr));
 }
 
-static void checkpoint_mptcp_pm(void)
+static void checkpoint_mptcp_pm(struct net_reset_state* st)
 {
 	struct nlmsg nlmsg;
 	int family = 0;
@@ -4331,19 +4339,19 @@ static void checkpoint_mptcp_pm(void)
 		     attr = (struct nlattr*)((char*)attr + NLMSG_ALIGN(attr->nla_len))) {
 			int type = attr->nla_type & NLA_TYPE_MASK;
 			if (type < NET_MPTCP_PM_LIMITS_ATTR_MAX && attr->nla_len >= sizeof(*attr) + sizeof(uint32)) {
-				net_mptcp_limits[type] = *(uint32*)(attr + 1);
-				net_mptcp_limits_present[type] = true;
+				st->mptcp_limits[type] = *(uint32*)(attr + 1);
+				st->mptcp_limits_present[type] = true;
 			}
 		}
-		net_mptcp_limits_saved = true;
+		st->mptcp_limits_saved = true;
 		recv(sock, nlmsg.buf, sizeof(nlmsg.buf), 0); // recv ack
 	}
 	close(sock);
 }
 
-static void reset_mptcp_pm(void)
+static void reset_mptcp_pm(const struct net_reset_state* st)
 {
-	if (!net_mptcp_limits_saved)
+	if (!st->mptcp_limits_saved)
 		return;
 	struct nlmsg nlmsg;
 	int family = 0;
@@ -4355,8 +4363,8 @@ static void reset_mptcp_pm(void)
 		debug("reset_mptcp_pm: flush failed: %d\n", errno);
 	net_mptcp_pm_init(&nlmsg, family, NET_MPTCP_PM_CMD_SET_LIMITS);
 	for (int type = 0; type < NET_MPTCP_PM_LIMITS_ATTR_MAX; type++) {
-		if (net_mptcp_limits_present[type])
-			netlink_attr(&nlmsg, type, &net_mptcp_limits[type], sizeof(net_mptcp_limits[type]));
+		if (st->mptcp_limits_present[type])
+			netlink_attr(&nlmsg, type, &st->mptcp_limits[type], sizeof(st->mptcp_limits[type]));
 	}
 	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0)
 		debug("reset_mptcp_pm: set limits failed: %d\n", errno);
@@ -4373,8 +4381,8 @@ static void checkpoint_net_namespace(void)
 	checkpoint_arptables();
 	checkpoint_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
 	checkpoint_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
-	checkpoint_net_sysctls();
-	checkpoint_mptcp_pm();
+	checkpoint_net_sysctls(&net_state);
+	checkpoint_mptcp_pm(&net_state);
 }
 
 static void reset_net_namespace(void)
@@ -4387,8 +4395,8 @@ static void reset_net_namespace(void)
 	reset_arptables();
 	reset_iptables(ipv4_tables, sizeof(ipv4_tables) / sizeof(ipv4_tables[0]), AF_INET, SOL_IP);
 	reset_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
-	reset_net_sysctls();
-	reset_mptcp_pm();
+	reset_net_sysctls(&net_state);
+	reset_mptcp_pm(&net_state);
 }
 #endif
 
