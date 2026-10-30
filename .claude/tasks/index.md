@@ -34,6 +34,15 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
 - **goal:** fuzz a base-vs-patched kernel pair aimed at a diff and classify
   patched-only regressions before merge.
 - **keywords:** diff, differential, pre-merge, syz-diffrepro, regression, patched.
+- **progress (2026-10-30):** round-2 MPTCP campaign (audit2) live on three
+  builds split by reach and sanitizer: A = in-kernel-PM series (KASAN), B = the
+  rest (KASAN, waits on Shardul's review of hand-resolved conflicts), C =
+  race-prone series (KCSAN). Run records, findings and per-function reach data
+  live outside the repo (skill `stages/records.md`). Pinned builds:
+  `syzkaller_54cdc7c66` (corpus persistence), `syzkaller_c1a242f4e` (per-end PM
+  selection). Reach measured per series from `/funccover`; the gaps it found
+  opened `mptcp_kcov_keystone_ext`, `mptcp_reach_scenarios`,
+  `diffrepro_fix_verification`.
 
 ## Development threads
 
@@ -77,6 +86,20 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
   softirq/workqueue paths report coverage and guide the fuzzer.
 - **keywords:** kcov, coverage, keystone, softirq, workqueue, remote handle,
   kernel_patches.
+- **progress (2026-10-30):** MPTCP gaps found under live fuzzing
+  (`mptcp_napi_poll`, `subflow_syn_recv_sock`, `mptcp_pm_allow_new_subflow`):
+  see `mptcp_kcov_keystone_ext`.
+
+### mptcp_kcov_keystone_ext
+- **status:** in progress (opened 2026-10-30).
+- **brief:** `.claude/tasks/mptcp_kcov_keystone_ext/CLAUDE.md`.
+- **goal:** keystone patches 0006+ so the MPTCP softirq paths still invisible
+  to kcov (delegated-action NAPI poll, passive join accept, server-side
+  subflow admission) report coverage.
+- **keywords:** keystone 0006, mptcp_napi_poll, subflow_syn_recv_sock,
+  allow_new_subflow, delegated, softirq coverage, invisible, funccover.
+- **owner:** syzkaller-tree session; review brf-a1.
+- **last touched:** 2026-10-30.
 
 ### differential_audit_yield
 - **status:** open, HIGH PRIORITY (opened 2026-10-24, from the MPTCP aggregate
@@ -104,9 +127,36 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
   so `pm_kernel.c` never runs. Design agreed with Shardul: per-end PM chosen by a
   `pair_init` `$variant`, typed per-end handles (no certain-to-fail ops), settings
   restored after pair creation, disconnect keeps the PM, per-program netns reset,
-  three steps. Note: `.claude/tasks/mptcp_pm_selection/design.md`. Awaiting brf-a1
-  review before code.
+  three steps. Note: `.claude/tasks/mptcp_pm_selection/design.md`. Steps 1-2
+  landed (`580c128f4`, `021322be1`), pinned as `syzkaller_c1a242f4e`; build A
+  reaches the in-kernel PM under fuzzing. Step 3 (userspace PM completeness)
+  open. Item (2) done: audit2 base = export tip + keystone on both sides.
+  Remaining reach gaps measured per series (2026-10-30): see
+  `mptcp_reach_scenarios` and `mptcp_kcov_keystone_ext`.
 - **owner:** Shardul (op-set items coordinated with brf-a1).
+- **last touched:** 2026-10-30.
+
+### mptcp_reach_scenarios
+- **status:** in progress (opened 2026-10-30).
+- **brief:** `.claude/tasks/mptcp_reach_scenarios/CLAUDE.md`.
+- **goal:** ops that create the trigger conditions series need (subflow stall
+  for reinjection, error-closed kernel-PM subflow for retry, MPTCP sysctl
+  writer, netns lifecycle), and a two-netns pair so each end has its own PM
+  state and endpoint table.
+- **keywords:** scenario op, trigger condition, reinjection, subflow stall,
+  retry, error close, sysctl writer, netns lifecycle, two netns, veth pair,
+  endpoint table, rm_addr, realism.
+- **owner:** syzkaller-tree session; review brf-a1 (MPTCP harness owner).
+- **last touched:** 2026-10-30.
+
+### diffrepro_fix_verification
+- **status:** in progress (opened 2026-10-30).
+- **brief:** `.claude/tasks/diffrepro_fix_verification/CLAUDE.md`.
+- **goal:** a syz-diffrepro summary section listing titles the base kernel hits
+  repeatedly and the patched kernel never does, as evidence a fix series works.
+- **keywords:** fix verification, base-only, fixed by patch, tested-by,
+  summary bucket, syz-diffrepro.
+- **owner:** syzkaller-tree session.
 - **last touched:** 2026-10-30.
 
 ### diff_corpus_persistence
@@ -155,6 +205,14 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
 - **keywords:** sanitizer routing, kasan, kcsan, kmsan, ubsan, build variants,
   vm allocation, bug-class classification, differential targeting,
   instrumentation budget, llm classifier, mutually exclusive builds.
+- **progress (2026-10-30):** first manual instance in the MPTCP audit: a
+  separate KCSAN build (own KCSAN base) for race-prone series, chosen by added
+  `READ_ONCE`/`WRITE_ONCE`/acquire-release counts per series. Operational
+  lessons (in the premerge-differential skill, stage 6): `cpu >= 2` per VM;
+  boot with `kcsan.early_enable=0` (the executor enables KCSAN after the
+  machine check); `ignores` for kernel noise families; disable
+  `KCSAN_REPORT_RACE_UNKNOWN_ORIGIN` (one-sided reports dominated repro time).
+  For fix series, the signal is base-only (see `diffrepro_fix_verification`).
 - **owner:** Shardul.
 - **last touched:** 2026-10-24.
 
