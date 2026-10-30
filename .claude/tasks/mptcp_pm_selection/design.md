@@ -355,3 +355,38 @@ differential configs that enable whatever carrier is chosen.
       MPJoinPortSynRx 1 (the announced-listener check ran and passed), RmAddr 3.
   - **Open:** `mptcp_pm_announced_has_ssk` runs (MIB) but sits in the SYN path,
     so kcov can't see it; that's the keystone question again.
+- 2026-10-30, op-design gaps from the gap list (branch `mptcp-pm-gaps`, from
+  `d82fa4b06`):
+  - **Endpoint on the pair's own address:** `add_endpoint$initial_subflow/
+    $initial_signal`, handle 8, id 9, 127.0.0.1. Reaches the
+    `mptcp_mpc_endpoint_setup` hit branch, `mpc_endpoint_id` bookkeeping and the
+    `local.addr.id = 0` paths, all 0 before.
+  - **id 0:** `del_endpoint$id0` (handle 256): DEL_ADDR id 0 with 127.0.0.1, the
+    kernel's `mptcp_nl_remove_id_zero_address`.
+  - **Kernel-assigned ids:** `add_endpoint$auto_subflow/$auto_signal`, handles
+    16-23 on 127.0.4.x, sent without an id; the executor learns the id from a
+    dump so del / set_flags / get keep working. The kernel allocates upwards
+    from the highest id it has seen, so an auto endpoint added before a fixed one
+    can take the fixed id and make that add fail with EBUSY, as for ip-mptcp(8)
+    users. Kept as real semantics and documented in the descriptions.
+  - **Reads:** `get_endpoint` (in-kernel by id, or `$announced` by token),
+    `dump_endpoints` (in-kernel table; `$userspace_client/$userspace_server`
+    for one connection's userspace list), `get_limits`. A new
+    `mptcp_nlmsg_query()` reads every reply up to the ACK or DONE with a 16 KiB
+    buffer, so a dump never leaves datagrams queued on the shared socket.
+  - **Naming with two-netns (agreed with syzkaller-ef):** `$client/$server`
+    name netns sides by MPTCP role; bare names stay the proc-netns form. The
+    userspace dumps are `$userspace_*` so they don't read as netns sides.
+    Two-netns encodes the side as a high bit (512/1024) on top of these
+    per-table handles and switches netns in `mptcp_pm_endpoint_resolve()`.
+  - **Verification (audit2 build A):** every endpoint, read and userspace op
+    builds as a standalone C reproducer with `-Werror`, plain and threaded with
+    net_reset (15 programs). `run-tests -tests mptcp`: 125 OK, 1 skip, 1 fail
+    (the known `join_close_race` flake); `-tests mptcp_pm` after the last fixes:
+    56 OK, 0 fail. Coverage probes: GET/DUMP/fill_addr/GET_LIMITS and the
+    userspace get/dump handlers, the kernel id allocation
+    (`append_new_local_addr` find_next_zero_bit), and the initial-endpoint
+    and id-0 paths above.
+  - **Still open from section A:** implicit-endpoint replace and id wrap
+    (needs joins to addresses outside the server's table, i.e. two-netns), and
+    IPv6.
