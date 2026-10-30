@@ -41,3 +41,8 @@ reachability column), not from the previous run's list.
    aborts the whole run ("coverage is not supported ... status=Crashed").
 
 Record the enabled list (or its hash + file) in the manifest.
+8. **KCSAN kernels: build with clang, not GCC 11.** GCC 11.4 instruments
+   `READ_ONCE()` of a `bool` as a plain `__tsan_read1` (the matching
+   `WRITE_ONCE()` stays volatile), so correctly annotated bool pairs show up as
+   data races. Check a suspect report by disassembling the read site
+   (`objdump -d`, look for `__tsan_read1` vs `__tsan_unaligned_volatile_read1`).

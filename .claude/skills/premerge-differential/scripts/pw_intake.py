@@ -15,7 +15,7 @@ Usage:
 Run with `python3 -I`. Network: patchwork.kernel.org REST API only (lore's HTML
 is bot-blocked; the API and b4 are not).
 """
-import argparse, collections, json, os, re, sys, time, urllib.request
+import argparse, collections, json, os, re, sys, time, urllib.error, urllib.request
 
 API = "https://patchwork.kernel.org/api/1.3"
 
@@ -25,6 +25,13 @@ def get(url, retries=3):
         try:
             with urllib.request.urlopen(url, timeout=60) as r:
                 return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:  # patchwork answers a page past the end with 404
+                return None
+            if i == retries - 1:
+                raise
+            print(f"retry {url}: {e}", file=sys.stderr)
+            time.sleep(5 * (i + 1))
         except Exception as e:  # network drops are common here; retry
             if i == retries - 1:
                 raise
@@ -55,6 +62,8 @@ def main():
         page = 1
         while True:
             raw = get(f"{API}/patches/?project={a.project}&state={st}&per_page=100&page={page}")
+            if raw is None:
+                break
             try:
                 patches = json.loads(raw)
             except ValueError:
@@ -90,14 +99,14 @@ def main():
     for _, sid in sorted(best.values(), key=lambda kv: kv[0][1], reverse=True):
         meta = f"{a.out}/meta/{sid}.json"
         if not os.path.exists(meta):
-            open(meta, "wb").write(get(f"{API}/series/{sid}/"))
+            open(meta, "wb").write(get(f"{API}/series/{sid}/") or b"{}")
         s = json.load(open(meta))
         msgid = ((s.get("cover_letter") or {}).get("msgid") or s["patches"][0]["msgid"]).strip("<>")
         ser[sid]["msgid"] = msgid
         ser[sid]["lore"] = f"https://lore.kernel.org/{a.list}/{msgid}/"
         mb = f"{a.out}/mbox/{sid}.mbox"
         if not os.path.exists(mb):
-            open(mb, "wb").write(get(f"https://patchwork.kernel.org/series/{sid}/mbox/"))
+            open(mb, "wb").write(get(f"https://patchwork.kernel.org/series/{sid}/mbox/") or b"")
         v = ser[sid]
         rows.append([sid, f"v{v['version']}", str(v["n"]), v["date"], v["submitter"],
                      v["name"], msgid, v["lore"]])
