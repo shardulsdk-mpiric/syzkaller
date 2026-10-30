@@ -1,7 +1,7 @@
 From c6bfeeb7f3410014851e9460493c8ddb112c92b7 Mon Sep 17 00:00:00 2001
-From: x <x@y>
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 30 Oct 2026 10:50:15 +0530
-Subject: [PATCH 8/8] mptcp: extend kcov coverage to the non-DSS option
+Subject: [PATCH 8/9] mptcp: extend kcov coverage to the non-DSS option
  dispatch
 
 In mptcp_incoming_options() only the option parser was bracketed; the

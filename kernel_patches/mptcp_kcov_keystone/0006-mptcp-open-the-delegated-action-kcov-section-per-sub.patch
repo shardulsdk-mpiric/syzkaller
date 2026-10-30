@@ -1,7 +1,7 @@
 From 7af609549bce52086a1c501409b77203869eedc4 Mon Sep 17 00:00:00 2001
-From: x <x@y>
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 30 Oct 2026 09:55:13 +0530
-Subject: [PATCH 6/8] mptcp: open the delegated-action kcov section per subflow
+Subject: [PATCH 6/9] mptcp: open the delegated-action kcov section per subflow
  in mptcp_napi_poll
 
 The deferred send push reached through the NAPI-delegated path was
