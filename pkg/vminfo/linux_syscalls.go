@@ -115,6 +115,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_mptcp_subflow_stall":         linuxSyzMptcpNfqueueSupported,
 	"syz_mptcp_subflow_fail":          linuxSyzMptcpNfqueueSupported,
 	"syz_mptcp_set_sysctl":            linuxSyzMptcpSupported,
+	"syz_mptcp_set_rps":               linuxSyzMptcpSupported,
 	"syz_mptcp_netns_cycle":           linuxSyzMptcpSupported,
 	"syz_quic_conn_init":              linuxSyzQuicSupported,
 	"syz_quic_conn_close":             linuxSyzQuicSupported,

@@ -455,6 +455,11 @@ static void mptcp_two_netns_no_wire_op(const char* call, long pair_slot, const c
 #define MPTCP_NEED_PEER_NETNS (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || MPTCP_NEED_PM_CONFIG)
 #define MPTCP_NEED_PEER_ENTER (MPTCP_NEED_PEER_NETNS || __NR_syz_mptcp_disconnect || MPTCP_NEED_PM_USERSPACE)
 #define MPTCP_PEER_HANDOFF (MPTCP_NEED_PEER_NETNS && (SYZ_EXECUTOR || SYZ_NET_RESET) && SYZ_EXECUTOR_USES_FORK_SERVER)
+// Receive Packet Steering on this netns's lo (set_rps): the op, and the per-program
+// reset that puts the knob back when the netns outlives the program
+// (MPTCP_RPS_RESET, the same shape as MPTCP_PEER_HANDOFF).
+#define MPTCP_NEED_RPS (SYZ_EXECUTOR || __NR_syz_mptcp_set_rps)
+#define MPTCP_RPS_RESET (MPTCP_NEED_RPS && (SYZ_EXECUTOR || SYZ_NET_RESET) && SYZ_EXECUTOR_USES_FORK_SERVER)
 
 // remove and set_flags also act on a joined subflow, and subflow_stall reads it
 // (the subflow names the flow).
@@ -742,18 +747,12 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 #define MPTCP_PEER_ALIASES_PER_RANGE 8
 #define MPTCP_PEER_PREFIXLEN 16
 
-#if MPTCP_NEED_PEER_ENTER
-#include <sched.h>
-
-// Long-lived netns fds sit at or above this, clear of the fds programs use and of
-// the range close_fds() closes at program end (which can run while a call that
-// was cut off in threaded mode is still between its setns calls).
+#if MPTCP_NEED_PEER_ENTER || MPTCP_RPS_RESET
+// Long-lived fds (the netns fds, the loop process's RPS knob) sit at or above
+// this, clear of the fds programs use and of the range close_fds() closes at
+// program end (which can run while a call that was cut off in threaded mode is
+// still between its setns calls).
 #define MPTCP_NETNS_FD_MIN 200
-
-// The peer netns, once built: an ns/net fd that keeps it alive.
-static int mptcp_peer_netns_fd = -1;
-// The executor proc's own netns, which every thread returns to.
-static int mptcp_self_netns_fd = -1;
 
 static int mptcp_fd_high(int fd)
 {
@@ -763,6 +762,15 @@ static int mptcp_fd_high(int fd)
 	close(fd);
 	return high;
 }
+#endif
+
+#if MPTCP_NEED_PEER_ENTER
+#include <sched.h>
+
+// The peer netns, once built: an ns/net fd that keeps it alive.
+static int mptcp_peer_netns_fd = -1;
+// The executor proc's own netns, which every thread returns to.
+static int mptcp_self_netns_fd = -1;
 
 // The self netns fd, opened on first use by a thread that is in the self netns
 // (every caller is, outside an enter/leave pair).
@@ -4476,6 +4484,179 @@ static long syz_mptcp_set_sysctl(volatile long a0, volatile long a1)
 	return ok ? 0 : -1;
 }
 #endif
+
+#if MPTCP_NEED_RPS
+#include <stdlib.h>
+#include <sys/mount.h>
+
+// Receive Packet Steering on the lo device of the calling process's netns: the
+// rps_cpus knob of its one rx queue. The knob is only reachable through sysfs, and
+// a sysfs instance shows the netns of the process that MOUNTED it (its superblock
+// is tagged with the mounter's netns: fs/sysfs/mount.c sysfs_get_tree,
+// kobj_ns_grab_current(KOBJ_NS_TYPE_NET)), so the VM's /sys shows the init netns's
+// lo, not this proc's. The net.core.rps_default_mask sysctl does not help either:
+// it is per netns (net->core.rps_default_mask, netns_core_table_dup in
+// net/core/sysctl_net_core.c), starts empty in a new netns, and is applied only
+// when a device registers in that netns (rx_queue_default_mask, called from
+// rx_queue_add_kobject in net/core/net-sysfs.c), and lo registers from the
+// unshare(CLONE_NEWNET) that creates the netns, before anything can run in it.
+// So: a private sysfs mount from inside the netns, open the knob, lazily unmount
+// (the open fd keeps the superblock alive), remove the directory. -1 when any step
+// fails, each a reason the knob is unavailable: no CONFIG_RPS (no rps_cpus
+// attribute), no CONFIG_SYSFS, no CAP_SYS_ADMIN over the netns (the setuid
+// sandbox), nowhere to make the directory.
+#define MPTCP_RPS_LO_KNOB "class/net/lo/queues/rx-0/rps_cpus"
+// Mask values are up to 9 characters per 32 CPUs; 4096 CPUs is far above any VM.
+#define MPTCP_RPS_MAX_CPUS 4096
+#define MPTCP_RPS_VAL_SIZE (MPTCP_RPS_MAX_CPUS / 32 * 9 + 1)
+
+static int mptcp_rps_open(void)
+{
+	char dir[32];
+	char path[sizeof(dir) + sizeof(MPTCP_RPS_LO_KNOB) + 1];
+	int fd = -1;
+
+	// The proc's working directory (the executor runs each proc in its own
+	// temporary directory), else /tmp.
+	strcpy(dir, "./syz-rps.XXXXXX");
+	if (!mkdtemp(dir)) {
+		strcpy(dir, "/tmp/syz-rps.XXXXXX");
+		if (!mkdtemp(dir)) {
+			debug("mptcp_rps_open: mkdtemp: %d\n", errno);
+			return -1;
+		}
+	}
+	if (mount("sysfs", dir, "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) == 0) {
+		snprintf(path, sizeof(path), "%s/%s", dir, MPTCP_RPS_LO_KNOB);
+		fd = open(path, O_RDWR);
+		if (fd < 0) {
+			debug("mptcp_rps_open: open %s: %d\n", MPTCP_RPS_LO_KNOB, errno);
+		}
+		if (umount2(dir, MNT_DETACH)) {
+			debug("mptcp_rps_open: umount2: %d\n", errno);
+		}
+	} else {
+		debug("mptcp_rps_open: mount sysfs: %d\n", errno);
+	}
+	rmdir(dir);
+	return fd;
+}
+
+// The knob's value as the kernel prints it (a cpumask, 32-bit groups separated by
+// commas, "0" for none), without the newline, so two reads compare as strings.
+static bool mptcp_rps_read(int fd, char* buf, int size)
+{
+	if (lseek(fd, 0, SEEK_SET) < 0)
+		return false;
+	int n = read(fd, buf, size - 1);
+	if (n <= 0)
+		return false;
+	buf[n] = 0;
+	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+		buf[--n] = 0;
+	return true;
+}
+
+static bool mptcp_rps_write(int fd, const char* val)
+{
+	int len = strlen(val);
+	if (write(fd, val, len) != len) {
+		debug("mptcp_rps_write: write %s: %d\n", val, errno);
+		return false;
+	}
+	return true;
+}
+#endif // MPTCP_NEED_RPS
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_set_rps
+// The mask of CPUs 0..ncpus-1 in the knob's format: hex, 32 bits per group, the
+// highest group first, lower groups zero-padded to 8 digits ("ff,ffffffff").
+static void mptcp_rps_mask(char* buf, int size, int ncpus)
+{
+	int pos = 0;
+	for (int hi = (ncpus - 1) / 32 * 32; hi >= 0 && pos < size; hi -= 32) {
+		int bits = ncpus - hi < 32 ? ncpus - hi : 32;
+		uint32 word = bits == 32 ? 0xffffffffu : (1u << bits) - 1;
+		pos += snprintf(buf + pos, size - pos, pos ? ",%08x" : "%x", word);
+	}
+}
+
+// Turns Receive Packet Steering on (on=1: rps_cpus = every online CPU) or off
+// (on=0: cleared) on the lo device of the calling process's netns, so that the
+// receive softirq of this proc's loopback traffic can run on a CPU other than the
+// sending task's, which is what makes the NAPI-delegated MPTCP paths (the
+// delegated-action branch of mptcp_napi_poll) occur at all. Opt-in and part of
+// the program: a run without this call in its config is unchanged, and a crash
+// that needs the steering replays it from its reproducer.
+//
+// 1 CPU: nothing to steer, no write, returns 1 (a distinct value, so a log or a
+// reproducer shows it did nothing). 0 when written; -1 when the knob is
+// unavailable (mptcp_rps_open). The setting stays for the rest of the program and
+// is put back by the executor's per-program reset (reset_mptcp_rps) when the
+// netns outlives the program. Only lo is steered: a two-netns pair's segments
+// cross the veth pair, which keeps its own queues.
+static long syz_mptcp_set_rps(volatile long a0)
+{
+	bool on = a0 != 0;
+	char value[MPTCP_RPS_VAL_SIZE], prev[MPTCP_RPS_VAL_SIZE];
+
+	long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (ncpus < 2) {
+		debug("syz_mptcp_set_rps: %ld cpu online, nothing to steer\n", ncpus);
+		return 1;
+	}
+	if (ncpus > MPTCP_RPS_MAX_CPUS)
+		ncpus = MPTCP_RPS_MAX_CPUS;
+	if (on)
+		mptcp_rps_mask(value, sizeof(value), ncpus);
+	else
+		strcpy(value, "0");
+	int fd = mptcp_rps_open();
+	if (fd < 0)
+		return -1;
+	if (!mptcp_rps_read(fd, prev, sizeof(prev)))
+		prev[0] = 0;
+	bool ok = mptcp_rps_write(fd, value);
+	close(fd);
+	debug("syz_mptcp_set_rps: lo rps_cpus %s -> %s (%ld cpus, %s)\n", prev, value, ncpus, ok ? "ok" : "failed");
+	return ok ? 0 : -1;
+}
+#endif
+
+#if MPTCP_RPS_RESET
+// Loop-process side, like the peer handoff: the executor's netns outlives every
+// program, so a set_rps setting would carry into the next program. The knob is
+// opened once at checkpoint (kept at a high fd, which the forked programs inherit
+// but never use) and read back before each program; a changed value is written
+// back. A knob that cannot be opened (no RPS, no privilege) is left alone, and the
+// op then fails the same way.
+static int mptcp_rps_fd = -1;
+static char mptcp_rps_saved[MPTCP_RPS_VAL_SIZE];
+
+static void checkpoint_mptcp_rps(void)
+{
+	mptcp_rps_fd = mptcp_fd_high(mptcp_rps_open());
+	if (mptcp_rps_fd < 0)
+		return;
+	if (!mptcp_rps_read(mptcp_rps_fd, mptcp_rps_saved, sizeof(mptcp_rps_saved))) {
+		close(mptcp_rps_fd);
+		mptcp_rps_fd = -1;
+		return;
+	}
+	debug("checkpoint_mptcp_rps: lo rps_cpus %s\n", mptcp_rps_saved);
+}
+
+static void reset_mptcp_rps(void)
+{
+	char cur[MPTCP_RPS_VAL_SIZE];
+	if (mptcp_rps_fd < 0)
+		return;
+	if (mptcp_rps_read(mptcp_rps_fd, cur, sizeof(cur)) && strcmp(cur, mptcp_rps_saved) == 0)
+		return;
+	debug("reset_mptcp_rps: lo rps_cpus %s -> %s\n", cur, mptcp_rps_saved);
+	mptcp_rps_write(mptcp_rps_fd, mptcp_rps_saved);
+}
+#endif // MPTCP_RPS_RESET
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_netns_cycle
 #include <net/if.h>

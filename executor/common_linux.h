@@ -3447,7 +3447,7 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
     __NR_syz_mptcp_pm_flush_endpoints || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove ||     \
     __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints || \
     __NR_syz_mptcp_pm_get_limits || __NR_syz_mptcp_subflow_stall || __NR_syz_mptcp_subflow_fail ||      \
-    __NR_syz_mptcp_set_sysctl || __NR_syz_mptcp_netns_cycle
+    __NR_syz_mptcp_set_sysctl || __NR_syz_mptcp_netns_cycle || __NR_syz_mptcp_set_rps
 #include "common_linux_mptcp.h"
 #endif
 
@@ -4515,6 +4515,9 @@ static void checkpoint_net_namespace(void)
 #if MPTCP_PEER_HANDOFF
 	checkpoint_mptcp_peer();
 #endif
+#if MPTCP_RPS_RESET
+	checkpoint_mptcp_rps();
+#endif
 }
 
 static void reset_net_namespace(void)
@@ -4531,6 +4534,9 @@ static void reset_net_namespace(void)
 	reset_mptcp_pm(&net_state);
 #if MPTCP_PEER_HANDOFF
 	reset_mptcp_peer();
+#endif
+#if MPTCP_RPS_RESET
+	reset_mptcp_rps();
 #endif
 }
 #endif

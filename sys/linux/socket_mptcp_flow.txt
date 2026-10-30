@@ -476,6 +476,28 @@ define MPTCP_SYSCTL_KNOB_ADD_ADDR_V6_PORT_DROP_TS	9
 mptcp_sysctl_knobs = MPTCP_SYSCTL_KNOB_SCHEDULER, MPTCP_SYSCTL_KNOB_PATH_MANAGER, MPTCP_SYSCTL_KNOB_CHECKSUM, MPTCP_SYSCTL_KNOB_ADD_ADDR_TIMEOUT, MPTCP_SYSCTL_KNOB_CLOSE_TIMEOUT, MPTCP_SYSCTL_KNOB_STALE_LOSS_CNT, MPTCP_SYSCTL_KNOB_ALLOW_JOIN_ID0, MPTCP_SYSCTL_KNOB_BLACKHOLE_TIMEOUT, MPTCP_SYSCTL_KNOB_SYN_RETRANS, MPTCP_SYSCTL_KNOB_ADD_ADDR_V6_PORT_DROP_TS
 syz_mptcp_set_sysctl(knob flags[mptcp_sysctl_knobs], val int32)
 
+# syz_mptcp_set_rps: Receive Packet Steering on the lo device of the calling
+# process's netns. on=1 sets its rps_cpus to every online CPU, so the receive softirq
+# of this process's loopback traffic can run on a CPU other than the sending task's;
+# on=0 clears it. Opt-in and part of the program: a run whose config does not enable
+# this call is unchanged, and a crash that needs the steering replays it from its
+# reproducer. On a VM with 1 CPU it writes nothing and returns 1 (0 when written, -1
+# when the knob is unavailable: no CONFIG_RPS, no sysfs, no CAP_SYS_ADMIN). The
+# setting stays for the rest of the program; the executor's per-program netns reset
+# puts it back. Only lo is steered: a two-netns pair's segments cross the veth pair.
+#
+# The executor's /sys shows the init netns's lo, and net.core.rps_default_mask only
+# applies to devices registered after it is written in that netns, so the executor
+# mounts its own sysfs from inside its netns to reach its lo's knob (see
+# common_linux_mptcp.h).
+#
+# Enable this call only on a kernel carrying kcov keystone patches 0001-0010
+# (kernel_patches/mptcp_kcov_keystone), never on a build with 0006 but without
+# 0010: with RPS on, loopback receive runs in NAPI on another CPU, so the
+# delegated-action branch of mptcp_napi_poll runs under fuzzing, and 0006's kcov
+# section dereferences the msk there before any teardown check (0010 supersedes it).
+syz_mptcp_set_rps(on int8[0:1])
+
 # syz_mptcp_netns_cycle: create a network namespace, connect nconns MPTCP pairs in
 # it and push data, then close everything at once, so the namespace is destroyed
 # while its connections are still closing. ENDPOINTS adds in-kernel PM endpoints

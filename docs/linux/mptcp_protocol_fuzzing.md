@@ -54,6 +54,7 @@ All produce/consume real syzkaller resources (`mptcp_pair`, `mptcp_subflow`,
 | `syz_mptcp_subflow_fail(client_kernel, which)` | a client end on the in-kernel PM loses one subflow to a path timeout (1s keepalive on the msk while that subflow's packets are dropped, ~2s); with a subflow-retries limit the PM re-creates it |
 | `syz_mptcp_set_sysctl(knob, val)` | write one `net.mptcp` sysctl with a valid value (scheduler/path_manager from the kernel's available lists, numbers in range); never `enabled` or `pm_type`; restored by the per-program netns reset |
 | `syz_mptcp_netns_cycle(nconns, flags)` | create a netns, connect MPTCP pairs in it (optionally with in-kernel PM endpoints), close everything so the netns is destroyed while the connections are still closing |
+| `syz_mptcp_set_rps(on)` | Receive Packet Steering on the `lo` of the executor process's netns: `rps_cpus` = every online CPU (on=1) or cleared (on=0), so loopback receive softirq work runs on another CPU than the sender. No-op returning 1 on a 1-CPU VM; -1 when the knob is unavailable. Restored by the per-program netns reset. **Keystone requirement, see below** |
 
 In-kernel path manager (netns-wide, like `ip mptcp endpoint` / `ip mptcp limits`; the
 per-program netns reset flushes endpoints and restores the limits):
@@ -109,6 +110,35 @@ then reach a peer with its own PM.
   (`join_subflow`'s `mut_op` is not applied; `subflow_stall` and `subflow_fail`
   fail), and `listener_close_race`, which stays single-netns.
 - IPv4 only.
+
+### Receive Packet Steering on loopback (`syz_mptcp_set_rps`)
+
+On loopback the receive softirq normally runs on the sending task's CPU, so the
+MPTCP paths that only occur when the subflow is *not* owned by a user task when
+NAPI runs (the delegated-action branch of `mptcp_napi_poll`) do not occur at all.
+`syz_mptcp_set_rps(1)` steers the executor process's `lo` across every online CPU
+(`/sys/class/net/lo/queues/rx-0/rps_cpus`), which makes that branch reachable on a
+VM with 2 or more CPUs (4 is what made it occur in the keystone measurements).
+
+- It is an op, not an executor default: enable it in the config to get it, and a
+  crash that needs the steering carries it in its own reproducer.
+- Each executor process runs in its own netns, and the VM's `/sys` shows the init
+  netns's devices, while `net.core.rps_default_mask` is per netns and applies only
+  to devices registered after it is written (never to a netns's own `lo`). The
+  executor therefore mounts a private sysfs from inside its netns to reach its own
+  `lo`; needs `CONFIG_RPS` (on with `SMP` + `SYSFS`) and the none or namespace
+  sandbox.
+- The per-program netns reset restores the knob, as it does the sysctls
+  `syz_mptcp_set_sysctl` writes.
+- Only `lo`: a two-netns pair's traffic crosses the veth pair, which is not steered.
+
+**Enable this call only on a kernel carrying kcov keystone patches 0001-0010
+(`kernel_patches/mptcp_kcov_keystone`), never on a build with 0006 but without
+0010.** With RPS on, the delegated-action path runs under fuzzing, and 0006's kcov
+section dereferences the msk at the top of the `mptcp_napi_poll` loop before any
+teardown check; 0010 keys the section on a handle held in the subflow context and
+supersedes it. On a build with 0006 alone, a fault in the annotation would be
+reported as a kernel bug.
 
 ## Kernel requirements
 
