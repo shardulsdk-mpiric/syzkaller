@@ -3445,7 +3445,8 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
     __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_add_endpoint ||                                  \
     __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags ||                          \
     __NR_syz_mptcp_pm_flush_endpoints || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove ||     \
-    __NR_syz_mptcp_pm_set_flags
+    __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints || \
+    __NR_syz_mptcp_pm_get_limits
 #include "common_linux_mptcp.h"
 #endif
 

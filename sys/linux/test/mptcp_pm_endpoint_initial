@@ -1,0 +1,16 @@
+# In-kernel PM endpoint on the pair's own address (127.0.0.1), as a host does for its
+# primary address: a signal endpoint added before a kernel/kernel pair, so the pair's
+# initial subflow is matched to it, plus a subflow endpoint. Then mark it backup,
+# withdraw id 0 (the initial subflow's address) from the pair, and remove the
+# endpoint itself.
+
+syz_mptcp_pm_set_limits(0x2, 0x2, 0x0)
+r0 = syz_mptcp_pm_add_endpoint$initial_signal(0x8, 0x1, 0x0, 0x0)
+r1 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x10, 0x3, 0x0, 0x0)
+r2 = syz_mptcp_pm_add_endpoint$subflow(0x0, 0x2, 0x0, 0x0)
+syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pm_set_endpoint_flags$signal(r0, 0x4)
+syz_mptcp_pm_del_endpoint$id0(0x100)
+syz_mptcp_pm_del_endpoint(r0)
+syz_mptcp_pm_del_endpoint(r2)
+syz_mptcp_pair_close(r1)

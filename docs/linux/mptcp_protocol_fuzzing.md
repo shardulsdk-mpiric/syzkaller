@@ -57,7 +57,11 @@ per-program netns reset flushes endpoints and restores the limits):
 |---|---|
 | `syz_mptcp_pm_set_limits(subflows, add_addr_accepted, subflow_retries)` | in-kernel PM limits |
 | `syz_mptcp_pm_add_endpoint$subflow\|$signal\|$signal_port(idx, kind, mods, port)` → endpoint | add endpoint idx (id idx+1, 127.0.1.(idx+1) on lo) of a kind the kernel accepts |
+| `syz_mptcp_pm_add_endpoint$initial_subflow\|$initial_signal` → endpoint | an endpoint on 127.0.0.1, the pair's own address (a host's primary address), id 9 |
+| `syz_mptcp_pm_add_endpoint$auto_subflow\|$auto_signal` → endpoint | an endpoint on 127.0.4.x with no id, so the kernel picks one; the executor reads it back from a dump |
 | `syz_mptcp_pm_del_endpoint(ep)`, `syz_mptcp_pm_set_endpoint_flags$subflow\|$signal(ep, flags)`, `syz_mptcp_pm_flush_endpoints()` | remove, toggle backup/fullmesh, remove all |
+| `syz_mptcp_pm_del_endpoint$id0` | withdraw id 0 (the initial subflow's address) from every in-kernel-PM connection |
+| `syz_mptcp_pm_get_endpoint`, `syz_mptcp_pm_dump_endpoints`, `syz_mptcp_pm_get_limits` | read one endpoint, the table, the limits |
 
 Userspace path manager, on one msk (what a daemon such as mptcpd does):
 
@@ -66,6 +70,7 @@ Userspace path manager, on one msk (what a daemon such as mptcpd does):
 | `syz_mptcp_pm_announce$client\|$server\|$server_port(end, side, idx, port)` → `mptcp_pm_announced` | ADD_ADDR of 127.0.2.(idx+1) from the server or 127.0.3.(idx+1) from the client (id 240+idx); `$server_port` also opens a listener on the announced address and port, as a daemon does |
 | `syz_mptcp_pm_remove$announced\|$subflow\|$id0_client\|$id0_server(handle, kind)` | RM_ADDR of an announcement, of a joined subflow's address, or of id 0 |
 | `syz_mptcp_pm_set_flags$client\|$server\|$subflow(handle, kind, backup)` | MP_PRIO on the initial subflow from either end, or on a joined subflow |
+| `syz_mptcp_pm_get_endpoint$announced(ann, kind)`, `syz_mptcp_pm_dump_endpoints$userspace_client\|$userspace_server(end, kind)` | read one announcement, or one end's userspace address list |
 
 Plus the upstream MPTCP path-manager netlink commands (`sendmsg$MPTCP_PM_CMD_*`), now
 usable end-to-end via the `mptcp_token` resource.
