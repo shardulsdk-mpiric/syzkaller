@@ -21,7 +21,9 @@
 // the title after the clean replay), "unresolved" ones (reproduced, but the
 // reproducer was below the engine's 0.4 reliability cut-off or base crashed with
 // another title during verification, so there is no base verdict) and "possibly
-// patched-only" ones (many patched crashes, none on base, no reproducer).
+// patched-only" ones (many patched crashes, none on base, no reproducer), and
+// the reverse signal for a series that fixes a bug, "fixed by patch?" titles
+// (base crashed repeatedly, patched never, over comparable execution; fixed.go).
 //
 // See README.md next to this file for the invocation, the kernel-pair
 // requirements and the known foot-guns.  pkg/manager/diff is deliberately not
@@ -49,6 +51,7 @@ import (
 	"github.com/google/syzkaller/pkg/manager/diff"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/stat"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/vm"
 	"golang.org/x/sync/errgroup"
@@ -74,6 +77,12 @@ var (
 		"report a title as 'possibly patched-only' when it crashed patched at least this often and never on base")
 	flagIgnore = flag.String("ignore_titles", "",
 		"regexp of crash titles to ignore (the only way to drop e.g. KCSAN reports from the engine)")
+	flagFixedCutoff = flag.Int("fixed_cutoff", 3,
+		"report a title as 'fixed by patch?' when it crashed base at least this often and never crashed patched")
+	flagFixedExecRatio = flag.Float64("fixed_exec_ratio", 0.8,
+		"'fixed by patch?' needs patched exec total >= base exec total * this ratio")
+	flagFixedFocus = flag.Bool("fixed_focus", false,
+		"keep only 'fixed by patch?' titles whose base report has a frame in the series' modified functions")
 	flagDebug      = flag.Bool("debug", false, "dump all VM output to console")
 	flagSaveCorpus = flag.Bool("save_corpus", true,
 		"save the patched kernel's corpus to <patched workdir>/corpus.db, so re-runs resume from it")
@@ -103,6 +112,12 @@ func main() {
 	ignoreRe, err := compileIgnore(*flagIgnore)
 	if err != nil {
 		log.Fatalf("bad -ignore_titles: %v", err)
+	}
+	if *flagFixedCutoff < 1 {
+		log.Fatalf("-fixed_cutoff must be >= 1")
+	}
+	if *flagFixedExecRatio < 0 {
+		log.Fatalf("-fixed_exec_ratio must be >= 0")
 	}
 
 	baseCfg, err := mgrconfig.LoadFile(*flagBase)
@@ -139,6 +154,16 @@ func main() {
 	} else {
 		log.Logf(0, "WARNING: no -patch and no symbol hashes: fuzzing is not aimed at the change")
 	}
+	fixed := fixedParams{
+		Cutoff:     *flagFixedCutoff,
+		ExecRatio:  *flagFixedExecRatio,
+		Focus:      *flagFixedFocus,
+		FocusFuncs: modifiedFunctions(baseHashes.Text, patchedHashes.Text),
+	}
+	if fixed.Focus && len(fixed.FocusFuncs) == 0 {
+		log.Logf(0, "WARNING: -fixed_focus: no modified functions (no symbol hashes, or too many symbols "+
+			"differ); the 'fixed by patch?' bucket will not be focus-filtered")
+	}
 
 	store := &manager.DiffFuzzerStore{BasePath: artifactsDir}
 	sink := &bugSink{dir: filepath.Join(outDir, "patched_only"), bugs: map[string]*diff.Bug{}}
@@ -151,7 +176,7 @@ func main() {
 
 	log.Logf(0, "syz-diffrepro: run time %v, triage deadline %v, reach gate %v, output %v",
 		*flagTime, *flagTriage, *flagReach, outDir)
-	err = run(ctx, baseCfg, patchedCfg, store, sink, ignoreRe, outDir)
+	err = run(ctx, baseCfg, patchedCfg, store, sink, ignoreRe, outDir, fixed)
 	switch {
 	case err == nil:
 		log.Logf(0, "run finished: %v", ctx.Err())
@@ -164,13 +189,13 @@ func main() {
 	default:
 		log.Errorf("run failed: %v", err)
 	}
-	if err := writeSummary(outDir, store, sink, *flagPossible, true); err != nil {
+	if err := writeSummary(outDir, store, sink, *flagPossible, currentExecTotals(), fixed, true); err != nil {
 		log.Fatalf("failed to write the summary: %v", err)
 	}
 }
 
 func run(ctx context.Context, baseCfg, patchedCfg *mgrconfig.Config, store *manager.DiffFuzzerStore,
-	sink *bugSink, ignoreRe *regexp.Regexp, outDir string) error {
+	sink *bugSink, ignoreRe *regexp.Regexp, outDir string, fixed fixedParams) error {
 	eg, groupCtx := errgroup.WithContext(ctx)
 	// Both sends block the engine's main loop; keep them buffered and drained.
 	bugs := make(chan *diff.Bug, 16)
@@ -224,7 +249,7 @@ func run(ctx context.Context, baseCfg, patchedCfg *mgrconfig.Config, store *mana
 			log.Logf(0, "status:\n%s", store.PlainTextDump())
 			// The store is in-memory: keep the on-disk summary current so a
 			// teardown hang, a panic or a kill after the deadline cannot lose it.
-			if err := writeSummary(outDir, store, sink, *flagPossible, false); err != nil {
+			if err := writeSummary(outDir, store, sink, *flagPossible, currentExecTotals(), fixed, false); err != nil {
 				log.Errorf("failed to write the periodic summary: %v", err)
 			}
 		}
@@ -360,9 +385,15 @@ type summary struct {
 	PossiblyPatchedOnly []summaryBug `json:"possibly_patched_only"`
 	// Never reproduced by the engine's own choice: title filter, -ignore_titles,
 	// or the per-title attempt budget exhausted.
-	Ignored     []summaryBug      `json:"ignored"`
-	AffectsBoth []string          `json:"affects_both"`
-	All         []manager.DiffBug `json:"all"`
+	Ignored     []summaryBug `json:"ignored"`
+	AffectsBoth []string     `json:"affects_both"`
+	// Base crashed with the title >= -fixed_cutoff times, patched never did,
+	// over comparable execution (see fixed.go).  Statistical evidence that the
+	// series fixes the bug, not proof.
+	FixedByPatch fixedResult `json:"fixed_by_patch"`
+	// The two kernels' "exec total" stats at the time of writing.
+	ExecTotals execTotals        `json:"exec_totals"`
+	All        []manager.DiffBug `json:"all"`
 }
 
 type summaryBug struct {
@@ -390,7 +421,8 @@ func unresolved(bug manager.DiffBug) bool {
 // idempotent: the status ticker calls it periodically (so a teardown hang or a
 // kill after the deadline does not lose the in-memory store) and main calls it
 // once more, with final set, after diff.Run has returned.
-func writeSummary(outDir string, store *manager.DiffFuzzerStore, sink *bugSink, possibleCutoff int, final bool) error {
+func writeSummary(outDir string, store *manager.DiffFuzzerStore, sink *bugSink, possibleCutoff int,
+	execs execTotals, fixed fixedParams, final bool) error {
 	delivered, seen := sink.snapshot()
 	list := store.List()
 	sort.Slice(list, func(i, j int) bool { return list[i].Title < list[j].Title })
@@ -422,6 +454,27 @@ func writeSummary(outDir string, store *manager.DiffFuzzerStore, sink *bugSink, 
 
 	var sum summary
 	sum.All = list
+	sum.ExecTotals = execs
+	sum.FixedByPatch = fixedByPatch(list, execs, fixed, func(bug manager.DiffBug) []byte {
+		if bug.Base.Report == "" {
+			return nil
+		}
+		// The store writes the base report text (last base crash of the title
+		// wins) under its BasePath; it keeps no copy in memory.
+		data, err := os.ReadFile(filepath.Join(store.BasePath, bug.Base.Report))
+		if err != nil {
+			log.Logf(1, "fixed-by-patch %q: cannot read the base report: %v", bug.Title, err)
+			return nil
+		}
+		return data
+	})
+	for _, rows := range [][]fixedRow{sum.FixedByPatch.Rows, sum.FixedByPatch.Withheld} {
+		for i := range rows {
+			if rows[i].BaseReport != "" {
+				rows[i].BaseReport = filepath.Join(store.BasePath, rows[i].BaseReport)
+			}
+		}
+	}
 	for _, bug := range list {
 		switch {
 		case bug.PatchedOnly() && bug.Base.Crashes > 0:
@@ -519,13 +572,15 @@ func writeSummary(outDir string, store *manager.DiffFuzzerStore, sink *bugSink, 
 	for _, title := range sum.AffectsBoth {
 		fmt.Fprintf(&text, "  %s\n", title)
 	}
+	writeFixedSection(&text, sum.FixedByPatch, execs, fixed)
 	fmt.Fprintf(&text, "\nFULL STORE:\n%s", store.PlainTextDump())
 	if final {
 		log.Logf(0, "%s", text.String())
 	} else {
-		log.Logf(0, "summary written: patched-only=%d contested=%d unresolved=%d possibly=%d ignored=%d both=%d",
+		log.Logf(0, "summary written: patched-only=%d contested=%d unresolved=%d possibly=%d ignored=%d both=%d "+
+			"fixed-by-patch?=%d (withheld %d)",
 			len(sum.PatchedOnly), len(sum.Contested), len(sum.Unresolved), len(sum.PossiblyPatchedOnly),
-			len(sum.Ignored), len(sum.AffectsBoth))
+			len(sum.Ignored), len(sum.AffectsBoth), len(sum.FixedByPatch.Rows), len(sum.FixedByPatch.Withheld))
 		for _, sb := range sum.Unresolved {
 			log.Logf(0, "unresolved (reproduced, no base verdict): %q status=%s syz repro %s",
 				sb.Title, sb.Status, sb.StoreRepro)
@@ -663,4 +718,11 @@ func compileIgnore(re string) (*regexp.Regexp, error) {
 		return nil, nil
 	}
 	return regexp.Compile(re)
+}
+
+// currentExecTotals reads the two kernels' "exec total" stats from the global
+// stat registry the engine's RPC servers register into (the same values the
+// engine logs under STAT every 5 minutes).
+func currentExecTotals() execTotals {
+	return execTotalsFrom(stat.Collect(stat.All))
 }

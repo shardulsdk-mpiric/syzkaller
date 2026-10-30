@@ -47,6 +47,9 @@ bin/syz-diffrepro \
 | `-repros` | parallel reproductions to budget VMs for | `2` |
 | `-possible_cutoff` | patched crash count that makes a title "possibly patched-only" | `10` |
 | `-ignore_titles` | regexp of crash titles the engine must not reproduce | none |
+| `-fixed_cutoff` | base crash count that makes a never-on-patched title "fixed by patch?" (see below) | `3` |
+| `-fixed_exec_ratio` | "fixed by patch?" needs patched exec total >= base exec total x this | `0.8` |
+| `-fixed_focus` | keep only "fixed by patch?" titles whose base report has a frame in the series' modified functions | `false` |
 | `-out` | output directory | `<patched workdir>/syz-diffrepro` |
 | `-vv` | syzkaller log verbosity | `1` (the engine logs each reproducer's reliability, and a reproducer dropped as too unreliable, only at level 1) |
 
@@ -60,7 +63,8 @@ summary that is at most 5 minutes stale.
 
 ```
 <out>/summary.txt, summary.json     patched-only / contested / unresolved / possibly patched-only / ignored /
-                                    affects-both, each row with status + patched and base crash counts, plus the store dump
+                                    affects-both, each row with status + patched and base crash counts;
+                                    fixed-by-patch? (base-only titles, see "Fix verification"); the store dump
 <out>/patched_only/<hash>/          one dir per patched-only title (hash = same as artifacts/crashes/<hash>)
     title, report, log, repro.syz, repro.opts, repro.c
 <out>/artifacts/crashes/<hash>/     the engine's own store: patched_report, base_report, repro.prog, *.log
@@ -98,6 +102,61 @@ A title whose reproducer crashes under a *different* title than the fuzzer's
 original crash is booked by the engine under both (crash count under the
 original, verdict under the reproducer's); the driver lists it once, under the
 reproducer's title, with a note.
+
+## Fix verification: the FIXED-BY-PATCH? section
+
+The engine only reports crashes of the patched kernel; a base crash feeds its
+title suppression (`EverCrashedBase`) and is otherwise dropped.  For a series
+that **fixes** a bug the useful signal is the reverse: the base kernel hits a
+title repeatedly while the patched kernel, which executes the same program
+stream (the base pool replays what the patched pool runs), never does.  The
+summary's last section before the store dump derives that from data the run
+already has, with no engine change and no extra VM time:
+
+```
+FIXED-BY-PATCH? (1): base crashed with the title >=3 times, patched never did, over comparable execution (patched exec total >= 0.80 x base); statistical evidence, not proof
+  exec total: base 49000, patched 49500; focus filter on (2 modified functions)
+  KCSAN: data-race in mptcp_pm_nl_work / mptcp_schedule_work   base 12 crashes   patched 0   (exec base 49000, patched 49500)
+    focus frames: mptcp_pm_nl_work, mptcp_schedule_work
+    base report: <out>/artifacts/crashes/<hash>/base_report
+  withheld (1): base-only titles above the cutoff that failed a guard
+  WARNING in tcp_recvmsg   base 3 crashes   patched 0   (exec base 49000, patched 49500)
+    withheld: no frame of the base report is in the focus functions
+```
+
+A title is listed when all of these hold:
+
+- the store counts **>= `-fixed_cutoff`** (default 3) base crashes and **0**
+  patched crashes with the title;
+- the patched kernel's `exec total` stat is **>= `-fixed_exec_ratio`**
+  (default 0.8) x the base kernel's, so "never on patched" is not "patched ran
+  less" (the two pools boot, crash and restart independently, so their execution
+  counts drift apart; set the ratio to 0 to disable the guard);
+- with `-fixed_focus`, a stack frame of the base report (the engine's last
+  `base_report` for the title, read from `<out>/artifacts/`; the title's own
+  function names are the fallback when no report was retained) names one of
+  the series' **modified functions**, the same `.text` symbols the engine's
+  `symbols` focus area aims at (hashes of both `vmlinux.o`; empty when they are
+  unavailable or more than 5% of the symbols differ, in which case the filter
+  is reported as not applied rather than silently listing nothing).
+
+Candidates above the cutoff that fail the exec-ratio or focus guard are listed
+under **withheld** with the reason, so no base-only title is lost from the
+summary because of a knob.  The engine's infrastructure titles (`no output`,
+`lost connection`, `SYZ*`) are never candidates.  `-ignore_titles` is *not*
+applied here on purpose: a KCSAN title kept out of reproduction is still the
+most direct fix-verification signal for a race fix.  `summary.json` carries the
+same data under `fixed_by_patch` (`rows`, `withheld`, `focus_applied`) and the
+two counts under `exec_totals`.
+
+**Limits.** Races are probabilistic: a title can be absent from the patched
+kernel by chance, and "0 of N" over a few thousand executions says little, so
+read the row against the exec totals and the base count, and prefer a long run
+on a window-widening kernel.  The two pools execute the same programs but not
+in lock-step, and the base report kept is only the last one for the title.  A
+listed row is *evidence* for a reply such as a Tested-by on the fix, with the
+counts and exec totals quoted; it is not proof that the series fixes the bug,
+and it says nothing about whether the fix is the right one.
 
 ## The kernel pair
 
