@@ -245,7 +245,9 @@ syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len
 # address blocks are the end's own: $client 10.0.2.(idx+1) fixed, 10.0.4.(idx-15)
 # auto, 10.0.0.1 initial; $server 10.0.3.(idx+1), 10.0.5.(idx-15), 10.0.0.2. $client
 # fixed and initial ids are offset by 32 (that table shares the executor's netns,
-# and so its id space, with the loopback table). $client/$server ops build the peer
+# and so its id space, with the loopback table: it is the same kernel table, so a
+# bare flush also removes $client endpoints, and the auto-after-fixed id ordering
+# applies across bare and $client). $client/$server ops build the peer
 # netns and veth themselves when no two-netns pair did yet, so endpoints can exist
 # before any pair, as on a real host. That first build (a netns, a veth pair, its
 # addresses) takes ~150 ms on a KASAN kernel, more with several procs building at
