@@ -3446,7 +3446,8 @@ static long syz_genetlink_get_family_id(volatile long name, volatile long sock_a
     __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags ||                          \
     __NR_syz_mptcp_pm_flush_endpoints || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove ||     \
     __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints || \
-    __NR_syz_mptcp_pm_get_limits
+    __NR_syz_mptcp_pm_get_limits || __NR_syz_mptcp_subflow_stall || __NR_syz_mptcp_subflow_fail ||      \
+    __NR_syz_mptcp_set_sysctl || __NR_syz_mptcp_netns_cycle
 #include "common_linux_mptcp.h"
 #endif
 
@@ -4217,9 +4218,10 @@ static void reset_ebtables()
 	close(fd);
 }
 
-// Netns sysctls that pseudo-syscalls change for the duration of a call: the MPTCP
-// pseudo-syscalls switch the path manager and the checksum and timestamps settings
-// while they create a connection, and restore them afterwards. Resetting them here
+// Netns sysctls that pseudo-syscalls change: the MPTCP pseudo-syscalls switch the
+// path manager and the checksum and timestamps settings while they create a
+// connection, and restore them afterwards, and syz_mptcp_set_sysctl leaves the
+// other MPTCP knobs it writes set for the rest of the program. Resetting them here
 // covers a program killed in the middle of such a call. Missing files (e.g. no
 // MPTCP) are skipped.
 static const char* net_sysctls[] = {
@@ -4228,6 +4230,14 @@ static const char* net_sysctls[] = {
     "/proc/sys/net/mptcp/checksum_enabled",
     "/proc/sys/net/mptcp/allow_join_initial_addr_port",
     "/proc/sys/net/ipv4/tcp_timestamps",
+    // Written by syz_mptcp_set_sysctl and left for the program to run with.
+    "/proc/sys/net/mptcp/scheduler",
+    "/proc/sys/net/mptcp/add_addr_timeout",
+    "/proc/sys/net/mptcp/close_timeout",
+    "/proc/sys/net/mptcp/stale_loss_cnt",
+    "/proc/sys/net/mptcp/blackhole_timeout",
+    "/proc/sys/net/mptcp/syn_retrans_before_tcp_fallback",
+    "/proc/sys/net/mptcp/add_addr_v6_port_drop_ts",
 };
 static char net_sysctl_values[sizeof(net_sysctls) / sizeof(net_sysctls[0])][32];
 

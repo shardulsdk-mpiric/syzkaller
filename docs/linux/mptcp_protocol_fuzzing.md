@@ -49,6 +49,10 @@ All produce/consume real syzkaller resources (`mptcp_pair`, `mptcp_subflow`,
 | `syz_mptcp_close_server(pair)` | SO_LINGER-close the accepted server msk |
 | `syz_mptcp_disconnect(pair)` | `connect(AF_UNSPEC)` disconnect of the accepted msk |
 | `syz_mptcp_drive_traffic(pair, data, len)` | push data client→server; on an RWND_CLAMP pair it leaves data on the send head to exercise the softirq deferred-push path |
+| `syz_mptcp_subflow_stall(subflow, target, mode, dirs, delay_ms, hold_ms, data, len)` | for up to 1s, delay (by up to 100ms), hold or drop the packets of one subflow (the joined one or the pair's initial one) while data is pushed both ways, then release them; the other subflows idle between pushes (the reinjection trigger). NFQUEUE, scoped to that subflow's 4-tuple |
+| `syz_mptcp_subflow_fail(client_kernel, which)` | a client end on the in-kernel PM loses one subflow to a path timeout (1s keepalive on the msk while that subflow's packets are dropped, ~2s); with a subflow-retries limit the PM re-creates it |
+| `syz_mptcp_set_sysctl(knob, val)` | write one `net.mptcp` sysctl with a valid value (scheduler/path_manager from the kernel's available lists, numbers in range); never `enabled` or `pm_type`; restored by the per-program netns reset |
+| `syz_mptcp_netns_cycle(nconns, flags)` | create a netns, connect MPTCP pairs in it (optionally with in-kernel PM endpoints), close everything so the netns is destroyed while the connections are still closing |
 
 In-kernel path manager (netns-wide, like `ip mptcp endpoint` / `ip mptcp limits`; the
 per-program netns reset flushes endpoints and restores the limits):
@@ -86,8 +90,10 @@ Build the target kernel with (see `dashboard/config/linux/` for base configs):
 - `CONFIG_MPTCP=y`, `CONFIG_MPTCP_IPV6=y`
 - `CONFIG_KASAN=y`, `CONFIG_KCOV=y`, `CONFIG_KCOV_ENABLE_COMPARISONS=y`
 - `CONFIG_NF_TABLES=y`, `CONFIG_NFT_QUEUE=y`, `CONFIG_NETFILTER_NETLINK_QUEUE=y`
-  **built-in** — the mutation layer installs its NFQUEUE rule via raw netlink; these must
-  not be modules.
+  **built-in** — the mutation layer (and `subflow_stall`/`subflow_fail`) installs its
+  NFQUEUE rule via raw netlink; these must not be modules. Without `CONFIG_NFT_QUEUE`
+  the rule falls back to the xtables NFQUEUE target, which needs `CONFIG_NFT_COMPAT=y`
+  and `CONFIG_NETFILTER_XT_TARGET_NFQUEUE=y`.
 - `# CONFIG_DEBUG_KMEMLEAK is not set` — kmemleak makes syz-manager skip repro generation
   for non-leak crashes, so leave it off on a bug-finding kernel (run leak-hunting as a
   separate profile).
