@@ -19,3 +19,9 @@
   picked series' risk is a data race, it needs a KCSAN build of its own; one
   KASAN build does not cover it. Record which picked series the chosen build
   cannot see.
+- **Harness-required kernel options**: check the protocol harness's requirements
+  against the built `.config`, not just the sanitizer and protocol options. The
+  MPTCP wire-mutation layer needs `CONFIG_NFT_QUEUE` (or the xtables fallback
+  with `NFT_COMPAT` + `NETFILTER_XT_TARGET_NFQUEUE`); without it every
+  mutation op is a silent no-op. Verify with a smoke program that a mutation
+  actually changes a counter (e.g. a JOIN HMAC failure MIB) before a long run.
