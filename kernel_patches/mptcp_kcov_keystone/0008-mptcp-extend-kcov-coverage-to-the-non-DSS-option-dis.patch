@@ -1,0 +1,101 @@
+From c6bfeeb7f3410014851e9460493c8ddb112c92b7 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Fri, 30 Oct 2026 10:50:15 +0530
+Subject: [PATCH 8/8] mptcp: extend kcov coverage to the non-DSS option
+ dispatch
+
+In mptcp_incoming_options() only the option parser was bracketed; the
+dispatch that follows it for non-DSS options -- FASTCLOSE, ADD_ADDR with
+its HMAC check, RM_ADDR, MP_PRIO, MP_FAIL and MP_RST handling -- ran
+outside any section in the receive softirq. The PM handlers it calls
+(mptcp_pm_add_addr_received(), mptcp_pm_add_addr_echoed(),
+mptcp_pm_rm_addr_received(), mptcp_pm_mp_prio_received(),
+mptcp_pm_mp_fail_received()) were therefore visible only when the
+segment happened to be drained from the socket backlog in task context,
+and a coverage-guided fuzzer read 0 PCs for RM_ADDR and MP_PRIO
+handling even though those options are sent and acted on.
+
+Open a section over the dispatch block, keyed on the same msk as the
+parser section. It is a section of its own rather than an extension of
+the parser one so that the common DSS-only packet pays nothing extra:
+the block is only entered for a non-DSS suboption set. It closes before
+the DSS/ACK processing below, which reaches the deferred-push section
+through ack_update_msk() -> __mptcp_check_push(); the two never overlap.
+There is no early exit inside the block, so a single start/stop pair is
+balanced.
+
+The inner add_addr_hmac_valid() bracket is dropped: it sits inside the
+new section and would nest (kcov warns "started twice"); the wider
+section records the same site, under the same key.
+
+Nesting check: the block reaches PM bookkeeping, mptcp_pm_schedule_work()
+and netlink events (mptcp_event*()), tcp_send_ack() on MP_FAIL (transmit
+hands the segment to netif_rx(), deferred) and the FASTCLOSE work
+scheduling; none opens a section. The fallback early-return path at the
+top of the function, which calls __mptcp_check_push() directly, is
+outside the new section. The same code running in task context from the
+backlog drain stays on per-task kcov through the in_serving_softirq()
+guard.
+
+Instrumentation-only, no functional change; no-op under CONFIG_KCOV=n.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PnC9KL4QuZ7vdAomuT6sTC
+---
+ net/mptcp/options.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 103a71e646b6..ab51bb1a7ee1 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -1182,12 +1182,10 @@ static bool add_addr_hmac_valid(struct mptcp_sock *msk,
+ 				struct mptcp_options_received *mp_opt)
+ {
+ 	u64 hmac = 0;
+-	bool valid;
+ 
+ 	if (mp_opt->echo)
+ 		return true;
+ 
+-	mptcp_kcov_remote_start(msk);
+ 	hmac = add_addr_generate_hmac(READ_ONCE(msk->remote_key),
+ 				      READ_ONCE(msk->local_key),
+ 				      &mp_opt->addr);
+@@ -1195,9 +1193,7 @@ static bool add_addr_hmac_valid(struct mptcp_sock *msk,
+ 	pr_debug("msk=%p, ahmac=%llu, mp_opt->ahmac=%llu\n",
+ 		 msk, hmac, mp_opt->ahmac);
+ 
+-	valid = hmac == mp_opt->ahmac;
+-	mptcp_kcov_remote_stop(msk);
+-	return valid;
++	return hmac == mp_opt->ahmac;
+ }
+ 
+ static bool mptcp_over_limit(struct sock *sk, struct sock *ssk,
+@@ -1267,6 +1263,14 @@ bool mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 		return sk->sk_state != TCP_CLOSE;
+ 
+ 	if (unlikely(mp_opt.suboptions != OPTION_MPTCP_DSS)) {
++		/* The non-DSS option dispatch (FASTCLOSE, ADD_ADDR and its
++		 * HMAC check, RM_ADDR, MP_PRIO, MP_FAIL, MP_RST) runs here in
++		 * the receive softirq; attribute it like the parser above.  A
++		 * section of its own, closed before the DSS/ACK processing
++		 * below, which reaches the deferred-push section through
++		 * ack_update_msk().  No early exit inside the block.
++		 */
++		mptcp_kcov_remote_start(msk);
+ 		if ((mp_opt.suboptions & OPTION_MPTCP_FASTCLOSE) &&
+ 		    READ_ONCE(msk->local_key) == mp_opt.fc_recv_key) {
+ 			WRITE_ONCE(msk->rcv_fastclose, true);
+@@ -1307,6 +1311,7 @@ bool mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 			subflow->reset_transient = mp_opt.reset_transient;
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_MPRSTRX);
+ 		}
++		mptcp_kcov_remote_stop(msk);
+ 
+ 		if (!(mp_opt.suboptions & OPTION_MPTCP_DSS))
+ 			return true;
+-- 
+2.34.1
+

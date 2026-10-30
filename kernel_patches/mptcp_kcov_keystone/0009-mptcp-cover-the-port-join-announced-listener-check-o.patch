@@ -1,0 +1,68 @@
+From 5f5211a7c0387c987d0849e7e4393033dcd4eb63 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Fri, 30 Oct 2026 11:01:04 +0530
+Subject: [PATCH 9/9] mptcp: cover the port-join announced-listener check on
+ the SYN path
+
+In subflow_check_req() the MP_JOIN SYN path had two sections: the token
+lookup (keyed on the listener's msk, the target being unknown yet) and
+the SYN-ACK thmac (keyed on the target). The announced-listener check
+between them, subflow_use_different_sport() ->
+mptcp_pm_announced_has_ssk(), which decides whether a join arriving on a
+port the PM announced is admitted, ran outside both. It executes for
+every port-join SYN (MPJoinPortSynRx counts it) and a coverage-guided
+fuzzer read 0 PCs for it.
+
+Start the target-keyed section right after the lookup instead of right
+before the thmac, so the one section covers the port check and the thmac.
+The check has a reject exit inside the section; it gets a matching stop.
+The syncookie block that follows stays outside, as before.
+
+Nesting check: the lookup section is closed before the new one opens;
+mptcp_pm_announced_has_ssk() takes the PM spinlock and walks the
+announce list, and subflow_req_create_thmac() computes the HMAC; neither
+opens a section. The ACK-path twin of this check in
+subflow_syn_recv_sock() is covered by that function's section.
+
+Instrumentation-only, no functional change; no-op under CONFIG_KCOV=n.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PnC9KL4QuZ7vdAomuT6sTC
+---
+ net/mptcp/subflow.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 200bebcc6a52..57fbfdf114c1 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -268,6 +268,12 @@ static int subflow_check_req(struct request_sock *req,
+ 			return -EPERM;
+ 		}
+ 
++		/* The join target is known from here on: one section keyed on
++		 * it over the port-join announced-listener check and the SYN-ACK
++		 * thmac.  Closed on the check's reject exit and after the thmac;
++		 * the syncookie block below keeps its own exits outside.
++		 */
++		mptcp_kcov_remote_start(subflow_req->msk);
+ 		if (subflow_use_different_sport(subflow_req->msk, sk_listener)) {
+ 			pr_debug("syn inet_sport=%d %d\n",
+ 				 ntohs(inet_sk(sk_listener)->inet_sport),
+@@ -275,12 +281,12 @@ static int subflow_check_req(struct request_sock *req,
+ 			if (!mptcp_pm_announced_has_ssk(subflow_req->msk, sk_listener)) {
+ 				SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_MISMATCHPORTSYNRX);
+ 				subflow_add_reset_reason(skb, MPTCP_RST_EPROHIBIT);
++				mptcp_kcov_remote_stop(subflow_req->msk);
+ 				return -EPERM;
+ 			}
+ 			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINPORTSYNRX);
+ 		}
+ 
+-		mptcp_kcov_remote_start(subflow_req->msk);
+ 		subflow_req_create_thmac(subflow_req);
+ 		mptcp_kcov_remote_stop(subflow_req->msk);
+ 
+-- 
+2.34.1
+

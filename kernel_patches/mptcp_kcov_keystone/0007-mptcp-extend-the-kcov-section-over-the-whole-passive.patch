@@ -1,0 +1,146 @@
+From 8993335a5d58d724e0cde9be228ccdc485dea531 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Fri, 30 Oct 2026 09:56:36 +0530
+Subject: [PATCH 7/8] mptcp: extend the kcov section over the whole passive
+ accept path
+
+subflow_syn_recv_sock() is the receive-softirq entry for every passive
+MPTCP child: the MP_CAPABLE accept (option extraction, the child msk
+clone, PM notification) and the MP_JOIN accept (HMAC check, PM admission
+through mptcp_finish_join() -> mptcp_pm_allow_new_subflow(), grafting
+onto the msk), plus the fallback and reset paths. Only the
+subflow_hmac_valid() call inside it was bracketed, so a coverage-guided
+fuzzer saw 2 of its 83 PCs and none of mptcp_pm_allow_new_subflow(),
+whose only caller past the active-subflow early return is this path,
+although every accepted join runs through both.
+
+Open one section over the function body, keyed on the listener's msk. At
+entry the child msk does not exist yet for MP_CAPABLE (it is cloned
+inside and inherits the listener's handle through sock_copy()), and the
+join target is only resolved on the MP_JOIN branch, so the listener is
+the one key valid for the whole path -- the same key subflow_check_req()
+uses for the token lookup. The section is balanced at a single out label
+that the three exits (success, dispose_child, fallback) now share.
+
+The inner subflow_hmac_valid() bracket keyed on the join target is
+dropped: it would nest in the new section (kcov warns "started twice"),
+and the wider section records the same site. For a join accepted into a
+passive msk the two keys carry the same handle anyway, the target being
+an accepted child of a listener created by the same task.
+
+Nesting check: the body reaches tcp_v4/v6_syn_recv_sock() (ULP clone, no
+section), mptcp_sk_clone_init() (no section now that the handle capture
+lives in mptcp_init_sock()), the PM hooks (netlink events and work
+scheduling only), mptcp_finish_join() (subflow delegation only schedules
+the NAPI poll), and tcp_done()/send_reset() on the reject path; none of
+them opens a section. The option-parser section in
+mptcp_incoming_options() runs on the child after this function returns.
+The syncookie variant, reached from the listener's backlog drain in
+process context, stays on per-task kcov through the in_serving_softirq()
+guard, as before.
+
+Instrumentation-only, no functional change; no-op under CONFIG_KCOV=n.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PnC9KL4QuZ7vdAomuT6sTC
+---
+ net/mptcp/protocol.h | 12 ++++++------
+ net/mptcp/subflow.c  | 24 +++++++++++++++++-------
+ 2 files changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 6fd2d3f4a843..98f3571c0bd2 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -425,12 +425,12 @@ static inline void msk_owned_by_me(const struct mptcp_sock *msk)
+ 	sock_owned_by_me((const struct sock *)msk);
+ }
+ 
+-/* Bracket an MP_JOIN/ADD_ADDR cryptographic validation call that runs in
+- * the receive softirq so the coverage it executes is attributed to the
+- * task that created the socket, via msk->kcov_handle (captured in
+- * mptcp_init_sock()).  Use as a balanced start/stop pair around a single
+- * validator call; see net/mac80211/rx.c for the equivalent skb-carried
+- * pattern.
++/* Bracket MPTCP work that runs in the receive softirq (an MP_JOIN/ADD_ADDR
++ * validator, the passive accept path, a NAPI-delegated action) so the
++ * coverage it executes is attributed to the task that created the socket,
++ * via msk->kcov_handle (captured in mptcp_init_sock()).  Use as a balanced,
++ * non-nested start/stop pair; see net/mac80211/rx.c for the equivalent
++ * skb-carried pattern.
+  *
+  * Restricted to softirq on purpose: the same validators also run in
+  * process context while the socket backlog is drained from a syscall,
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index d40b61636659..200bebcc6a52 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -858,16 +858,27 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 								 const struct sock *sk))
+ {
+ 	struct mptcp_subflow_context *listener = mptcp_subflow_ctx(sk);
++	struct mptcp_sock *lmsk = mptcp_sk(listener->conn);
+ 	struct mptcp_subflow_request_sock *subflow_req;
+ 	struct mptcp_options_received mp_opt;
+ 	bool fallback, fallback_is_fatal;
+-	bool hmac_ok;
+ 	enum sk_rst_reason reason;
+ 	struct mptcp_sock *owner;
+ 	struct sock *child;
+ 
+ 	pr_debug("listener=%p, req=%p, conn=%p\n", listener, req, listener->conn);
+ 
++	/* The whole passive accept path runs here in the receive softirq:
++	 * option extraction, the child msk clone, the MP_JOIN HMAC and PM
++	 * admission checks, grafting and the reset paths.  Attribute it to
++	 * the task that created the listener's msk: the child msk does not
++	 * exist yet for MP_CAPABLE and the join target is only known on the
++	 * MP_JOIN branch, so the listener is the one key valid throughout
++	 * (as for the token lookup in subflow_check_req()).  Balanced at the
++	 * out label shared by every exit.
++	 */
++	mptcp_kcov_remote_start(lmsk);
++
+ 	/* After child creation we must look for MPC even when options
+ 	 * are not parsed
+ 	 */
+@@ -960,10 +971,7 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 				goto dispose_child;
+ 			}
+ 
+-			mptcp_kcov_remote_start(owner);
+-			hmac_ok = subflow_hmac_valid(subflow_req, &mp_opt);
+-			mptcp_kcov_remote_stop(owner);
+-			if (!hmac_ok) {
++			if (!subflow_hmac_valid(subflow_req, &mp_opt)) {
+ 				SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKMAC);
+ 				subflow_add_reset_reason(skb, MPTCP_RST_EMPTCP);
+ 				goto dispose_child;
+@@ -1009,7 +1017,7 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 	WARN_ON_ONCE(child && *own_req && tcp_sk(child)->is_mptcp &&
+ 		     (!mptcp_subflow_ctx(child) ||
+ 		      !mptcp_subflow_ctx(child)->conn));
+-	return child;
++	goto out;
+ 
+ dispose_child:
+ 	mptcp_subflow_drop_ctx(child);
+@@ -1020,12 +1028,14 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 	req->rsk_ops->send_reset(sk, skb, reason);
+ 
+ 	/* The last child reference will be released by the caller */
+-	return child;
++	goto out;
+ 
+ fallback:
+ 	if (fallback)
+ 		SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_MPCAPABLEPASSIVEFALLBACK);
+ 	mptcp_subflow_drop_ctx(child);
++out:
++	mptcp_kcov_remote_stop(lmsk);
+ 	return child;
+ }
+ 
+-- 
+2.34.1
+

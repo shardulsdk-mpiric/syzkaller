@@ -1,0 +1,94 @@
+From 7af609549bce52086a1c501409b77203869eedc4 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Fri, 30 Oct 2026 09:55:13 +0530
+Subject: [PATCH 6/8] mptcp: open the delegated-action kcov section per subflow
+ in mptcp_napi_poll
+
+The deferred send push reached through the NAPI-delegated path was
+bracketed inside mptcp_subflow_process_delegated(), around the
+MPTCP_DELEGATE_SEND branch only. The rest of the delegated processing
+(the sndbuf sync, the third-ACK scheduling) and mptcp_napi_poll() itself,
+which runs in the NET_RX softirq on the delegated-action device, stayed
+outside any section: a coverage-guided fuzzer sees none of
+mptcp_napi_poll()'s PCs although every join and every deferred push goes
+through it.
+
+Move the section to the poll loop, one per dequeued subflow and keyed on
+that subflow's msk. The per-CPU delegated list mixes subflows of
+different msks, so a single section at poll entry would attribute all of
+them to the first msk's creator; and kcov forbids nesting a softirq
+section in another, so the loop-level section and the former inner one
+cannot coexist. The msk is read once, under the subflow lock, so that
+start and stop use the same key.
+
+The other caller of mptcp_subflow_process_delegated(),
+tcp_release_cb_override(), runs in process context from release_sock(),
+where the softirq-guarded helper was already a no-op and per-task kcov
+records the work; it loses nothing.
+
+Nesting check: the loop body reaches __mptcp_subflow_push_pending(),
+__mptcp_sync_sndbuf() and schedule_3rdack_retransmission(); none of them
+calls a bracketed site (the option-parser and validator sections are
+receive-path only, __mptcp_check_push() is called only from options.c,
+and the transmit path hands the segment to netif_rx(), which defers to a
+later softirq). A NAPI poll that runs while mptcp_worker()'s
+task-context section is open (release_sock() -> local_bh_enable()) is
+the softirq-interrupts-task case kcov supports explicitly.
+
+Instrumentation-only, no functional change; no-op under CONFIG_KCOV=n.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PnC9KL4QuZ7vdAomuT6sTC
+---
+ net/mptcp/protocol.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index a701892ad338..0e96b857cc89 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3999,11 +3999,9 @@ void mptcp_subflow_process_delegated(struct sock *ssk, long status)
+ 
+ 	if (status & BIT(MPTCP_DELEGATE_SEND)) {
+ 		mptcp_data_lock(sk);
+-		if (!sock_owned_by_user(sk)) {
+-			mptcp_kcov_remote_start(mptcp_sk(sk));
++		if (!sock_owned_by_user(sk))
+ 			__mptcp_subflow_push_pending(sk, ssk, true);
+-			mptcp_kcov_remote_stop(mptcp_sk(sk));
+-		} else
++		else
+ 			__set_bit(MPTCP_PUSH_PENDING, &mptcp_sk(sk)->cb_flags);
+ 		mptcp_data_unlock(sk);
+ 	}
+@@ -4861,8 +4859,19 @@ static int mptcp_napi_poll(struct napi_struct *napi, int budget)
+ 	delegated = container_of(napi, struct mptcp_delegated_action, napi);
+ 	while ((subflow = mptcp_subflow_delegated_next(delegated)) != NULL) {
+ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++		struct mptcp_sock *msk;
+ 
+ 		bh_lock_sock_nested(ssk);
++		/* Attribute this subflow's delegated actions (deferred push,
++		 * sndbuf sync, third-ACK scheduling) to the task that created
++		 * its msk.  One section per subflow: the per-CPU list mixes
++		 * subflows of different msks, and a softirq section must not
++		 * nest in another, so the section lives here rather than in
++		 * mptcp_subflow_process_delegated().  The key is read once so
++		 * that start and stop agree.
++		 */
++		msk = mptcp_sk(subflow->conn);
++		mptcp_kcov_remote_start(msk);
+ 		if (!sock_owned_by_user(ssk)) {
+ 			mptcp_subflow_process_delegated(ssk, xchg(&subflow->delegated_status, 0));
+ 		} else {
+@@ -4874,6 +4883,7 @@ static int mptcp_napi_poll(struct napi_struct *napi, int budget)
+ 			smp_wmb();
+ 			clear_bit(MPTCP_DELEGATE_SCHEDULED, &subflow->delegated_status);
+ 		}
++		mptcp_kcov_remote_stop(msk);
+ 		bh_unlock_sock(ssk);
+ 		sock_put(ssk);
+ 
+-- 
+2.34.1
+
