@@ -301,3 +301,57 @@ differential configs that enable whatever carrier is chosen.
     - The server-side `mptcp_pm_allow_new_subflow` (the userspace cap) runs in
       softirq and is not kcov-visible on this kernel. That's a keystone-scope
       question, not reach.
+- 2026-10-30, coverage-gap measurement (build A, c1a242f4e bundle, seeded fuzz
+  run, line-level over pm.c / pm_kernel.c / pm_netlink.c / pm_userspace.c). The
+  list and method are in `open/run/pm_selection_test/gap/GAPS.md`, outside the
+  repo. Split with syzkaller-ef's reach work (`mptcp_reach_scenarios/`): network
+  events (retry, stale, ADD_ADDR retransmit, netns lifecycle) and the two-netns
+  pair are theirs; new op variants (step 3, endpoint on the pair's own address,
+  id 0, kernel-assigned ids, GET/DUMP, IPv6) are this task's. Flag bits: 16/32
+  here, 64 two-netns, 128 reserved for this task, 256 scenario ops.
+  - **Received-option handlers are kcov-dark.** The keystone bracket in
+    `mptcp_incoming_options` covers only `mptcp_get_options()`. The handlers
+    after it (`mptcp_pm_add_addr_received`, `_rm_addr_received`,
+    `_mp_prio_received`, `_mp_fail_received`) give coverage only when the skb
+    goes through the socket backlog. Measured on step 3's kernel-peer test:
+    MPTcpExt `RmAddr` 3 and `AddAddr` 2, while kcov shows both handlers at 0.
+    Handed to syzkaller-ef's keystone branch; brf-a1 judges the bracket.
+- 2026-10-30, step-3 implementation (branch `mptcp-pm-step3`, Shardul's standing
+  approval for coverage-quality work):
+  - **Server handle:** `pair_init` gains a sixth argument, `server
+    ptr[out, mptcp_server_userspace]` (const 0 for a kernel-PM server). The
+    compiler only propagates "used as input" from a child resource to its
+    parent, so a shared `mptcp_msk_userspace` parent consumed by the ops would
+    leave the per-end children rejected. Each op therefore has per-end
+    variants with a `const` selector, the same pattern as `pm`.
+  - **Ops:** `syz_mptcp_pm_announce$client/$server/$server_port` →
+    `mptcp_pm_announced`; `syz_mptcp_pm_remove$announced/$subflow/$id0_client/
+    $id0_server`; `syz_mptcp_pm_set_flags$client/$server/$subflow`. Addresses:
+    server announces 127.0.2.(idx+1), client 127.0.3.(idx+1), id 240+idx.
+    `$server_port` opens an MPTCP listener on the announced address and a
+    per-announcement port, as a daemon does, which is what makes a peer's port
+    join reach `mptcp_pm_announced_has_ssk`.
+  - **Tokens** are read from the end's socket on every call (disconnect gives
+    an msk a new one). Announcements live in a per-program pool, with stale
+    ones (pair closed or reused) reclaimed by the next announce.
+  - **Compatibility:** five-argument programs from steps 1-2 parse non-strict
+    with the server handle defaulted, and their join keeps its link
+    (`TestMPTCPLegacyPairInitStillLinks` now covers three- and five-argument
+    forms).
+  - **Verification:**
+    - prog / vminfo tests pass; runtest parsing passes except the known
+      linux/loong64 gap. Each new op builds as a standalone C reproducer with
+      `-Werror`, plain and threaded with net_reset.
+    - run-tests on audit2 build A: 110 OK, 1 skip, 2 fails (the known
+      threaded `join_close_race` flake). `mptcp_pm_userspace` and
+      `mptcp_pm_userspace_kernel_peer` pass in every mode.
+    - Coverage probe on build A: `mptcp_pm_nl_announce_doit`,
+      `mptcp_pm_nl_remove_doit` (announced, subflow and id-0 paths),
+      `mptcp_userspace_pm_set_flags`, `mptcp_pm_mp_prio_send_ack`, and on the
+      kernel-peer test `mptcp_pm_userspace_get_local_id` (the server looking up
+      the address a kernel-PM client joined to) and the client's
+      `mptcp_pm_nl_add_addr_received`.
+    - MIB on the kernel-peer test: AddAddr 2, EchoAdd 2, MPJoinSynRx 2,
+      MPJoinPortSynRx 1 (the announced-listener check ran and passed), RmAddr 3.
+  - **Open:** `mptcp_pm_announced_has_ssk` runs (MIB) but sits in the SYN path,
+    so kcov can't see it; that's the keystone question again.
