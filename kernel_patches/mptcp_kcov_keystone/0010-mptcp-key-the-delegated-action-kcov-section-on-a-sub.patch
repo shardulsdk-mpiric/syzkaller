@@ -1,0 +1,210 @@
+From e872a6c914328f4ddfe6259829ab694ecc794c67 Mon Sep 17 00:00:00 2001
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Date: Fri, 30 Oct 2026 13:48:27 +0530
+Subject: [PATCH 10/10] mptcp: key the delegated-action kcov section on a
+ subflow-held handle
+
+The per-subflow section that "mptcp: open the delegated-action kcov
+section per subflow in mptcp_napi_poll" opens at the top of the poll
+loop reads mptcp_sk(subflow->conn)->kcov_handle. A delegated subflow
+context can stay queued after the subflow has dropped its reference on
+the msk: that is the lifetime the pending delegated-list fixes rely on
+(the context is kept alive until mptcp_napi_poll() dequeues it, then
+freed there). With such a fix applied, the annotation reads a possibly
+freed msk in mptcp_napi_poll(), an instrumentation-introduced fault that
+a differential run would book against the fix.
+
+Copy the msk's handle into the subflow context when the context is
+attached to its msk, i.e. wherever subflow->conn is set, while the msk
+is certainly alive:
+
+ - mptcp_subflow_create_socket(): active subflows (the first one and
+   PM-created joins), before tcp_connect and with the msk referenced;
+ - subflow_syn_recv_sock(), MP_CAPABLE: the passive child, right after
+   mptcp_sk_clone_init() returns the new msk, which inherited the
+   listener's handle through sk_clone_lock();
+ - subflow_syn_recv_sock(), MP_JOIN: right after the subflow takes over
+   the request's msk reference.
+
+The context of a passive child is created by subflow_ulp_clone() zeroed
+and gets its conn, and now its handle, only at those two points, before
+the child is hashed or exposed. All delegation sites act on a subflow
+whose conn is set, so the copy always precedes any queuing. The field
+lives outside the reset group, so mptcp_subflow_ctx_reset() on
+disconnect does not clear it, and the msk's handle never changes after
+mptcp_init_sock().
+
+mptcp_napi_poll() now reads the subflow-held handle once into a local
+and brackets the loop body with it, performing no msk dereference for
+the annotation. Two small helpers sit next to the existing ones: a
+softirq-only start/stop pair keyed on a handle value, and the attach and
+read accessors for the subflow copy. All are no-ops without CONFIG_KCOV,
+and the field is absent.
+
+Instrumentation-only, no functional change; no-op under CONFIG_KCOV=n.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PnC9KL4QuZ7vdAomuT6sTC
+---
+ net/mptcp/protocol.c | 14 ++++++-----
+ net/mptcp/protocol.h | 55 ++++++++++++++++++++++++++++++++++++++++++++
+ net/mptcp/subflow.c  |  4 ++++
+ 3 files changed, 67 insertions(+), 6 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 0e96b857cc89..3790c3f7ac2b 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -4859,7 +4859,7 @@ static int mptcp_napi_poll(struct napi_struct *napi, int budget)
+ 	delegated = container_of(napi, struct mptcp_delegated_action, napi);
+ 	while ((subflow = mptcp_subflow_delegated_next(delegated)) != NULL) {
+ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+-		struct mptcp_sock *msk;
++		struct kcov_common_handle_id kcov_handle;
+ 
+ 		bh_lock_sock_nested(ssk);
+ 		/* Attribute this subflow's delegated actions (deferred push,
+@@ -4867,11 +4867,13 @@ static int mptcp_napi_poll(struct napi_struct *napi, int budget)
+ 		 * its msk.  One section per subflow: the per-CPU list mixes
+ 		 * subflows of different msks, and a softirq section must not
+ 		 * nest in another, so the section lives here rather than in
+-		 * mptcp_subflow_process_delegated().  The key is read once so
+-		 * that start and stop agree.
++		 * mptcp_subflow_process_delegated().  Keyed on the subflow's
++		 * own copy of the handle: a queued ctx can outlive its msk
++		 * reference, so the msk must not be dereferenced here.  The
++		 * key is read once so that start and stop agree.
+ 		 */
+-		msk = mptcp_sk(subflow->conn);
+-		mptcp_kcov_remote_start(msk);
++		kcov_handle = mptcp_subflow_kcov_handle(subflow);
++		mptcp_kcov_remote_start_handle(kcov_handle);
+ 		if (!sock_owned_by_user(ssk)) {
+ 			mptcp_subflow_process_delegated(ssk, xchg(&subflow->delegated_status, 0));
+ 		} else {
+@@ -4883,7 +4885,7 @@ static int mptcp_napi_poll(struct napi_struct *napi, int budget)
+ 			smp_wmb();
+ 			clear_bit(MPTCP_DELEGATE_SCHEDULED, &subflow->delegated_status);
+ 		}
+-		mptcp_kcov_remote_stop(msk);
++		mptcp_kcov_remote_stop_handle(kcov_handle);
+ 		bh_unlock_sock(ssk);
+ 		sock_put(ssk);
+ 
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 98f3571c0bd2..cefc01696674 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -468,11 +468,31 @@ static inline void mptcp_kcov_remote_stop_task(const struct mptcp_sock *msk)
+ 	if (msk)
+ 		kcov_remote_stop();
+ }
++
++/* Softirq variant keyed on a handle the caller already holds, for paths
++ * where the msk may no longer be dereferenced: mptcp_napi_poll() runs on
++ * subflow contexts that can outlive their msk reference, so it keys the
++ * section on the subflow's own copy of the handle, see
++ * mptcp_subflow_kcov_attach().  Same softirq-only rule as above.
++ */
++static inline void mptcp_kcov_remote_start_handle(struct kcov_common_handle_id handle)
++{
++	if (in_serving_softirq())
++		kcov_remote_start_common(handle);
++}
++
++static inline void mptcp_kcov_remote_stop_handle(struct kcov_common_handle_id handle)
++{
++	if (in_serving_softirq())
++		kcov_remote_stop();
++}
+ #else
+ static inline void mptcp_kcov_remote_start(const struct mptcp_sock *msk) { }
+ static inline void mptcp_kcov_remote_stop(const struct mptcp_sock *msk) { }
+ static inline void mptcp_kcov_remote_start_task(const struct mptcp_sock *msk) { }
+ static inline void mptcp_kcov_remote_stop_task(const struct mptcp_sock *msk) { }
++static inline void mptcp_kcov_remote_start_handle(struct kcov_common_handle_id handle) { }
++static inline void mptcp_kcov_remote_stop_handle(struct kcov_common_handle_id handle) { }
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_NET
+@@ -709,6 +729,12 @@ struct mptcp_subflow_context {
+ 
+ 	struct	sock *tcp_sock;	    /* tcp sk backpointer */
+ 	struct	sock *conn;	    /* parent mptcp_sock */
++#ifdef CONFIG_KCOV
++	/* copy of the parent msk's kcov_handle, set when the ctx is attached
++	 * to its msk; outside the reset group so it lives as long as the ctx
++	 */
++	struct kcov_common_handle_id kcov_handle;
++#endif
+ 	const	struct inet_connection_sock_af_ops *icsk_af_ops;
+ 	void	(*tcp_state_change)(struct sock *sk);
+ 	void	(*tcp_error_report)(struct sock *sk);
+@@ -731,6 +757,35 @@ mptcp_subflow_tcp_sock(const struct mptcp_subflow_context *subflow)
+ 	return subflow->tcp_sock;
+ }
+ 
++/* Copy the msk's kcov remote handle into the subflow context.  Call it
++ * wherever subflow->conn is set, while the msk is known to be alive, so that
++ * per-subflow softirq work running after the msk reference is gone (the
++ * delegated actions in mptcp_napi_poll()) can be attributed without
++ * touching the msk.
++ */
++#ifdef CONFIG_KCOV
++static inline void mptcp_subflow_kcov_attach(struct mptcp_subflow_context *subflow,
++					     const struct mptcp_sock *msk)
++{
++	subflow->kcov_handle = msk->kcov_handle;
++}
++
++static inline struct kcov_common_handle_id
++mptcp_subflow_kcov_handle(const struct mptcp_subflow_context *subflow)
++{
++	return subflow->kcov_handle;
++}
++#else
++static inline void mptcp_subflow_kcov_attach(struct mptcp_subflow_context *subflow,
++					     const struct mptcp_sock *msk) { }
++
++static inline struct kcov_common_handle_id
++mptcp_subflow_kcov_handle(const struct mptcp_subflow_context *subflow)
++{
++	return (struct kcov_common_handle_id){};
++}
++#endif
++
+ static inline void
+ mptcp_subflow_ctx_reset(struct mptcp_subflow_context *subflow)
+ {
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 57fbfdf114c1..7c9f06910534 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -954,6 +954,8 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 				fallback = true;
+ 				goto fallback;
+ 			}
++			/* the clone inherited the listener msk's handle */
++			mptcp_subflow_kcov_attach(ctx, mptcp_sk(ctx->conn));
+ 
+ 			ctx->subflow_id = 1;
+ 			owner = mptcp_sk(ctx->conn);
+@@ -992,6 +994,7 @@ static struct sock *subflow_syn_recv_sock(const struct sock *sk,
+ 			/* move the msk reference ownership to the subflow */
+ 			WRITE_ONCE(subflow_req->msk, NULL);
+ 			ctx->conn = (struct sock *)owner;
++			mptcp_subflow_kcov_attach(ctx, owner);
+ 
+ 			if (subflow_use_different_sport(owner, sk)) {
+ 				pr_debug("ack inet_sport=%d %d\n",
+@@ -1902,6 +1905,7 @@ int mptcp_subflow_create_socket(struct sock *sk, unsigned short family,
+ 	*new_sock = sf;
+ 	sock_hold(sk);
+ 	subflow->conn = sk;
++	mptcp_subflow_kcov_attach(subflow, mptcp_sk(sk));
+ 	mptcp_subflow_ops_override(sf->sk);
+ 
+ 	return 0;
+-- 
+2.34.1
+
