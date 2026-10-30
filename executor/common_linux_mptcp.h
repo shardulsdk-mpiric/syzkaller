@@ -415,6 +415,10 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 // set_sysctl only needs the lock and the sysctl read/write helpers.
 #define MPTCP_NEED_NETNS_SETTINGS (MPTCP_NEED_NETNS_SAVE || __NR_syz_mptcp_set_sysctl)
 #define MPTCP_NEED_PM_SWITCH (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_disconnect)
+// The two-netns peer netns: building it (MPTCP_NEED_PEER_NETNS) and switching a
+// thread into it (MPTCP_NEED_PEER_ENTER). No call uses it yet.
+#define MPTCP_NEED_PEER_NETNS 0
+#define MPTCP_NEED_PEER_ENTER MPTCP_NEED_PEER_NETNS
 
 // remove and set_flags also act on a joined subflow, and subflow_stall reads it
 // (the subflow names the flow).
@@ -461,7 +465,7 @@ static void mptcp_spin_unlock(volatile int* lock)
 //      mptcp_can_accept_new_subflow() in net/mptcp/subflow.c) requires one. We
 //      never need to read an event, just to hold the subscription open.
 //
-// mptcp_pm_ensure_netlink() is idempotent (mptcp_pm_setup_done latches). It is
+// mptcp_pm_ensure_netlink() is idempotent (struct mptcp_pm_nl.setup_done latches). It is
 // called from syz_mptcp_pair_init() when at least one end is userspace and from
 // syz_mptcp_join_subflow(), so a C reproducer that re-enters at either
 // pseudo-syscall still works. A pair with both ends on the in-kernel PM never
@@ -493,8 +497,30 @@ struct mptcp_nlmsg {
 };
 
 #if MPTCP_NEED_GENL_SOCK
-static int mptcp_pm_genl_sock = -1; // request/reply socket: GETFAMILY, SUBFLOW_CREATE/DESTROY
+// The mptcp_pm genl plumbing of one network namespace. A genl socket and an event
+// subscription act in the netns they were created in, and the MPTCP tokens and the
+// userspace-PM listener check (mptcp_userspace_pm_active) are netns-scoped, so each
+// netns that runs an end needs its own. The family and multicast-group ids are
+// global, so they are not. mptcp_pm_self is the executor proc's netns.
+struct mptcp_pm_nl {
+	int genl_sock; // request/reply socket: GETFAMILY, SUBFLOW_CREATE/DESTROY, PM commands
+	int event_sock; // held open + subscribed so mptcp_userspace_pm_active() is true
+	int setup_done; // latched by mptcp_pm_ensure_netlink()
+	int setup_lock; // serializes the one-time setup under -threaded
+};
+static struct mptcp_pm_nl mptcp_pm_self = {-1, -1, 0, 0};
 static uint16 mptcp_pm_family_id;
+
+// The plumbing of the netns the calling thread is in.
+static inline struct mptcp_pm_nl* mptcp_pm_cur(void)
+{
+	return &mptcp_pm_self;
+}
+
+static inline int mptcp_pm_sock(void)
+{
+	return mptcp_pm_cur()->genl_sock;
+}
 #endif
 
 // The request/reply socket above is shared across threads under the default
@@ -542,7 +568,7 @@ static void mptcp_nlmsg_attr(struct mptcp_nlmsg* m, int typ, const void* data, i
 // Only SUBFLOW_CREATE/DESTROY and the endpoint commands nest attributes
 // (GETFAMILY's request doesn't) -- see MPTCP_NEED_SUBFLOW_CALL and
 // MPTCP_NEED_PM_ENDPOINT.
-#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_netns_cycle
+#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_netns_cycle || MPTCP_NEED_PEER_NETNS
 static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_out, int typ)
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
@@ -563,7 +589,7 @@ static void mptcp_nlmsg_nest_end(struct mptcp_nlmsg* m, struct nlattr* nest)
 		return;
 	nest->nla_len = m->pos - (char*)nest;
 }
-#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || announce || set_flags || netns_cycle
+#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || announce || set_flags || netns_cycle || peer netns
 
 // Sends m and waits for one reply datagram. Returns the number of bytes
 // received (>=0) on success -- for a bare NLM_F_ACK request (our
@@ -633,14 +659,305 @@ static int mptcp_nlmsg_send(struct mptcp_nlmsg* m, int sock)
 }
 #endif // MPTCP_NEED_NLMSG
 
-// Needed by (MPTCP_NEED_PM_SETUP): pair_init and join_subflow only --
-// the two callers of mptcp_pm_ensure_netlink(). subflow_destroy reads
-// mptcp_pm_genl_sock/mptcp_pm_family_id directly (see the NLMSG block
-// above) but never calls ensure_setup, so it doesn't need these.
+// ---------- Two-netns topology: peer netns + veth pair ----------
+//
+// A two-netns pair keeps its client end in the executor proc's netns (the "self"
+// netns) and puts its server end in a second, "peer" netns, joined by a veth
+// pair, so each end has its own in-kernel PM endpoint table and net.mptcp
+// sysctls, as two hosts do. Everything is raw (rt)netlink + setns/unshare + one
+// ioctl, so a C reproducer needs no ip/ethtool binary.
+//
+// Netns rule: an existing fd is used from any thread with no setns (a socket stays
+// bound to the netns it was created in). A thread switches into the peer netns
+// only to create a socket or to write a sysctl there; setns is thread-local, so no
+// other thread moves.
+//
+// Address plan, kept in this one block: every address one end of a two-netns pair
+// uses lives here, as an alias on that end's veth, added when the topology is
+// built. One on-link /16, so no routes are needed; clear of initialize_netdevices
+// (veth0/veth1, 172.20.20.0/24).
+//
+//   client end, veth-c in this netns:  10.0.0.1 (the end's address, also its
+//     "initial" endpoint), 10.0.1.(subflow slot) join locals, 10.0.2.(1+i) fixed
+//     endpoints, 10.0.4.(1+i) kernel-id endpoints, 10.0.6.(1+i) announcements
+//   server end, veth-s in the peer netns: 10.0.0.2, 10.0.3.(1+i) fixed endpoints,
+//     10.0.5.(1+i) kernel-id endpoints, 10.0.7.(1+i) announcements
+#define MPTCP_VETH_SELF "veth-c"
+#define MPTCP_VETH_PEER "veth-s"
+#define MPTCP_PEER_SELF_ADDR 0x0a000001 // 10.0.0.1, the client end
+#define MPTCP_PEER_PEER_ADDR 0x0a000002 // 10.0.0.2, the server end
+#define MPTCP_PEER_JOIN_ADDR_BASE 0x0a000100 // 10.0.1.(subflow slot)
+#define MPTCP_PEER_SELF_EP_ADDR_BASE 0x0a000201 // 10.0.2.(1+i)
+#define MPTCP_PEER_PEER_EP_ADDR_BASE 0x0a000301 // 10.0.3.(1+i)
+#define MPTCP_PEER_SELF_AUTO_ADDR_BASE 0x0a000401 // 10.0.4.(1+i)
+#define MPTCP_PEER_PEER_AUTO_ADDR_BASE 0x0a000501 // 10.0.5.(1+i)
+#define MPTCP_PEER_SELF_ANN_ADDR_BASE 0x0a000601 // 10.0.6.(1+i)
+#define MPTCP_PEER_PEER_ANN_ADDR_BASE 0x0a000701 // 10.0.7.(1+i)
+#define MPTCP_PEER_ALIASES_PER_RANGE 8
+#define MPTCP_PEER_PREFIXLEN 16
+
+#if MPTCP_NEED_PEER_ENTER
+#include <sched.h>
+
+// Long-lived netns fds sit at or above this, clear of the fds programs use and of
+// the range close_fds() closes at program end (which can run while a call that
+// was cut off in threaded mode is still between its setns calls).
+#define MPTCP_NETNS_FD_MIN 200
+
+// The peer netns, once built: an ns/net fd that keeps it alive.
+static int mptcp_peer_netns_fd = -1;
+// The executor proc's own netns, which every thread returns to.
+static int mptcp_self_netns_fd = -1;
+
+static int mptcp_fd_high(int fd)
+{
+	if (fd < 0)
+		return -1;
+	int high = fcntl(fd, F_DUPFD, MPTCP_NETNS_FD_MIN);
+	close(fd);
+	return high;
+}
+
+// The self netns fd, opened on first use by a thread that is in the self netns
+// (every caller is, outside an enter/leave pair).
+static int mptcp_self_netns(void)
+{
+	int fd = __atomic_load_n(&mptcp_self_netns_fd, __ATOMIC_ACQUIRE);
+	if (fd >= 0)
+		return fd;
+	fd = mptcp_fd_high(open("/proc/thread-self/ns/net", O_RDONLY));
+	if (fd < 0)
+		return -1;
+	int expected = -1;
+	if (!__atomic_compare_exchange_n(&mptcp_self_netns_fd, &expected, fd, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		close(fd);
+		fd = expected;
+	}
+	return fd;
+}
+
+// Moves the calling thread into the netns of target_fd; *entered is set for
+// mptcp_netns_leave(). Thread-local: no other thread moves.
+static int mptcp_netns_enter(int target_fd, int* entered)
+{
+	*entered = -1;
+	if (mptcp_self_netns() < 0) {
+		debug("mptcp_netns_enter: open ns/net: %d\n", errno);
+		return -1;
+	}
+	if (setns(target_fd, CLONE_NEWNET) < 0) {
+		debug("mptcp_netns_enter: setns: %d\n", errno);
+		return -1;
+	}
+	*entered = 1;
+	return 0;
+}
+
+// Returns the calling thread to the self netns. The fallback, /proc/1 (the loop
+// process, pid 1 of the executor's pid namespace, which never leaves the self
+// netns), covers a program that closed the self fd. A thread that still cannot
+// return stays in the peer netns until its program ends, which costs that program
+// realism but must not take the executor down.
+static void mptcp_netns_leave(int entered)
+{
+	if (entered < 0)
+		return;
+	if (setns(mptcp_self_netns_fd, CLONE_NEWNET) == 0)
+		return;
+	int fd = open("/proc/1/ns/net", O_RDONLY);
+	if (fd >= 0 && setns(fd, CLONE_NEWNET) == 0) {
+		close(fd);
+		return;
+	}
+	if (fd >= 0)
+		close(fd);
+	debug("mptcp_netns_leave: cannot return to the executor netns: %d\n", errno);
+}
+
+#endif // MPTCP_NEED_PEER_ENTER
+
+#if MPTCP_NEED_PEER_NETNS
+#include <linux/ethtool.h>
+#include <linux/if_addr.h>
+#include <linux/if_link.h>
+#include <linux/rtnetlink.h>
+#include <linux/sockios.h>
+#include <linux/veth.h>
+#include <sys/ioctl.h>
+
+#define MPTCP_PEER_JOIN_ADDRS 64 // MPTCP_SUBFLOW_POOL_SIZE
+
+// Appends raw bytes (a nested struct, e.g. the veth peer's ifinfomsg).
+static void mptcp_nlmsg_put(struct mptcp_nlmsg* m, const void* data, int size)
+{
+	if (m->overflow)
+		return;
+	if (m->pos + NLMSG_ALIGN(size) > m->buf + sizeof(m->buf)) {
+		m->overflow = true;
+		return;
+	}
+	memcpy(m->pos, data, size);
+	m->pos += NLMSG_ALIGN(size);
+}
+
+static int mptcp_rtnl_open(void)
+{
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+	if (sock < 0) {
+		debug("mptcp_rtnl_open: %d\n", errno);
+		return -1;
+	}
+	struct timeval rtv = {2, 0};
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+	return sock;
+}
+
+// RTM_NEWLINK veth: veth-c here, its peer veth-s created straight in peer_fd.
+static int mptcp_veth_create(int rtnl, int peer_fd)
+{
+	struct mptcp_nlmsg m;
+	struct ifinfomsg ifi;
+	struct nlattr *linkinfo = NULL, *data = NULL, *peer = NULL;
+	uint32 nsfd = peer_fd;
+
+	memset(&ifi, 0, sizeof(ifi));
+	ifi.ifi_family = AF_UNSPEC;
+	mptcp_nlmsg_init(&m, RTM_NEWLINK, &ifi, sizeof(ifi));
+	((struct nlmsghdr*)m.buf)->nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
+	mptcp_nlmsg_attr(&m, IFLA_IFNAME, MPTCP_VETH_SELF, strlen(MPTCP_VETH_SELF) + 1);
+	mptcp_nlmsg_nest_begin(&m, &linkinfo, IFLA_LINKINFO);
+	mptcp_nlmsg_attr(&m, IFLA_INFO_KIND, "veth", 4);
+	mptcp_nlmsg_nest_begin(&m, &data, IFLA_INFO_DATA);
+	mptcp_nlmsg_nest_begin(&m, &peer, VETH_INFO_PEER);
+	mptcp_nlmsg_put(&m, &ifi, sizeof(ifi));
+	mptcp_nlmsg_attr(&m, IFLA_IFNAME, MPTCP_VETH_PEER, strlen(MPTCP_VETH_PEER) + 1);
+	mptcp_nlmsg_attr(&m, IFLA_NET_NS_FD, &nsfd, sizeof(nsfd));
+	mptcp_nlmsg_nest_end(&m, peer);
+	mptcp_nlmsg_nest_end(&m, data);
+	mptcp_nlmsg_nest_end(&m, linkinfo);
+	return mptcp_nlmsg_send(&m, rtnl);
+}
+
+// RTM_DELLINK veth-c (with it, its peer); a missing link is fine.
+static void mptcp_veth_delete(int rtnl)
+{
+	struct mptcp_nlmsg m;
+	struct ifinfomsg ifi;
+
+	memset(&ifi, 0, sizeof(ifi));
+	ifi.ifi_family = AF_UNSPEC;
+	mptcp_nlmsg_init(&m, RTM_DELLINK, &ifi, sizeof(ifi));
+	mptcp_nlmsg_attr(&m, IFLA_IFNAME, MPTCP_VETH_SELF, strlen(MPTCP_VETH_SELF) + 1);
+	mptcp_nlmsg_send(&m, rtnl);
+}
+
+// Sets the MTU explicitly (1500: per-MSS segments, nothing inherited) and the link up.
+static int mptcp_link_up(int rtnl, int ifindex, bool set_mtu)
+{
+	struct mptcp_nlmsg m;
+	struct ifinfomsg ifi;
+	uint32 mtu = 1500;
+
+	memset(&ifi, 0, sizeof(ifi));
+	ifi.ifi_family = AF_UNSPEC;
+	ifi.ifi_index = ifindex;
+	ifi.ifi_flags = IFF_UP;
+	ifi.ifi_change = IFF_UP;
+	mptcp_nlmsg_init(&m, RTM_NEWLINK, &ifi, sizeof(ifi));
+	if (set_mtu)
+		mptcp_nlmsg_attr(&m, IFLA_MTU, &mtu, sizeof(mtu));
+	return mptcp_nlmsg_send(&m, rtnl);
+}
+
+// RTM_NEWADDR addr/16 on ifindex. NLM_F_REPLACE makes a re-add a no-op.
+static int mptcp_addr_add(int rtnl, int ifindex, uint32 addr_h)
+{
+	struct mptcp_nlmsg m;
+	struct ifaddrmsg ifa;
+	uint32 addr_be = htonl(addr_h);
+
+	memset(&ifa, 0, sizeof(ifa));
+	ifa.ifa_family = AF_INET;
+	ifa.ifa_prefixlen = MPTCP_PEER_PREFIXLEN;
+	ifa.ifa_index = ifindex;
+	mptcp_nlmsg_init(&m, RTM_NEWADDR, &ifa, sizeof(ifa));
+	((struct nlmsghdr*)m.buf)->nlmsg_flags |= NLM_F_CREATE | NLM_F_REPLACE;
+	mptcp_nlmsg_attr(&m, IFA_LOCAL, &addr_be, sizeof(addr_be));
+	mptcp_nlmsg_attr(&m, IFA_ADDRESS, &addr_be, sizeof(addr_be));
+	int err = mptcp_nlmsg_send(&m, rtnl);
+	if (err < 0) {
+		debug("mptcp_addr_add: 0x%x on %d: %d\n", addr_h, ifindex, errno);
+	}
+	return err;
+}
+
+// Segmentation and coalescing offloads off (mandatory, not tuning): with TSO/GSO
+// the egress hook sees one GSO super-segment instead of per-MSS segments, and GRO/LRO
+// coalesce segments before the receiver parses their MPTCP options. TX checksum
+// offload off too, so the wire carries a real checksum. Legacy ethtool commands:
+// still served by every kernel, no feature-name lookup needed. LRO is fixed off on
+// veth, so its failure is expected and ignored.
+static void mptcp_veth_offloads_off(const char* ifname)
+{
+	static const uint32 cmds[] = {ETHTOOL_STSO, ETHTOOL_SGSO, ETHTOOL_SGRO, ETHTOOL_STXCSUM};
+	struct ethtool_value ev;
+	struct ifreq ifr;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	if (fd < 0)
+		return;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	ifr.ifr_data = (char*)&ev;
+	for (unsigned i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+		ev.cmd = cmds[i];
+		ev.data = 0;
+		if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+			debug("mptcp_veth_offloads_off: %s cmd 0x%x: %d\n", ifname, cmds[i], errno);
+		}
+	}
+	ev.cmd = ETHTOOL_GFLAGS;
+	ev.data = 0;
+	if (ioctl(fd, SIOCETHTOOL, &ifr) == 0 && (ev.data & ETH_FLAG_LRO)) {
+		ev.cmd = ETHTOOL_SFLAGS;
+		ev.data &= ~ETH_FLAG_LRO;
+		ioctl(fd, SIOCETHTOOL, &ifr);
+	}
+	close(fd);
+}
+
+// A run of aliases: count addresses from base (host order).
+struct mptcp_alias_range {
+	uint32 base;
+	int count;
+};
+
+// Configures one veth end in the calling thread's netns: offloads off, its base
+// address plus the alias ranges, MTU, up.
+static void mptcp_veth_configure(const char* ifname, uint32 base_addr_h, const struct mptcp_alias_range* ranges,
+				 int nranges)
+{
+	int rtnl = mptcp_rtnl_open();
+	if (rtnl < 0)
+		return;
+	int ifindex = if_nametoindex(ifname);
+	mptcp_veth_offloads_off(ifname);
+	mptcp_addr_add(rtnl, ifindex, base_addr_h);
+	for (int r = 0; r < nranges; r++) {
+		for (int i = 0; i < ranges[r].count; i++)
+			mptcp_addr_add(rtnl, ifindex, ranges[r].base + i);
+	}
+	if (mptcp_link_up(rtnl, ifindex, true) < 0) {
+		debug("mptcp_veth_configure: %s up: %d\n", ifname, errno);
+	}
+	close(rtnl);
+}
+#endif // MPTCP_NEED_PEER_NETNS
+
+// Needed by (MPTCP_NEED_PM_SETUP): the callers of mptcp_pm_ensure_netlink().
+// subflow_destroy uses the genl socket directly (see the NLMSG block above) but
+// never calls it, so it doesn't need these.
 #if MPTCP_NEED_PM_SETUP
-static int mptcp_pm_setup_done;
-static int mptcp_pm_setup_lock; // serializes the one-time netlink setup under -threaded
-static int mptcp_pm_event_sock = -1; // held open + subscribed so mptcp_userspace_pm_active() is true
 static uint32 mptcp_pm_event_grp_id; // "mptcp_pm_events" mcast group id, for per-join event sockets
 #endif // MPTCP_NEED_PM_SETUP
 
@@ -722,23 +1039,25 @@ static int mptcp_pm_resolve_family(int sock, uint16* family_id_out, uint32* even
 #endif // MPTCP_NEED_PM_FAMILY
 
 #if MPTCP_NEED_PM_SETUP
+// Idempotent one-time setup of the genl plumbing of the calling thread's netns.
 static int mptcp_pm_ensure_netlink(void)
 {
+	struct mptcp_pm_nl* nl = mptcp_pm_cur();
 	struct sockaddr_nl sa;
 	uint32 event_grp_id = 0;
 	int sock = -1, event_sock = -1;
 
 	// Fast path once setup has been published.
-	if (__atomic_load_n(&mptcp_pm_setup_done, __ATOMIC_ACQUIRE))
+	if (__atomic_load_n(&nl->setup_done, __ATOMIC_ACQUIRE))
 		return 0;
 
 	// Serialize first-time setup: exactly one thread does the family resolve
 	// and event subscription; others wait and then observe setup_done.
 	// Idempotent re-entry from either pair_init or join_subflow. The path
 	// manager itself is chosen per msk by pair_init, not here.
-	mptcp_spin_lock(&mptcp_pm_setup_lock);
-	if (mptcp_pm_setup_done) {
-		mptcp_spin_unlock(&mptcp_pm_setup_lock);
+	mptcp_spin_lock(&nl->setup_lock);
+	if (nl->setup_done) {
+		mptcp_spin_unlock(&nl->setup_lock);
 		return 0;
 	}
 
@@ -780,13 +1099,13 @@ static int mptcp_pm_ensure_netlink(void)
 		goto fail;
 	}
 
-	mptcp_pm_genl_sock = sock;
-	mptcp_pm_event_sock = event_sock;
+	nl->genl_sock = sock;
+	nl->event_sock = event_sock;
 	mptcp_pm_event_grp_id = event_grp_id;
-	__atomic_store_n(&mptcp_pm_setup_done, 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&nl->setup_done, 1, __ATOMIC_RELEASE);
 	debug("mptcp_pm_ensure_netlink: family_id=%d event_grp_id=%d\n",
 	      mptcp_pm_family_id, event_grp_id);
-	mptcp_spin_unlock(&mptcp_pm_setup_lock);
+	mptcp_spin_unlock(&nl->setup_lock);
 	return 0;
 
 fail:
@@ -794,7 +1113,7 @@ fail:
 		close(event_sock);
 	if (sock >= 0)
 		close(sock);
-	mptcp_spin_unlock(&mptcp_pm_setup_lock);
+	mptcp_spin_unlock(&nl->setup_lock);
 	return -1;
 }
 #endif // MPTCP_NEED_PM_SETUP
@@ -949,7 +1268,7 @@ static int mptcp_pm_subflow_create(uint32 token, uint8 addr_id, uint32 addr_flag
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_PORT, &remote_port_h, sizeof(remote_port_h));
 	mptcp_nlmsg_nest_end(&m, nest);
 
-	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
+	return mptcp_nlmsg_send(&m, mptcp_pm_sock());
 }
 #endif // __NR_syz_mptcp_join_subflow
 
@@ -990,7 +1309,7 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_PORT, &remote_port_h, sizeof(remote_port_h));
 	mptcp_nlmsg_nest_end(&m, nest);
 
-	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
+	return mptcp_nlmsg_send(&m, mptcp_pm_sock());
 }
 #endif // __NR_syz_mptcp_subflow_destroy
 
@@ -1101,7 +1420,7 @@ static int mptcp_pm_endpoint_cmd(int cmd, long h, uint32 flags, uint16 port_h)
 	}
 	mptcp_pm_endpoint_build(&m, cmd, id, addr_be, cmd == MPTCP_PM_CMD_ADD_ADDR || h == MPTCP_PM_ENDPOINT_ID0,
 				flags, port_h);
-	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
+	return mptcp_nlmsg_send(&m, mptcp_pm_sock());
 }
 #endif
 #endif // MPTCP_NEED_PM_ENDPOINT
@@ -1118,6 +1437,7 @@ static int mptcp_nlmsg_query(struct mptcp_nlmsg* m, bool dump, void (*cb)(void* 
 	struct sockaddr_nl sa;
 	static char buf[16384];
 	int ret = -1, err = EINVAL;
+	int sock = mptcp_pm_sock();
 
 	if (m->overflow) {
 		errno = EMSGSIZE;
@@ -1132,13 +1452,13 @@ static int mptcp_nlmsg_query(struct mptcp_nlmsg* m, bool dump, void (*cb)(void* 
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
 	mptcp_spin_lock(&mptcp_nlmsg_lock);
-	if (sendto(mptcp_pm_genl_sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&sa, sizeof(sa)) !=
+	if (sendto(sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&sa, sizeof(sa)) !=
 	    (ssize_t)hdr->nlmsg_len) {
 		err = errno;
 		goto out;
 	}
 	for (int i = 0; i < 64; i++) {
-		ssize_t n = recv(mptcp_pm_genl_sock, buf, sizeof(buf), 0);
+		ssize_t n = recv(sock, buf, sizeof(buf), 0);
 		if (n < (ssize_t)sizeof(struct nlmsghdr)) {
 			err = n < 0 ? errno : EINVAL;
 			goto out;
@@ -1292,7 +1612,7 @@ static long syz_mptcp_pm_flush_endpoints(void)
 	genlhdr.cmd = MPTCP_PM_CMD_FLUSH_ADDRS;
 	genlhdr.version = MPTCP_PM_VER;
 	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
-	if (mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0) {
+	if (mptcp_nlmsg_send(&m, mptcp_pm_sock()) < 0) {
 		debug("syz_mptcp_pm_flush_endpoints: %d\n", errno);
 		return -1;
 	}
@@ -1314,7 +1634,7 @@ static int mptcp_pm_send_limits(uint32 subflows, uint32 add_addr_accepted, uint3
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_SUBFLOWS, &subflows, sizeof(subflows));
 	if (subflow_retries)
 		mptcp_nlmsg_attr(&m, SYZ_MPTCP_PM_ATTR_SUBFLOW_RETRIES, &subflow_retries, sizeof(subflow_retries));
-	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
+	return mptcp_nlmsg_send(&m, mptcp_pm_sock());
 }
 
 // Sets the in-kernel PM limits: extra subflows per msk, accepted ADD_ADDRs, and
@@ -3041,7 +3361,7 @@ static long syz_mptcp_pm_announce(volatile long a0, volatile long a1, volatile l
 
 	mptcp_pm_nlmsg_start(&m, MPTCP_PM_CMD_ANNOUNCE, token);
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR, a->id, addr_be, port_h, MPTCP_PM_ADDR_FLAG_SIGNAL);
-	if (mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0) {
+	if (mptcp_nlmsg_send(&m, mptcp_pm_sock()) < 0) {
 		int err = errno;
 		debug("syz_mptcp_pm_announce: ANNOUNCE: %d\n", err);
 		mptcp_announce_release(a);
@@ -3072,7 +3392,7 @@ static long mptcp_pm_remove_id(const char* who, int fd, uint8 id)
 	}
 	mptcp_pm_nlmsg_start(&m, MPTCP_PM_CMD_REMOVE, token);
 	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_LOC_ID, &id, sizeof(id));
-	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0 ? -1 : 0;
+	return mptcp_nlmsg_send(&m, mptcp_pm_sock()) < 0 ? -1 : 0;
 }
 
 // syz_mptcp_pm_remove(handle, kind): REMOVE of an announcement, of a joined
@@ -3183,7 +3503,7 @@ static long syz_mptcp_pm_set_flags(volatile long a0, volatile long a1, volatile 
 	mptcp_pm_nlmsg_start(&m, MPTCP_PM_CMD_SET_FLAGS, token);
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR, -1, loc.sin_addr.s_addr, ntohs(loc.sin_port), flags);
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR_REMOTE, -1, rem.sin_addr.s_addr, ntohs(rem.sin_port), 0);
-	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0 ? -1 : 0;
+	return mptcp_nlmsg_send(&m, mptcp_pm_sock()) < 0 ? -1 : 0;
 }
 #endif
 // ---------- Scenario ops: conditions the other ops cannot create ----------
