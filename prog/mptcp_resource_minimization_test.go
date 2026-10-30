@@ -30,7 +30,7 @@ import (
 //
 // The base program under test mirrors sys/linux/test/mptcp_join_subflow:
 //
-//	r0 = syz_mptcp_pair_init(..., &AUTO=<r1=>0x0)
+//	r0 = syz_mptcp_pair_init(..., &AUTO=<r1=>0x0, &AUTO)
 //	r2 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
 //	syz_mptcp_subflow_destroy(r2)
 //	syz_mptcp_pair_close(r0)
@@ -39,7 +39,7 @@ import (
 // (MPTCP_MUT_NONE) keeps this a plain, unmutated join -- the resource-chain
 // property under test is independent of the mutation op.
 const mptcpMinimizationBaseProg = `
-r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r1=>0x0)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r1=>0x0, &AUTO)
 r2 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
 syz_mptcp_subflow_destroy(r2)
 syz_mptcp_pair_close(r0)
@@ -295,32 +295,59 @@ func TestMPTCPMinimizationNaivePresencePredicateIsInsufficient(t *testing.T) {
 }
 
 // TestMPTCPLegacyPairInitStillLinks pins the compatibility promise for programs
-// written before pair_init gained the pm argument and the per-end handles:
-// existing corpora and saved reproducers call syz_mptcp_pair_init with three
-// arguments and pass its return value to syz_mptcp_join_subflow. Non-strict
-// parsing (corpus loading, syz-execprog, syz-repro) must accept them, fill in
-// the userspace/userspace default, and keep the join linked to the pair.
+// written before pair_init gained its later arguments: corpora and saved
+// reproducers call syz_mptcp_pair_init with three arguments (before the pm
+// argument and per-end handles) or five (before the server handle). Non-strict
+// parsing (corpus loading, syz-execprog, syz-repro) must accept them, fill in the
+// userspace/userspace default, and keep the join linked to what it was linked to.
 func TestMPTCPLegacyPairInitStillLinks(t *testing.T) {
 	target := mptcpMinimizationTarget(t)
-	legacy := `
+	for _, test := range []struct {
+		name        string
+		prog        string
+		joinsTheRet bool // the join takes pair_init's return value, not the client handle
+	}{
+		{
+			name: "three arguments",
+			prog: `
 r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x9)
 r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
 syz_mptcp_subflow_destroy(r1)
 syz_mptcp_pair_close(r0)
-`
-	p, err := target.Deserialize([]byte(strings.TrimSpace(legacy)), NonStrict)
-	if err != nil {
-		t.Fatalf("failed to deserialize legacy mptcp program: %v", err)
-	}
-	pairInit, join := p.Calls[0], p.Calls[1]
-	if pairInit.Meta.Name != "syz_mptcp_pair_init" || len(pairInit.Args) != 5 {
-		t.Fatalf("legacy pair_init did not get the new argument list:\n%s", p.Serialize())
-	}
-	if pm, ok := pairInit.Args[3].(*ConstArg); !ok || pm.Val != 0 {
-		t.Fatalf("legacy pair_init should default to the userspace/userspace pm value 0:\n%s", p.Serialize())
-	}
-	arg, ok := join.Args[0].(*ResultArg)
-	if !ok || arg.Res != pairInit.Ret {
-		t.Fatalf("legacy join_subflow lost its link to pair_init:\n%s", p.Serialize())
+`,
+			joinsTheRet: true,
+		},
+		{
+			name: "five arguments",
+			prog: `
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r1=>0x0)
+r2 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
+syz_mptcp_subflow_destroy(r2)
+syz_mptcp_pair_close(r0)
+`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p, err := target.Deserialize([]byte(strings.TrimSpace(test.prog)), NonStrict)
+			if err != nil {
+				t.Fatalf("failed to deserialize legacy mptcp program: %v", err)
+			}
+			pairInit, join := p.Calls[0], p.Calls[1]
+			if pairInit.Meta.Name != "syz_mptcp_pair_init" || len(pairInit.Args) != 6 {
+				t.Fatalf("legacy pair_init did not get the new argument list:\n%s", p.Serialize())
+			}
+			if pm, ok := pairInit.Args[3].(*ConstArg); !ok || pm.Val != 0 {
+				t.Fatalf("legacy pair_init should default to the userspace/userspace pm value 0:\n%s",
+					p.Serialize())
+			}
+			want := pairInit.Ret
+			if !test.joinsTheRet {
+				want = mptcpClientHandle(t, pairInit)
+			}
+			arg, ok := join.Args[0].(*ResultArg)
+			if !ok || arg.Res != want {
+				t.Fatalf("legacy join_subflow lost its link to pair_init:\n%s", p.Serialize())
+			}
+		})
 	}
 }

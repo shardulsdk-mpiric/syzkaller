@@ -2,9 +2,9 @@
 # userspace-PM client with an in-kernel-PM server, then the reverse. Both pairs
 # establish and carry data.
 
-r0 = syz_mptcp_pair_init$server_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x2, &AUTO=<r1=>0x0)
+r0 = syz_mptcp_pair_init$server_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x2, &AUTO=<r1=>0x0, 0x0)
 syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
 syz_mptcp_pair_close(r0)
-r2 = syz_mptcp_pair_init$client_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x1, 0x0)
+r2 = syz_mptcp_pair_init$client_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x1, 0x0, &AUTO)
 syz_mptcp_drive_traffic(r2, &AUTO="4142434445464748", 0x8)
 syz_mptcp_pair_close(r2)
