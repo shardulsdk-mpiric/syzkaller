@@ -10,7 +10,10 @@
 // reproducers; see brf/.claude/designs/mptcp_mutation_and_key_capture.md §2/§4).
 //
 // NFQUEUE holds the skb until userspace verdicts, so the mutation is applied to
-// the held packet synchronously before it proceeds. Raw-netlink (no
+// the held packet synchronously before it proceeds. The one exception to
+// statelessness is the per-flow stall (syz_nfq_stall_*, below), which delays,
+// holds or drops one flow's packets for a bounded time and leaves every other
+// packet, and the mutation hook, as they were. Raw-netlink (no
 // libnetfilter_queue dependency), mirroring the executor's other self-contained
 // netlink builders.
 #ifndef EXECUTOR_COMMON_LINUX_MPTCP_NFQ_H
@@ -27,6 +30,7 @@
 #include <linux/tcp.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -500,10 +504,23 @@ static inline int syz_nfq_delete_rule(int fd)
 	return syz_nft_batch_commit(fd, &b);
 }
 
+// nft_compat "target" expression attributes (<linux/netfilter/nf_tables_compat.h>,
+// which older headers lack) and the xt_NFQUEUE v3 target info: queue 0 of 1,
+// with the bypass flag.
+#define SYZ_NFTA_TARGET_NAME 1
+#define SYZ_NFTA_TARGET_REV 2
+#define SYZ_NFTA_TARGET_INFO 3
+#define SYZ_XT_NFQ_FLAG_BYPASS 0x01
+
 // Batch { BEGIN, NEWTABLE, NEWCHAIN (filter/output/prio 0/accept),
 // NEWRULE [meta oif -> reg1; cmp reg1 == ifindex(lo); payload nh[9]:1 -> reg1;
 // cmp reg1 == IPPROTO_TCP; queue num 0 bypass], END }.
-static inline int syz_nfq_install_rule(int fd)
+//
+// The queue verdict needs CONFIG_NFT_QUEUE. A kernel without it (the "queue"
+// expression is then unknown, ENOENT) often still has the xtables NFQUEUE target
+// and nft_compat, so with compat set the rule ends in the equivalent compat
+// expression instead: target NFQUEUE rev 3 {queuenum 0, queues_total 1, bypass}.
+static inline int syz_nfq_install_rule_as(int fd, bool compat)
 {
 	char raw[1024];
 	struct syz_nft_buf b;
@@ -562,15 +579,215 @@ static inline int syz_nfq_install_rule(int fd)
 	// reg1 == IPPROTO_TCP
 	syz_nft_expr_cmp_eq(&b, &tcp, sizeof(tcp));
 	// queue num 0 bypass
-	syz_nft_expr_start(&b, "queue", &elem, &data);
-	syz_nft_put_be16(&b, NFTA_QUEUE_NUM, NFQ_QUEUE_NUM);
-	syz_nft_put_be16(&b, NFTA_QUEUE_FLAGS, NFT_QUEUE_FLAG_BYPASS);
-	syz_nft_expr_end(&b, elem, data);
+	if (compat) {
+		uint16 info[4] = {NFQ_QUEUE_NUM, 1, SYZ_XT_NFQ_FLAG_BYPASS, 0};
+		syz_nft_expr_start(&b, "target", &elem, &data);
+		syz_nft_put_str(&b, SYZ_NFTA_TARGET_NAME, "NFQUEUE");
+		syz_nft_put_be32(&b, SYZ_NFTA_TARGET_REV, 3);
+		syz_nft_put(&b, SYZ_NFTA_TARGET_INFO, info, sizeof(info));
+		syz_nft_expr_end(&b, elem, data);
+	} else {
+		syz_nft_expr_start(&b, "queue", &elem, &data);
+		syz_nft_put_be16(&b, NFTA_QUEUE_NUM, NFQ_QUEUE_NUM);
+		syz_nft_put_be16(&b, NFTA_QUEUE_FLAGS, NFT_QUEUE_FLAG_BYPASS);
+		syz_nft_expr_end(&b, elem, data);
+	}
 	syz_nft_nest_end(&b, exprs);
 	syz_nft_msg_end(&b, m);
 
 	syz_nft_batch_end(&b);
 	return syz_nft_batch_commit(fd, &b);
+}
+
+static inline int syz_nfq_install_rule(int fd)
+{
+	if (syz_nfq_install_rule_as(fd, false) == 0)
+		return 0;
+	if (errno != ENOENT)
+		return -1;
+	debug("syz_nfq_install_rule: no nft queue expression, using the xtables NFQUEUE target\n");
+	return syz_nfq_install_rule_as(fd, true);
+}
+
+// ---- Per-flow stall (the one stateful extension of the engine) ----
+//
+// A stall is a filter on one TCP flow (an IPv4 address/port pair, either or both
+// directions) plus what to do with its packets for a bounded time: DELAY each one
+// by delay_ms, BLOCK (hold) all of them until the stall ends, or DROP them. A
+// syscall thread publishes a stall in a free slot, keeps it for a bounded time,
+// then retires it and waits until the worker has released every packet it held
+// (syz_nfq_stall_begin/end), so nothing outlives the call.
+//
+// Only the stalled flow is affected. The worker keeps verdicting every other
+// packet as it arrives, in arrival order, and runs the mutation hook on every
+// packet first, exactly as before: a packet the hook drops or rewrites gets that
+// verdict at once and is never held, and the hook sees each packet at arrival, so
+// what it captures (MP_JOIN nonces, ...) is captured when it always was. A held
+// packet costs a queue id and a deadline, not a copy: the kernel keeps the skb
+// until the worker accepts it, unmodified. Held packets of one stall are released
+// in arrival order. The hold list is bounded; a packet that does not fit is
+// dropped, like a full bottleneck queue (TCP retransmits it). Flows are told
+// apart by port, because every pair of an executor process shares its netns.
+#define SYZ_NFQ_STALL_MAX 8
+#define SYZ_NFQ_HELD_MAX 256
+#define SYZ_NFQ_STALL_DELAY 0
+#define SYZ_NFQ_STALL_BLOCK 1
+#define SYZ_NFQ_STALL_DROP 2
+// Directions, relative to the (a, b) endpoints of the stall.
+#define SYZ_NFQ_STALL_A_TO_B 1
+#define SYZ_NFQ_STALL_B_TO_A 2
+
+struct syz_nfq_stall {
+	int claimed; // owned by a syscall thread (claimed with a compare-exchange)
+	int active; // the spec below is valid; release-stored after it is written
+	uint32 gen; // bumped per use, so held packets of a retired stall are told apart
+	uint32 addr_a, addr_b; // network order
+	uint16 port_a, port_b; // network order, 0 matches any port
+	int dirs;
+	int mode;
+	int delay_ms;
+	int held; // packets currently held for this slot (worker-written)
+};
+
+struct syz_nfq_held {
+	uint32 id;
+	uint64 due_ms; // UINT64_MAX: until the stall is retired (BLOCK)
+	int slot;
+	uint32 gen;
+};
+
+static struct syz_nfq_stall syz_nfq_stalls[SYZ_NFQ_STALL_MAX];
+static struct syz_nfq_held syz_nfq_held_list[SYZ_NFQ_HELD_MAX]; // worker-only
+static int syz_nfq_held_n; // worker-only
+
+static inline uint64 syz_nfq_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Publishes a stall and returns its slot, or -1 if all slots are taken.
+static inline int syz_nfq_stall_begin(uint32 addr_a, uint16 port_a, uint32 addr_b, uint16 port_b,
+				      int dirs, int mode, int delay_ms)
+{
+	for (int i = 0; i < SYZ_NFQ_STALL_MAX; i++) {
+		int expected = 0;
+		struct syz_nfq_stall* st = &syz_nfq_stalls[i];
+		if (!__atomic_compare_exchange_n(&st->claimed, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			continue;
+		st->addr_a = addr_a;
+		st->addr_b = addr_b;
+		st->port_a = port_a;
+		st->port_b = port_b;
+		st->dirs = dirs;
+		st->mode = mode;
+		st->delay_ms = delay_ms;
+		__atomic_store_n(&st->gen, __atomic_load_n(&st->gen, __ATOMIC_RELAXED) + 1, __ATOMIC_RELEASE);
+		__atomic_store_n(&st->active, 1, __ATOMIC_RELEASE);
+		return i;
+	}
+	return -1;
+}
+
+// Retires the stall and waits (bounded) until the worker has released what it
+// held. Returns the number of packets still held at the deadline (0 normally);
+// those are released by the worker later, since their generation is stale.
+static inline int syz_nfq_stall_end(int slot)
+{
+	struct syz_nfq_stall* st = &syz_nfq_stalls[slot];
+	int held = 0;
+	__atomic_store_n(&st->active, 0, __ATOMIC_RELEASE);
+	for (int i = 0; i < 200; i++) {
+		held = __atomic_load_n(&st->held, __ATOMIC_ACQUIRE);
+		if (held == 0)
+			break;
+		usleep(5000);
+	}
+	__atomic_store_n(&st->claimed, 0, __ATOMIC_RELEASE);
+	return held;
+}
+
+// Worker: the stall a packet belongs to, or -1. Only IPv4/TCP is matched.
+static inline int syz_nfq_stall_match(const uint8* pkt, int len, uint32* gen_out)
+{
+	if (len < (int)sizeof(struct iphdr))
+		return -1;
+	const struct iphdr* ip = (const struct iphdr*)pkt;
+	int ihl = ip->ihl * 4;
+	if (ip->protocol != IPPROTO_TCP || ihl < (int)sizeof(struct iphdr) || len < ihl + (int)sizeof(struct tcphdr))
+		return -1;
+	const struct tcphdr* th = (const struct tcphdr*)(pkt + ihl);
+	for (int i = 0; i < SYZ_NFQ_STALL_MAX; i++) {
+		struct syz_nfq_stall* st = &syz_nfq_stalls[i];
+		if (!__atomic_load_n(&st->active, __ATOMIC_ACQUIRE))
+			continue;
+		bool ab = ip->saddr == st->addr_a && ip->daddr == st->addr_b &&
+			  (!st->port_a || th->source == st->port_a) && (!st->port_b || th->dest == st->port_b);
+		bool ba = ip->saddr == st->addr_b && ip->daddr == st->addr_a &&
+			  (!st->port_b || th->source == st->port_b) && (!st->port_a || th->dest == st->port_a);
+		if ((ab && (st->dirs & SYZ_NFQ_STALL_A_TO_B)) || (ba && (st->dirs & SYZ_NFQ_STALL_B_TO_A))) {
+			*gen_out = __atomic_load_n(&st->gen, __ATOMIC_ACQUIRE);
+			return i;
+		}
+	}
+	return -1;
+}
+
+static inline int syz_nfq_send_verdict(int fd, uint16 q, uint32 id, uint32 verdict,
+				       const uint8* payload, uint16 plen);
+
+// Worker: accept every held packet that is due or whose stall has been retired,
+// in arrival order. Returns how long the worker may wait for the next packet:
+// -1 when nothing is held (block as before), else ms until the next deadline,
+// capped so a retired BLOCK stall is noticed within a few ms.
+static inline int syz_nfq_stall_service(void)
+{
+	if (syz_nfq_held_n == 0)
+		return -1;
+	uint64 now = syz_nfq_now_ms();
+	uint64 next = now + 5;
+	int kept = 0;
+	for (int i = 0; i < syz_nfq_held_n; i++) {
+		struct syz_nfq_held* h = &syz_nfq_held_list[i];
+		struct syz_nfq_stall* st = &syz_nfq_stalls[h->slot];
+		bool live = __atomic_load_n(&st->active, __ATOMIC_ACQUIRE) &&
+			    __atomic_load_n(&st->gen, __ATOMIC_ACQUIRE) == h->gen;
+		if (!live || h->due_ms <= now) {
+			syz_nfq_send_verdict(syz_nfq_fd, NFQ_QUEUE_NUM, h->id, NF_ACCEPT, NULL, 0);
+			__atomic_sub_fetch(&st->held, 1, __ATOMIC_RELEASE);
+			continue;
+		}
+		if (h->due_ms < next)
+			next = h->due_ms;
+		syz_nfq_held_list[kept++] = *h;
+	}
+	syz_nfq_held_n = kept;
+	if (kept == 0)
+		return -1;
+	return (int)(next - now);
+}
+
+// Worker: decide a pass-through packet's verdict under the stalls. Returns true if
+// the stall took it (held or dropped); false to accept it now.
+static inline bool syz_nfq_stall_take(uint16 q, uint32 id, const uint8* pkt, int len)
+{
+	uint32 gen = 0;
+	int slot = syz_nfq_stall_match(pkt, len, &gen);
+	if (slot < 0)
+		return false;
+	struct syz_nfq_stall* st = &syz_nfq_stalls[slot];
+	if (st->mode == SYZ_NFQ_STALL_DROP || syz_nfq_held_n >= SYZ_NFQ_HELD_MAX) {
+		syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_DROP, NULL, 0);
+		return true;
+	}
+	struct syz_nfq_held* h = &syz_nfq_held_list[syz_nfq_held_n++];
+	h->id = id;
+	h->due_ms = st->mode == SYZ_NFQ_STALL_DELAY ? syz_nfq_now_ms() + st->delay_ms : (uint64)-1;
+	h->slot = slot;
+	h->gen = gen;
+	__atomic_add_fetch(&st->held, 1, __ATOMIC_RELEASE);
+	return true;
 }
 
 static inline int syz_nfq_send_verdict(int fd, uint16 q, uint32 id, uint32 verdict,
@@ -625,7 +842,21 @@ static inline void* syz_nfq_worker_loop(void* arg)
 	// NLMSG_OK, and the packet would get no verdict (skb held forever).
 	static char buf[128 * 1024];
 	while (!__atomic_load_n(&syz_nfq_worker_stop, __ATOMIC_SEQ_CST)) {
-		ssize_t n = recv(syz_nfq_fd, buf, sizeof(buf), 0);
+		// With packets held by a stall, wait no longer than the next release
+		// deadline; otherwise block in recv as always (SO_RCVTIMEO bounds it).
+		int wait_ms = syz_nfq_stall_service();
+		ssize_t n;
+		if (wait_ms >= 0) {
+			struct pollfd pfd;
+			pfd.fd = syz_nfq_fd;
+			pfd.events = POLLIN;
+			pfd.revents = 0;
+			if (poll(&pfd, 1, wait_ms) <= 0)
+				continue;
+			n = recv(syz_nfq_fd, buf, sizeof(buf), MSG_DONTWAIT);
+		} else {
+			n = recv(syz_nfq_fd, buf, sizeof(buf), 0);
+		}
 		if (n < 0) {
 			// EAGAIN/EWOULDBLOCK: SO_RCVTIMEO fired -- loop back to re-check
 			// the stop flag (this is the only wake source for a clean join).
@@ -709,6 +940,8 @@ static inline void* syz_nfq_worker_loop(void* arg)
 				}
 				vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, payload, (uint16)newlen);
 			}
+		} else if (payload && syz_nfq_stall_take(q, id, payload, plen)) {
+			vrc = 0; // held or dropped by a stall
 		} else {
 			vrc = syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_ACCEPT, NULL, 0);
 		}
@@ -739,8 +972,24 @@ static inline void syz_nfq_cleanup(void)
 	}
 }
 
-// Idempotent. The subsystem layer sets syz_nfq_hook before calling this.
+// The subsystem layer sets syz_nfq_hook before calling syz_nfq_setup().
+static int syz_nfq_setup_locked(void);
+static int syz_nfq_setup_lock;
+
+// Idempotent and safe to call from several threads at once (a mutated join and a
+// stall can both be the first user).
 static inline int syz_nfq_setup(void)
+{
+	if (__atomic_load_n(&syz_nfq_setup_done, __ATOMIC_ACQUIRE))
+		return 0;
+	while (__atomic_exchange_n(&syz_nfq_setup_lock, 1, __ATOMIC_ACQUIRE))
+		usleep(50);
+	int ret = syz_nfq_setup_locked();
+	__atomic_store_n(&syz_nfq_setup_lock, 0, __ATOMIC_RELEASE);
+	return ret;
+}
+
+static int syz_nfq_setup_locked(void)
 {
 	struct sockaddr_nl sa;
 
@@ -794,7 +1043,7 @@ static inline int syz_nfq_setup(void)
 	if (pthread_create(&syz_nfq_worker_thread, NULL, syz_nfq_worker_loop, NULL) != 0)
 		goto fail;
 	syz_nfq_worker_started = 1;
-	syz_nfq_setup_done = 1;
+	__atomic_store_n(&syz_nfq_setup_done, 1, __ATOMIC_RELEASE);
 	return 0;
 fail:
 	syz_nfq_cleanup();
