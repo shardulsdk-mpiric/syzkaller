@@ -1,0 +1,22 @@
+# Write every MPTCP sysctl the op offers while a pair is live: the scheduler and
+# path manager (picked from the kernel's available lists) and the numeric knobs
+# (taken modulo their range). The pair keeps working, a pair created afterwards
+# still gets the PM pair_init chooses, and the per-program netns reset restores
+# every value written.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0, &AUTO)
+syz_mptcp_set_sysctl(0x0, 0x0)
+syz_mptcp_set_sysctl(0x1, 0x1)
+syz_mptcp_set_sysctl(0x2, 0x0)
+syz_mptcp_set_sysctl(0x3, 0x3)
+syz_mptcp_set_sysctl(0x4, 0x5)
+syz_mptcp_set_sysctl(0x5, 0x8)
+syz_mptcp_set_sysctl(0x6, 0x1)
+syz_mptcp_set_sysctl(0x7, 0x0)
+syz_mptcp_set_sysctl(0x8, 0x2)
+syz_mptcp_set_sysctl(0x9, 0x0)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+r1 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x3, &AUTO=<r2=>0x0, 0x0)
+syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pair_close(r1)
+syz_mptcp_pair_close(r0)

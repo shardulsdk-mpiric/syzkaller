@@ -297,15 +297,23 @@ func TestMPTCPMinimizationNaivePresencePredicateIsInsufficient(t *testing.T) {
 // TestMPTCPLegacyPairInitStillLinks pins the compatibility promise for programs
 // written before pair_init gained its later arguments: corpora and saved
 // reproducers call syz_mptcp_pair_init with three arguments (before the pm
-// argument and per-end handles) or five (before the server handle). Non-strict
+// argument and per-end handles) or five (before the server handle), and the
+// kernel-PM-client variants with `0x0` as the client (before it became the
+// mptcp_client_kernel handle consumed by syz_mptcp_subflow_fail). Non-strict
 // parsing (corpus loading, syz-execprog, syz-repro) must accept them, fill in the
-// userspace/userspace default, and keep the join linked to what it was linked to.
+// defaults, and keep the second call linked to what it was linked to.
 func TestMPTCPLegacyPairInitStillLinks(t *testing.T) {
 	target := mptcpMinimizationTarget(t)
+	const (
+		linkRet    = iota // the second call takes pair_init's return value
+		linkClient        // the second call takes the client handle
+	)
 	for _, test := range []struct {
-		name        string
-		prog        string
-		joinsTheRet bool // the join takes pair_init's return value, not the client handle
+		name     string
+		prog     string
+		pairInit string
+		pm       uint64
+		link     int
 	}{
 		{
 			name: "three arguments",
@@ -315,7 +323,8 @@ r1 = syz_mptcp_join_subflow(r0, 0x1, 0x0, 0x0)
 syz_mptcp_subflow_destroy(r1)
 syz_mptcp_pair_close(r0)
 `,
-			joinsTheRet: true,
+			pairInit: "syz_mptcp_pair_init",
+			link:     linkRet,
 		},
 		{
 			name: "five arguments",
@@ -325,6 +334,41 @@ r2 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
 syz_mptcp_subflow_destroy(r2)
 syz_mptcp_pair_close(r0)
 `,
+			pairInit: "syz_mptcp_pair_init",
+			link:     linkClient,
+		},
+		{
+			name: "kernel client const 0",
+			prog: `
+r0 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x3, 0x0, 0x0)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pair_close(r0)
+`,
+			pairInit: "syz_mptcp_pair_init$kernel",
+			pm:       3,
+			link:     linkRet,
+		},
+		{
+			name: "client_kernel client const 0, five arguments",
+			prog: `
+r0 = syz_mptcp_pair_init$client_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x1, 0x0)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pair_close(r0)
+`,
+			pairInit: "syz_mptcp_pair_init$client_kernel",
+			pm:       1,
+			link:     linkRet,
+		},
+		{
+			name: "kernel client handle",
+			prog: `
+r0 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x3, &AUTO=<r1=>0x0, 0x0)
+syz_mptcp_subflow_fail(r1, 0x0)
+syz_mptcp_pair_close(r0)
+`,
+			pairInit: "syz_mptcp_pair_init$kernel",
+			pm:       3,
+			link:     linkClient,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -332,21 +376,20 @@ syz_mptcp_pair_close(r0)
 			if err != nil {
 				t.Fatalf("failed to deserialize legacy mptcp program: %v", err)
 			}
-			pairInit, join := p.Calls[0], p.Calls[1]
-			if pairInit.Meta.Name != "syz_mptcp_pair_init" || len(pairInit.Args) != 6 {
+			pairInit, next := p.Calls[0], p.Calls[1]
+			if pairInit.Meta.Name != test.pairInit || len(pairInit.Args) != 6 {
 				t.Fatalf("legacy pair_init did not get the new argument list:\n%s", p.Serialize())
 			}
-			if pm, ok := pairInit.Args[3].(*ConstArg); !ok || pm.Val != 0 {
-				t.Fatalf("legacy pair_init should default to the userspace/userspace pm value 0:\n%s",
-					p.Serialize())
+			if pm, ok := pairInit.Args[3].(*ConstArg); !ok || pm.Val != test.pm {
+				t.Fatalf("legacy pair_init should keep the pm value %v:\n%s", test.pm, p.Serialize())
 			}
 			want := pairInit.Ret
-			if !test.joinsTheRet {
+			if test.link == linkClient {
 				want = mptcpClientHandle(t, pairInit)
 			}
-			arg, ok := join.Args[0].(*ResultArg)
+			arg, ok := next.Args[0].(*ResultArg)
 			if !ok || arg.Res != want {
-				t.Fatalf("legacy join_subflow lost its link to pair_init:\n%s", p.Serialize())
+				t.Fatalf("legacy %v lost its link to pair_init:\n%s", next.Meta.Name, p.Serialize())
 			}
 		})
 	}

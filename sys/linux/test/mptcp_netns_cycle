@@ -1,0 +1,11 @@
+# Create a network namespace with live MPTCP connections and destroy it while they
+# are still closing: plain close, with in-kernel PM endpoints, and with a reset and
+# unread data. The calling thread is back in its own netns afterwards, so a pair
+# created there still works.
+
+syz_mptcp_netns_cycle(0x1, 0x0)
+syz_mptcp_netns_cycle(0x2, 0x1)
+syz_mptcp_netns_cycle(0x4, 0x6)
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r10=>0x0, &AUTO)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pair_close(r0)

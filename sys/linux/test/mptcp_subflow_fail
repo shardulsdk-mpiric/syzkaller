@@ -1,0 +1,15 @@
+# A kernel/kernel pair with a subflow endpoint has two client subflows (the initial
+# one and one the in-kernel PM opens). Fail the second one like a dead path: TCP
+# closes it with a timeout error, and with a nonzero subflow-retries limit the
+# in-kernel PM re-creates it (kernels without that limit just close it). The pair
+# keeps carrying data on the other subflow. The endpoint is flushed at the end, so
+# a repeated run (C reproducer repeat mode) can add it again.
+
+syz_mptcp_pm_set_limits(0x2, 0x0, 0x1)
+r0 = syz_mptcp_pm_add_endpoint$subflow(0x0, 0x2, 0x0, 0x0)
+r1 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x3, &AUTO=<r2=>0x0, 0x0)
+syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
+syz_mptcp_subflow_fail(r2, 0x1)
+syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pair_close(r1)
+syz_mptcp_pm_flush_endpoints()

@@ -44,9 +44,12 @@ resource mptcp_subflow[intptr]: 0xffffffffffffffff
 # Each end that runs the userspace PM is also returned as a typed handle (same
 # value as mptcp_pair, the pool slot). Ops that need a userspace PM on a given end
 # take that end's handle, so they are not generated against a kernel-PM end they
-# cannot act on. PM-agnostic ops keep taking mptcp_pair.
+# cannot act on. PM-agnostic ops keep taking mptcp_pair. A client end that runs
+# the in-kernel PM is returned as mptcp_client_kernel, for the ops that need the
+# in-kernel PM on the client.
 resource mptcp_client_userspace[intptr]: 0xffffffffffffffff
 resource mptcp_server_userspace[intptr]: 0xffffffffffffffff
+resource mptcp_client_kernel[intptr]: 0xffffffffffffffff
 
 # Harness constants for the pm argument (see .const + executor #define): bit 0
 # selects the in-kernel PM for the client end, bit 1 for the server end.
@@ -56,11 +59,12 @@ define MPTCP_PAIR_PM_SERVER_KERNEL	2
 define MPTCP_PAIR_PM_KERNEL	3
 
 # Both ends userspace PM. The bare name keeps this behaviour for existing programs.
-# An end that runs the in-kernel PM gets no handle (const 0, a NULL pointer).
+# A kernel-PM client end is returned as mptcp_client_kernel; a kernel-PM server end
+# gets no handle (const 0, a NULL pointer).
 syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_USERSPACE], client ptr[out, mptcp_client_userspace], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
 syz_mptcp_pair_init$server_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_SERVER_KERNEL], client ptr[out, mptcp_client_userspace], server const[0]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_CLIENT_KERNEL], client const[0], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client const[0], server const[0]) mptcp_pair (remote_cover)
+syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_CLIENT_KERNEL], client ptr[out, mptcp_client_kernel], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
+syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client ptr[out, mptcp_client_kernel], server const[0]) mptcp_pair (remote_cover)
 syz_mptcp_pair_close(pair mptcp_pair)
 
 # addr_id: local address id announced to the kernel for this subflow
@@ -305,3 +309,64 @@ define MPTCP_PM_PRIO_SUBFLOW	2
 syz_mptcp_pm_set_flags$client(end mptcp_client_userspace, kind const[MPTCP_PM_PRIO_CLIENT], backup int8[0:1])
 syz_mptcp_pm_set_flags$server(end mptcp_server_userspace, kind const[MPTCP_PM_PRIO_SERVER], backup int8[0:1])
 syz_mptcp_pm_set_flags$subflow(sub mptcp_subflow, kind const[MPTCP_PM_PRIO_SUBFLOW], backup int8[0:1])
+
+# Scenario ops: conditions the kernel acts on that no sequence of the other ops
+# creates. Each is bounded in time and leaves nothing behind.
+#
+# syz_mptcp_subflow_stall: one subflow of a pair stops making progress for hold_ms
+# while data is pushed both ways, then is released. target picks the subflow the
+# handle names or the pair's initial one; mode DELAY makes each of its packets
+# arrive delay_ms late (its RTT grows, under TCP's minimum RTO), BLOCK holds its
+# packets until the end, DROP drops them; dirs picks the direction(s). The other
+# subflows run at full speed and go idle between pushes: the state the scheduler
+# and the reinjection logic react to. Done in the NFQUEUE layer, scoped to the
+# subflow's addresses and ports, so other pairs of the process are not affected.
+define MPTCP_STALL_TARGET_SUBFLOW	0
+define MPTCP_STALL_TARGET_INITIAL	1
+define MPTCP_STALL_DELAY	0
+define MPTCP_STALL_BLOCK	1
+define MPTCP_STALL_DROP	2
+define MPTCP_STALL_TO_SERVER	1
+define MPTCP_STALL_TO_CLIENT	2
+mptcp_stall_targets = MPTCP_STALL_TARGET_SUBFLOW, MPTCP_STALL_TARGET_INITIAL
+mptcp_stall_modes = MPTCP_STALL_DELAY, MPTCP_STALL_BLOCK, MPTCP_STALL_DROP
+mptcp_stall_dirs = MPTCP_STALL_TO_SERVER, MPTCP_STALL_TO_CLIENT
+syz_mptcp_subflow_stall(subflow mptcp_subflow, target flags[mptcp_stall_targets], mode flags[mptcp_stall_modes], dirs flags[mptcp_stall_dirs], delay_ms int8[1:100], hold_ms int16[0:1000], data ptr[in, array[int8]], data_len len[data]) (timeout[1500], prog_timeout[2000], remote_cover)
+
+# syz_mptcp_subflow_fail: one established subflow (the which-th) of a client end on
+# the in-kernel PM fails like a dead path: TCP closes it with a timeout error (a
+# 1s keepalive on the msk while the subflow's packets are dropped, about 2s). The
+# in-kernel PM can then re-create it (see the subflow_retries limit of
+# syz_mptcp_pm_set_limits) while another subflow can still send. Only generated
+# for a kernel-PM client end, the only PM that acts on it.
+syz_mptcp_subflow_fail(client mptcp_client_kernel, which int8[0:7]) (timeout[4000], prog_timeout[5000], remote_cover)
+
+# syz_mptcp_set_sysctl: write one net.mptcp sysctl with a valid value while the rest
+# of the program runs. Names (scheduler, path_manager) are picked from the
+# kernel's available list by val; numbers are val modulo the knob's range. The
+# value stays until the per-program netns reset; pair_init still sets each end's
+# PM itself, so a written path_manager governs only plain socket() msks. Neither
+# `enabled` nor the deprecated pm_type is written.
+define MPTCP_SYSCTL_KNOB_SCHEDULER	0
+define MPTCP_SYSCTL_KNOB_PATH_MANAGER	1
+define MPTCP_SYSCTL_KNOB_CHECKSUM	2
+define MPTCP_SYSCTL_KNOB_ADD_ADDR_TIMEOUT	3
+define MPTCP_SYSCTL_KNOB_CLOSE_TIMEOUT	4
+define MPTCP_SYSCTL_KNOB_STALE_LOSS_CNT	5
+define MPTCP_SYSCTL_KNOB_ALLOW_JOIN_ID0	6
+define MPTCP_SYSCTL_KNOB_BLACKHOLE_TIMEOUT	7
+define MPTCP_SYSCTL_KNOB_SYN_RETRANS	8
+define MPTCP_SYSCTL_KNOB_ADD_ADDR_V6_PORT_DROP_TS	9
+mptcp_sysctl_knobs = MPTCP_SYSCTL_KNOB_SCHEDULER, MPTCP_SYSCTL_KNOB_PATH_MANAGER, MPTCP_SYSCTL_KNOB_CHECKSUM, MPTCP_SYSCTL_KNOB_ADD_ADDR_TIMEOUT, MPTCP_SYSCTL_KNOB_CLOSE_TIMEOUT, MPTCP_SYSCTL_KNOB_STALE_LOSS_CNT, MPTCP_SYSCTL_KNOB_ALLOW_JOIN_ID0, MPTCP_SYSCTL_KNOB_BLACKHOLE_TIMEOUT, MPTCP_SYSCTL_KNOB_SYN_RETRANS, MPTCP_SYSCTL_KNOB_ADD_ADDR_V6_PORT_DROP_TS
+syz_mptcp_set_sysctl(knob flags[mptcp_sysctl_knobs], val int32)
+
+# syz_mptcp_netns_cycle: create a network namespace, connect nconns MPTCP pairs in
+# it and push data, then close everything at once, so the namespace is destroyed
+# while its connections are still closing. ENDPOINTS adds in-kernel PM endpoints
+# (a subflow one and a signal one with a port, which opens a kernel listener);
+# ABORT closes with a reset instead of a FIN; UNREAD leaves data unread.
+define MPTCP_NETNS_ENDPOINTS	1
+define MPTCP_NETNS_ABORT	2
+define MPTCP_NETNS_UNREAD	4
+mptcp_netns_flags = MPTCP_NETNS_ENDPOINTS, MPTCP_NETNS_ABORT, MPTCP_NETNS_UNREAD
+syz_mptcp_netns_cycle(nconns int8[1:4], flags flags[mptcp_netns_flags]) (timeout[1000])

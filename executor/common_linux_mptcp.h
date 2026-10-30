@@ -77,7 +77,7 @@
 // Mutation layer (dormant until the MP_JOIN HMAC hook wires it): the no-deps
 // crypto + the stateless NFQUEUE engine. Guarded to the mutation-carrying call
 // so minimal reproducers that don't mutate don't pull in pthread/netfilter.
-#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_stall || __NR_syz_mptcp_subflow_fail
 #include "common_linux_mptcp_crypto.h"
 #include "common_linux_mptcp_mut.h"
 #include "common_linux_mptcp_nfq.h"
@@ -375,7 +375,8 @@ struct syz_mptcp_info_short {
     __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||                              \
     __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server || __NR_syz_mptcp_disconnect || \
     __NR_syz_mptcp_drive_traffic || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove ||      \
-    __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints
+    __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints || \
+    __NR_syz_mptcp_subflow_stall || __NR_syz_mptcp_subflow_fail
 static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 #endif
 
@@ -401,16 +402,23 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 // GET / DUMP replies, also used to learn a kernel-assigned endpoint id.
 #define MPTCP_NEED_PM_QUERY (SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints || __NR_syz_mptcp_pm_get_limits)
 #define MPTCP_NEED_PM_CONFIG (MPTCP_NEED_PM_ENDPOINT || MPTCP_NEED_PM_QUERY || __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_flush_endpoints)
-#define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
+// The calls that send on the shared genl socket (netns_cycle uses its own).
+#define MPTCP_NEED_GENL_SOCK (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
+#define MPTCP_NEED_NLMSG (MPTCP_NEED_GENL_SOCK || __NR_syz_mptcp_netns_cycle)
 #define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
+// netns_cycle resolves the genl family on its own socket, in its own netns.
+#define MPTCP_NEED_PM_FAMILY (MPTCP_NEED_PM_SETUP || __NR_syz_mptcp_netns_cycle)
 // The calls that apply netns settings for one pair (see mptcp_netns_save):
 // pair_init at creation, join for the subflow SYN, disconnect for the msk reset.
 // Only pair_init and disconnect switch the path manager.
-#define MPTCP_NEED_NETNS_SETTINGS (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_disconnect)
+#define MPTCP_NEED_NETNS_SAVE (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_disconnect)
+// set_sysctl only needs the lock and the sysctl read/write helpers.
+#define MPTCP_NEED_NETNS_SETTINGS (MPTCP_NEED_NETNS_SAVE || __NR_syz_mptcp_set_sysctl)
 #define MPTCP_NEED_PM_SWITCH (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_disconnect)
 
-// remove and set_flags also act on a joined subflow.
-#if MPTCP_NEED_SUBFLOW_CALL || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags
+// remove and set_flags also act on a joined subflow, and subflow_stall reads it
+// (the subflow names the flow).
+#if MPTCP_NEED_SUBFLOW_CALL || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_subflow_stall
 static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[MPTCP_SUBFLOW_POOL_SIZE];
 #endif
 
@@ -484,8 +492,10 @@ struct mptcp_nlmsg {
 	bool overflow; // set if any attr write would exceed buf; checked by send
 };
 
+#if MPTCP_NEED_GENL_SOCK
 static int mptcp_pm_genl_sock = -1; // request/reply socket: GETFAMILY, SUBFLOW_CREATE/DESTROY
 static uint16 mptcp_pm_family_id;
+#endif
 
 // The request/reply socket above is shared across threads under the default
 // -threaded model. Two concurrent transactions on one socket can each recv
@@ -532,7 +542,7 @@ static void mptcp_nlmsg_attr(struct mptcp_nlmsg* m, int typ, const void* data, i
 // Only SUBFLOW_CREATE/DESTROY and the endpoint commands nest attributes
 // (GETFAMILY's request doesn't) -- see MPTCP_NEED_SUBFLOW_CALL and
 // MPTCP_NEED_PM_ENDPOINT.
-#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_set_flags
+#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_netns_cycle
 static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_out, int typ)
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
@@ -553,7 +563,7 @@ static void mptcp_nlmsg_nest_end(struct mptcp_nlmsg* m, struct nlattr* nest)
 		return;
 	nest->nla_len = m->pos - (char*)nest;
 }
-#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || announce || set_flags
+#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || announce || set_flags || netns_cycle
 
 // Sends m and waits for one reply datagram. Returns the number of bytes
 // received (>=0) on success -- for a bare NLM_F_ACK request (our
@@ -632,6 +642,9 @@ static int mptcp_pm_setup_done;
 static int mptcp_pm_setup_lock; // serializes the one-time netlink setup under -threaded
 static int mptcp_pm_event_sock = -1; // held open + subscribed so mptcp_userspace_pm_active() is true
 static uint32 mptcp_pm_event_grp_id; // "mptcp_pm_events" mcast group id, for per-join event sockets
+#endif // MPTCP_NEED_PM_SETUP
+
+#if MPTCP_NEED_PM_FAMILY
 
 // Parse a CTRL_CMD_GETFAMILY reply for the mptcp_pm family id and the id
 // of its "mptcp_pm_events" multicast group.
@@ -706,7 +719,9 @@ static int mptcp_pm_resolve_family(int sock, uint16* family_id_out, uint32* even
 	*event_grp_id_out = event_grp_id;
 	return 0;
 }
+#endif // MPTCP_NEED_PM_FAMILY
 
+#if MPTCP_NEED_PM_SETUP
 static int mptcp_pm_ensure_netlink(void)
 {
 	struct sockaddr_nl sa;
@@ -800,6 +815,7 @@ fail:
 
 static int mptcp_netns_lock;
 
+#if MPTCP_NEED_NETNS_SAVE
 struct mptcp_netns_saved {
 	const char* pm_path; // path_manager, or pm_type on kernels without it; NULL if not saved
 	char pm[32];
@@ -807,6 +823,7 @@ struct mptcp_netns_saved {
 	char timestamps[8];
 	char join_id0[8];
 };
+#endif
 
 static bool mptcp_sysctl_read(const char* path, char* buf, int size)
 {
@@ -832,12 +849,14 @@ static bool mptcp_sysctl_write(const char* path, const char* val)
 	}
 	int len = strlen(val);
 	bool ok = write(fd, val, len) == len;
-	if (!ok)
+	if (!ok) {
 		debug("mptcp_sysctl_write: write %s=%s: %d\n", path, val, errno);
+	}
 	close(fd);
 	return ok;
 }
 
+#if MPTCP_NEED_NETNS_SAVE
 // Saves the settings a call is about to change. The caller holds mptcp_netns_lock
 // until the matching mptcp_netns_restore().
 static void mptcp_netns_save(struct mptcp_netns_saved* saved, bool pm, bool checksum, bool timestamps,
@@ -869,6 +888,7 @@ static void mptcp_netns_restore(const struct mptcp_netns_saved* saved)
 	if (saved->join_id0[0])
 		mptcp_sysctl_write(MPTCP_SYSCTL_JOIN_ID0, saved->join_id0);
 }
+#endif // MPTCP_NEED_NETNS_SAVE
 #endif // MPTCP_NEED_NETNS_SETTINGS
 
 #if MPTCP_NEED_PM_SWITCH
@@ -1458,8 +1478,9 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	if (init_flags & MPTCP_INIT_NO_TIMESTAMPS) {
 		int tsfd = open("/proc/sys/net/ipv4/tcp_timestamps", O_WRONLY);
 		if (tsfd >= 0) {
-			if (write(tsfd, "0\n", 2) != 2)
+			if (write(tsfd, "0\n", 2) != 2) {
 				debug("syz_mptcp_pair_init: tcp_timestamps disable short write errno=%d\n", errno);
+			}
 			close(tsfd);
 		} else {
 			debug("syz_mptcp_pair_init: open tcp_timestamps errno=%d\n", errno);
@@ -1471,8 +1492,9 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	if (init_flags & MPTCP_INIT_CHECKSUM) {
 		int cfd = open("/proc/sys/net/mptcp/checksum_enabled", O_WRONLY);
 		if (cfd >= 0) {
-			if (write(cfd, "1\n", 2) != 2)
+			if (write(cfd, "1\n", 2) != 2) {
 				debug("syz_mptcp_pair_init: checksum_enabled short write errno=%d\n", errno);
+			}
 			close(cfd);
 		} else {
 			debug("syz_mptcp_pair_init: open checksum_enabled errno=%d\n", errno);
@@ -3162,6 +3184,615 @@ static long syz_mptcp_pm_set_flags(volatile long a0, volatile long a1, volatile 
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR, -1, loc.sin_addr.s_addr, ntohs(loc.sin_port), flags);
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR_REMOTE, -1, rem.sin_addr.s_addr, ntohs(rem.sin_port), 0);
 	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0 ? -1 : 0;
+}
+#endif
+// ---------- Scenario ops: conditions the other ops cannot create ----------
+//
+// Each op below sets up one condition the kernel acts on and that no sequence of
+// the other ops produces: a subflow that stops making progress while another one
+// idles (subflow_stall), a subflow the in-kernel PM sees closed by a path error
+// (subflow_fail), an MPTCP sysctl written while connections run (set_sysctl), and a
+// network namespace destroyed while MPTCP sockets in it are still in use
+// (netns_cycle). Each is bounded in time and leaves nothing behind: packets held by
+// a stall are released before the call returns, socket options and sysctls are
+// put back (or reset per program), and every fd is closed.
+
+// Ops that act on a live pair after sleeping recheck that the pool slot still
+// holds the pair they started on (same generation), so a pair closed and its slot
+// reused by another pair_init meanwhile is never touched.
+#if SYZ_EXECUTOR || __NR_syz_mptcp_subflow_stall || __NR_syz_mptcp_subflow_fail
+static bool mptcp_pair_still(const struct syz_mptcp_pair_slot* pair, uint32 gen)
+{
+	return __atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE) &&
+	       __atomic_load_n(&pair->generation, __ATOMIC_ACQUIRE) == gen;
+}
+
+static uint64 mptcp_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_subflow_stall
+// Harness constants (mirrored in socket_mptcp_flow.txt + .const).
+#define MPTCP_STALL_TARGET_SUBFLOW 0 // the subflow the handle names
+#define MPTCP_STALL_TARGET_INITIAL 1 // the pair's initial subflow
+#define MPTCP_STALL_DELAY 0 // each packet of the flow arrives delay_ms late
+#define MPTCP_STALL_BLOCK 1 // packets are held until the stall ends
+#define MPTCP_STALL_DROP 2 // packets are dropped until the stall ends
+#define MPTCP_STALL_TO_SERVER 1 // client -> server packets (data on a client push)
+#define MPTCP_STALL_TO_CLIENT 2 // server -> client packets (the ACKs of that data)
+#define MPTCP_STALL_MAX_MS 1000
+#define MPTCP_STALL_MAX_DELAY_MS 100
+#define MPTCP_STALL_TICK_US 10000
+
+// Stalls one subflow of a pair for hold_ms while data is pushed both ways every
+// tick, then releases it. With DELAY the subflow keeps working but slowly (its RTT
+// grows by the delay, kept under TCP's minimum RTO so it does not time out); with
+// BLOCK or DROP its ACKs stop advancing. The other subflows run at full speed and
+// go idle between pushes: the state the MPTCP scheduler and reinjection logic
+// react to. The handle is a subflow, so its pair is validated by generation.
+static long syz_mptcp_subflow_stall(volatile long a0, volatile long a1, volatile long a2, volatile long a3,
+				    volatile long a4, volatile long a5, volatile long a6, volatile long a7)
+{
+	long sub_slot = a0;
+	int target = (int)a1;
+	int mode = (int)a2;
+	int dirs = (int)a3 & (MPTCP_STALL_TO_SERVER | MPTCP_STALL_TO_CLIENT);
+	int delay_ms = (int)(uint8)a4;
+	int hold_ms = (int)(uint16)a5;
+	const void* data = (const void*)a6;
+	size_t data_len = (size_t)a7;
+	char drain_buf[4096];
+
+	if (sub_slot < 0 || sub_slot >= MPTCP_SUBFLOW_POOL_SIZE)
+		return -1;
+	struct syz_mptcp_subflow_slot* sub = &syz_mptcp_subflow_pool[sub_slot];
+	if (!__atomic_load_n(&sub->in_use, __ATOMIC_ACQUIRE))
+		return -1;
+	uint32 gen = sub->pair_generation;
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[sub->pair_slot];
+	if (!mptcp_pair_still(pair, gen) || pair->client_fd < 0 || pair->server_fd < 0) {
+		debug("syz_mptcp_subflow_stall: subflow %ld: pair gone\n", sub_slot);
+		return -1;
+	}
+	if (mode < MPTCP_STALL_DELAY || mode > MPTCP_STALL_DROP)
+		mode = MPTCP_STALL_DELAY;
+	if (!dirs)
+		dirs = MPTCP_STALL_TO_SERVER | MPTCP_STALL_TO_CLIENT;
+	if (delay_ms < 1)
+		delay_ms = 1;
+	if (delay_ms > MPTCP_STALL_MAX_DELAY_MS)
+		delay_ms = MPTCP_STALL_MAX_DELAY_MS;
+	if (hold_ms > MPTCP_STALL_MAX_MS)
+		hold_ms = MPTCP_STALL_MAX_MS;
+	if (data_len > sizeof(drain_buf))
+		data_len = sizeof(drain_buf);
+
+	// The flow, as (client end, server end). A joined subflow has its own local
+	// address; its port is known once the join read it back (0 matches any port).
+	uint32 client_addr = sub->local_addr_be;
+	uint16 client_port = htons(sub->local_port_h);
+	if (target == MPTCP_STALL_TARGET_INITIAL) {
+		struct sockaddr_in ca;
+		socklen_t calen = sizeof(ca);
+		if (getsockname(pair->client_fd, (struct sockaddr*)&ca, &calen) < 0 || ca.sin_port == 0) {
+			debug("syz_mptcp_subflow_stall: getsockname: %d\n", errno);
+			return -1;
+		}
+		client_addr = ca.sin_addr.s_addr;
+		client_port = ca.sin_port;
+	}
+
+	syz_nfq_hook = syz_mptcp_mut_hook; // the engine contract: set before setup
+	if (syz_nfq_setup() != 0) {
+		debug("syz_mptcp_subflow_stall: NFQUEUE setup failed\n");
+		return -1;
+	}
+	int st = syz_nfq_stall_begin(client_addr, client_port, htonl(0x7f000001), htons(sub->remote_port_h),
+				     dirs, mode, delay_ms);
+	if (st < 0) {
+		debug("syz_mptcp_subflow_stall: no free stall slot\n");
+		return -1;
+	}
+	uint64 end = mptcp_now_ms() + hold_ms;
+	long pushed = 0;
+	do {
+		if (!mptcp_pair_still(pair, gen))
+			break;
+		ssize_t n = send(pair->client_fd, data, data_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+		if (n > 0)
+			pushed += n;
+		send(pair->server_fd, data, data_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+		for (int i = 0; i < 4; i++) {
+			if (recv(pair->server_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) <= 0)
+				break;
+		}
+		for (int i = 0; i < 4; i++) {
+			if (recv(pair->client_fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) <= 0)
+				break;
+		}
+		usleep(MPTCP_STALL_TICK_US);
+	} while (mptcp_now_ms() < end);
+	int left = syz_nfq_stall_end(st);
+	debug("syz_mptcp_subflow_stall: subflow %ld target %d mode %d dirs %d delay %d hold %d: pushed %ld, %d left held\n",
+	      sub_slot, target, mode, dirs, delay_ms, hold_ms, pushed, left);
+	(void)left;
+	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_subflow_fail
+#ifndef MPTCP_FULL_INFO
+#define MPTCP_FULL_INFO 4
+#endif
+#define MPTCP_FAIL_MAX_SUBFLOWS 8
+#define MPTCP_FAIL_WAIT_MS 3500
+// TCP states as tcp_info reports them (include/net/tcp_states.h).
+#define MPTCP_FAIL_TCP_ESTABLISHED 1
+#define MPTCP_FAIL_TCP_CLOSE 7
+
+// Prefix of struct mptcp_full_info (uapi <linux/mptcp.h>, MPTCP_FULL_INFO): only
+// the header is passed, so the kernel fills the two arrays and skips mptcp_info.
+struct syz_mptcp_full_info_hdr {
+	uint32 size_tcpinfo_kernel;
+	uint32 size_tcpinfo_user;
+	uint32 size_sfinfo_kernel;
+	uint32 size_sfinfo_user;
+	uint32 num_subflows;
+	uint32 size_arrays_user;
+	uint64 subflow_info;
+	uint64 tcp_info;
+};
+
+// struct mptcp_subflow_info: a u32 id, then the local and remote addresses as
+// sockaddr_storage (8-byte aligned, as __kernel_sockaddr_storage is).
+struct syz_mptcp_sfinfo {
+	uint32 id;
+	struct sockaddr_storage local;
+	struct sockaddr_storage remote;
+};
+
+// Reads the msk's subflows: each one's id, IPv4 addresses and TCP state (the first
+// byte of struct tcp_info). Returns their number (at most max), or -1.
+static int mptcp_fail_list(int fd, struct syz_mptcp_sfinfo* sf, uint8* state, int max)
+{
+	uint8 ti[MPTCP_FAIL_MAX_SUBFLOWS][8];
+	struct syz_mptcp_full_info_hdr h;
+	socklen_t len = sizeof(h);
+
+	memset(&h, 0, sizeof(h));
+	memset(sf, 0, sizeof(*sf) * max);
+	h.size_tcpinfo_user = sizeof(ti[0]);
+	h.size_sfinfo_user = sizeof(*sf);
+	h.size_arrays_user = max;
+	h.subflow_info = (uint64)(long)sf;
+	h.tcp_info = (uint64)(long)ti;
+	if (getsockopt(fd, SOL_MPTCP, MPTCP_FULL_INFO, &h, &len) < 0)
+		return -1;
+	int n = h.num_subflows < (uint32)max ? (int)h.num_subflows : max;
+	for (int i = 0; i < n; i++)
+		state[i] = ti[i][0];
+	return n;
+}
+
+// Makes one subflow of a client end on the in-kernel PM fail the way a dead path
+// does: TCP gives up on it with a timeout error. The client msk gets the shortest
+// keepalive (1s idle, 1 probe, 1s apart), which MPTCP applies to every subflow,
+// while all packets of the chosen subflow are dropped. Its probe goes unanswered
+// and TCP closes it with ETIMEDOUT about 2s later; the other subflows answer their
+// probes and stay up. When the in-kernel PM closes the failed subflow it can
+// re-create it (the subflow-retries limit) if another subflow can still send.
+// An injected reset would not do: a reset means the path works, and the PM does
+// not retry it. Bounded by MPTCP_FAIL_WAIT_MS; the keepalive settings are put back
+// and the drop removed before returning.
+static long syz_mptcp_subflow_fail(volatile long a0, volatile long a1)
+{
+	long slot = a0;
+	int which = (int)(uint8)a1;
+	struct syz_mptcp_sfinfo sf[MPTCP_FAIL_MAX_SUBFLOWS];
+	uint8 state[MPTCP_FAIL_MAX_SUBFLOWS];
+	int one = 1, zero = 0;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE)
+		return -1;
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
+	uint32 gen = __atomic_load_n(&pair->generation, __ATOMIC_ACQUIRE);
+	if (!mptcp_pair_still(pair, gen) || pair->client_fd < 0)
+		return -1;
+	// The retry is in-kernel PM behaviour; the description only hands this call a
+	// kernel-PM client end.
+	if (!pair->client_kernel_pm) {
+		debug("syz_mptcp_subflow_fail: pair %ld client runs the userspace PM\n", slot);
+		return -1;
+	}
+	int fd = pair->client_fd;
+
+	// Pick the which-th established IPv4 subflow.
+	int n = mptcp_fail_list(fd, sf, state, MPTCP_FAIL_MAX_SUBFLOWS);
+	int est[MPTCP_FAIL_MAX_SUBFLOWS], nest = 0;
+	for (int i = 0; i < n; i++) {
+		if (state[i] == MPTCP_FAIL_TCP_ESTABLISHED && sf[i].local.ss_family == AF_INET)
+			est[nest++] = i;
+	}
+	if (nest == 0) {
+		debug("syz_mptcp_subflow_fail: pair %ld: no established subflow (%d listed, errno %d)\n", slot, n, errno);
+		return -1;
+	}
+	struct syz_mptcp_sfinfo* t = &sf[est[which % nest]];
+	uint32 id = t->id;
+	struct sockaddr_in* l = (struct sockaddr_in*)&t->local;
+	struct sockaddr_in* r = (struct sockaddr_in*)&t->remote;
+
+	syz_nfq_hook = syz_mptcp_mut_hook; // the engine contract: set before setup
+	if (syz_nfq_setup() != 0) {
+		debug("syz_mptcp_subflow_fail: NFQUEUE setup failed\n");
+		return -1;
+	}
+	int st = syz_nfq_stall_begin(l->sin_addr.s_addr, l->sin_port, r->sin_addr.s_addr, r->sin_port,
+				     SYZ_NFQ_STALL_A_TO_B | SYZ_NFQ_STALL_B_TO_A, SYZ_NFQ_STALL_DROP, 0);
+	if (st < 0)
+		return -1;
+
+	// Save the msk's keepalive settings (the getsockopt values include the netns
+	// defaults), then arm the shortest keepalive.
+	int idle = 0, intvl = 0, cnt = 0, ka = 0;
+	socklen_t ol = sizeof(int);
+	getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka, &ol);
+	ol = sizeof(int);
+	getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &ol);
+	ol = sizeof(int);
+	getsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, &ol);
+	ol = sizeof(int);
+	getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, &ol);
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &one, sizeof(one));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &one, sizeof(one));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &one, sizeof(one));
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+
+	// Wait until the subflow is closed (gone from the list, or listed as closed:
+	// the initial subflow stays listed).
+	bool closed = false;
+	uint64 end = mptcp_now_ms() + MPTCP_FAIL_WAIT_MS;
+	while (mptcp_now_ms() < end && mptcp_pair_still(pair, gen)) {
+		usleep(50000);
+		n = mptcp_fail_list(fd, sf, state, MPTCP_FAIL_MAX_SUBFLOWS);
+		if (n < 0)
+			break;
+		closed = true;
+		for (int i = 0; i < n; i++) {
+			if (sf[i].id == id && state[i] != MPTCP_FAIL_TCP_CLOSE)
+				closed = false;
+		}
+		if (closed)
+			break;
+	}
+
+	if (mptcp_pair_still(pair, gen)) {
+		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, ka ? &one : &zero, sizeof(int));
+		if (idle > 0)
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+		if (intvl > 0)
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+		if (cnt > 0)
+			setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+	}
+	syz_nfq_stall_end(st);
+	debug("syz_mptcp_subflow_fail: pair %ld subflow id %u %s\n", slot, id, closed ? "closed" : "still open");
+	return closed ? 0 : -1;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_set_sysctl
+// Knobs of syz_mptcp_set_sysctl (harness constants, mirrored in .txt + .const).
+#define MPTCP_SYSCTL_KNOB_SCHEDULER 0
+#define MPTCP_SYSCTL_KNOB_PATH_MANAGER 1
+#define MPTCP_SYSCTL_KNOB_CHECKSUM 2
+#define MPTCP_SYSCTL_KNOB_ADD_ADDR_TIMEOUT 3
+#define MPTCP_SYSCTL_KNOB_CLOSE_TIMEOUT 4
+#define MPTCP_SYSCTL_KNOB_STALE_LOSS_CNT 5
+#define MPTCP_SYSCTL_KNOB_ALLOW_JOIN_ID0 6
+#define MPTCP_SYSCTL_KNOB_BLACKHOLE_TIMEOUT 7
+#define MPTCP_SYSCTL_KNOB_SYN_RETRANS 8
+#define MPTCP_SYSCTL_KNOB_ADD_ADDR_V6_PORT_DROP_TS 9
+
+struct mptcp_sysctl_knob {
+	const char* name; // under /proc/sys/net/mptcp/
+	uint32 max; // values are taken modulo max+1; 0 for a name from a list
+	const char* list; // file with the valid names, for string knobs
+};
+
+// `enabled` is not offered: turning MPTCP off breaks every other call. Nor is
+// pm_type: it is deprecated (since v6.15) in favour of path_manager, and writing
+// it rewrites path_manager too. Numeric ranges stay where a connection still
+// behaves (timeouts in seconds).
+static const struct mptcp_sysctl_knob mptcp_sysctl_knobs[] = {
+    {"scheduler", 0, "available_schedulers"},
+    {"path_manager", 0, "available_path_managers"},
+    {"checksum_enabled", 1, NULL},
+    {"add_addr_timeout", 120, NULL},
+    {"close_timeout", 120, NULL},
+    {"stale_loss_cnt", 16, NULL},
+    {"allow_join_initial_addr_port", 1, NULL},
+    {"blackhole_timeout", 3600, NULL},
+    {"syn_retrans_before_tcp_fallback", 10, NULL},
+    {"add_addr_v6_port_drop_ts", 1, NULL},
+};
+
+// Writes one MPTCP sysctl with a valid value while whatever else the program runs
+// keeps running: names come from the kernel's own list of available ones, numbers
+// from the knob's range. The value stays until the executor's per-program netns
+// reset restores it (every knob here is in net_sysctls[], common_linux.h). The
+// write takes mptcp_netns_lock, which pair_init holds while it sets each end's PM
+// and creates the pair: pair_init saves and restores path_manager, checksum and
+// allow_join_initial_addr_port around its handshake, so a written value survives
+// it and governs msks created by plain socket() calls, and a write never lands
+// inside a handshake.
+static long syz_mptcp_set_sysctl(volatile long a0, volatile long a1)
+{
+	uint32 knob = (uint32)a0;
+	uint32 val = (uint32)a1;
+	char path[128], prev[64], value[64];
+
+	if (knob >= sizeof(mptcp_sysctl_knobs) / sizeof(mptcp_sysctl_knobs[0]))
+		return -1;
+	const struct mptcp_sysctl_knob* k = &mptcp_sysctl_knobs[knob];
+	if (k->list) {
+		// Pick the val-th name (modulo their number) of the space-separated list.
+		char names[256];
+		snprintf(path, sizeof(path), "/proc/sys/net/mptcp/%s", k->list);
+		if (!mptcp_sysctl_read(path, names, sizeof(names)))
+			return -1;
+		int count = 0;
+		for (char* p = names; *p;) {
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (!*p)
+				break;
+			count++;
+			while (*p && *p != ' ' && *p != '\t')
+				p++;
+		}
+		if (count == 0)
+			return -1;
+		int want = val % count, i = 0;
+		value[0] = 0;
+		for (char* p = names; *p;) {
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (!*p)
+				break;
+			char* s = p;
+			while (*p && *p != ' ' && *p != '\t')
+				p++;
+			if (i++ == want) {
+				int l = p - s < (int)sizeof(value) - 1 ? p - s : (int)sizeof(value) - 1;
+				memcpy(value, s, l);
+				value[l] = 0;
+				break;
+			}
+		}
+	} else {
+		snprintf(value, sizeof(value), "%u", val % (k->max + 1));
+	}
+	snprintf(path, sizeof(path), "/proc/sys/net/mptcp/%s", k->name);
+
+	mptcp_spin_lock(&mptcp_netns_lock);
+	// Read first: the handler's read side runs too, and the log shows the change.
+	if (!mptcp_sysctl_read(path, prev, sizeof(prev)))
+		prev[0] = 0;
+	bool ok = mptcp_sysctl_write(path, value);
+	mptcp_spin_unlock(&mptcp_netns_lock);
+	debug("syz_mptcp_set_sysctl: %s: %s -> %s (%s)\n", k->name, prev, value, ok ? "ok" : "failed");
+	return ok ? 0 : -1;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_netns_cycle
+#include <net/if.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/ioctl.h>
+
+#define MPTCP_NETNS_MAX_CONNS 4
+// Flags (harness constants, mirrored in .txt + .const).
+#define MPTCP_NETNS_ENDPOINTS 1 // in-kernel PM endpoints: a subflow one, a signal one with a port
+#define MPTCP_NETNS_ABORT 2 // close with SO_LINGER{1,0} (reset) instead of a FIN
+#define MPTCP_NETNS_UNREAD 4 // leave data unread in both directions
+#define MPTCP_NETNS_SIGNAL_PORT 26116
+
+// In-kernel PM configuration inside the new netns, over a genl socket created
+// there (a netlink socket acts in the netns it was created in).
+static void mptcp_netns_add_endpoints(void)
+{
+	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+	if (sock < 0)
+		return;
+	struct timeval rtv = {1, 0};
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+	uint16 family = 0;
+	uint32 grp = 0;
+	if (mptcp_pm_resolve_family(sock, &family, &grp) < 0) {
+		close(sock);
+		return;
+	}
+	struct mptcp_nlmsg m;
+	struct genlmsghdr genlhdr;
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.version = MPTCP_PM_VER;
+	genlhdr.cmd = MPTCP_PM_CMD_SET_LIMITS;
+	uint32 two = 2;
+	mptcp_nlmsg_init(&m, family, &genlhdr, sizeof(genlhdr));
+	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_RCV_ADD_ADDRS, &two, sizeof(two));
+	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_SUBFLOWS, &two, sizeof(two));
+	mptcp_nlmsg_send(&m, sock);
+	// id 1: subflow endpoint 127.0.1.1; id 2: signal endpoint 127.0.1.2 with a port
+	// (the kernel opens its own listener on it).
+	uint32 ifindex = if_nametoindex("lo");
+	for (int i = 1; i <= 2; i++) {
+		uint8 id = i;
+		uint16 fam = AF_INET;
+		uint32 addr_be = htonl(0x7f000100 + i);
+		uint32 flags = i == 1 ? MPTCP_PM_ADDR_FLAG_SUBFLOW : MPTCP_PM_ADDR_FLAG_SIGNAL;
+		uint16 port = MPTCP_NETNS_SIGNAL_PORT;
+		struct nlattr* nest = NULL;
+		genlhdr.cmd = MPTCP_PM_CMD_ADD_ADDR;
+		mptcp_nlmsg_init(&m, family, &genlhdr, sizeof(genlhdr));
+		mptcp_nlmsg_nest_begin(&m, &nest, MPTCP_PM_ATTR_ADDR | NLA_F_NESTED);
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ID, &id, sizeof(id));
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam, sizeof(fam));
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ADDR4, &addr_be, sizeof(addr_be));
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_IF_IDX, &ifindex, sizeof(ifindex));
+		if (i == 2)
+			mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_PORT, &port, sizeof(port));
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FLAGS, &flags, sizeof(flags));
+		mptcp_nlmsg_nest_end(&m, nest);
+		if (mptcp_nlmsg_send(&m, sock) < 0) {
+			debug("mptcp_netns_add_endpoints: endpoint %d: %d\n", i, errno);
+		}
+	}
+	close(sock);
+}
+
+// The connections of syz_mptcp_netns_cycle, in the current netns. Every fd opened
+// is recorded in fds, for the caller to close.
+static long mptcp_netns_connect(int nconns, int flags, int* fds, int* nfds)
+{
+	struct sockaddr_in sa;
+	socklen_t salen = sizeof(sa);
+	char buf[2048];
+
+	// connect() and accept() honour the send/receive timeouts: bound both, so a
+	// lost handshake packet cannot hold the call for the SYN retry period.
+	struct timeval tv = {0, 300000};
+	int lfd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+	if (lfd < 0)
+		return -1;
+	fds[(*nfds)++] = lfd;
+	setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(lfd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || getsockname(lfd, (struct sockaddr*)&sa, &salen) < 0 ||
+	    listen(lfd, MPTCP_NETNS_MAX_CONNS) < 0)
+		return -1;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	memset(buf, 'x', sizeof(buf));
+	for (int i = 0; i < nconns; i++) {
+		int c = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+		if (c < 0)
+			return -1;
+		fds[(*nfds)++] = c;
+		setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+		if (connect(c, (struct sockaddr*)&sa, sizeof(sa)) < 0)
+			return -1;
+		int s = accept(lfd, NULL, NULL);
+		if (s < 0)
+			return -1;
+		fds[(*nfds)++] = s;
+		send(c, buf, sizeof(buf), MSG_DONTWAIT | MSG_NOSIGNAL);
+		send(s, buf, sizeof(buf), MSG_DONTWAIT | MSG_NOSIGNAL);
+		if (!(flags & MPTCP_NETNS_UNREAD)) {
+			recv(s, buf, sizeof(buf), MSG_DONTWAIT);
+			recv(c, buf, sizeof(buf), MSG_DONTWAIT);
+		}
+	}
+	// Give the in-kernel PM a moment to act on the new connections (it runs from
+	// the msk worker once they are fully established).
+	if (flags & MPTCP_NETNS_ENDPOINTS)
+		usleep(20000);
+	return 0;
+}
+
+// Creates the namespace from a helper thread, brings its loopback up, and returns
+// an fd for it. A new
+// namespace initializes every per-netns subsystem of the kernel, far more code
+// than the kcov buffer holds: done on the calling thread, it would fill the
+// call's coverage with that (truncating what the MPTCP connections reach) and,
+// twice in one program, overflow the executor's coverage output. The helper
+// thread has no kcov, so only what the call does inside the namespace counts.
+static void* mptcp_netns_create_thread(void* arg)
+{
+	int* fd = (int*)arg;
+	*fd = -1;
+	if (unshare(CLONE_NEWNET) != 0)
+		return NULL;
+	// Bringing the loopback device up is generic device code too (addrconf,
+	// multicast, ...), and as much coverage again: also done here.
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s >= 0) {
+		struct ifreq ifr;
+		memset(&ifr, 0, sizeof(ifr));
+		strcpy(ifr.ifr_name, "lo");
+		if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+			ifr.ifr_flags |= IFF_UP;
+			ioctl(s, SIOCSIFFLAGS, &ifr);
+		}
+		close(s);
+	}
+	*fd = open("/proc/thread-self/ns/net", O_RDONLY);
+	return NULL;
+}
+
+// Creates a network namespace (mptcp_net_init runs, on a helper thread), brings its loopback up,
+// connects nconns MPTCP pairs in it (optionally with in-kernel PM endpoints, so the
+// PM adds subflows and opens its own listener) and pushes data, then returns to
+// the caller's netns and closes everything at once. The user sockets were the
+// last references to the namespace, so it is destroyed (cleanup_net ->
+// mptcp_net_exit and the PM's per-netns exit) while the connections it held are
+// still closing: subflows, kernel listener, timers. Only the calling thread
+// switches namespace, and it switches back before anything else runs on it.
+static long syz_mptcp_netns_cycle(volatile long a0, volatile long a1)
+{
+	int nconns = (int)(uint8)a0;
+	int flags = (int)a1;
+	int fds[1 + 2 * MPTCP_NETNS_MAX_CONNS];
+	int nfds = 0;
+	long ret = -1;
+
+	if (nconns < 1)
+		nconns = 1;
+	if (nconns > MPTCP_NETNS_MAX_CONNS)
+		nconns = MPTCP_NETNS_MAX_CONNS;
+	int orig = open("/proc/thread-self/ns/net", O_RDONLY);
+	if (orig < 0)
+		return -1;
+	int nsfd = -1;
+	pthread_t th;
+	if (pthread_create(&th, NULL, mptcp_netns_create_thread, &nsfd) != 0) {
+		close(orig);
+		return -1;
+	}
+	pthread_join(th, NULL);
+	if (nsfd < 0 || setns(nsfd, CLONE_NEWNET) < 0) {
+		debug("syz_mptcp_netns_cycle: create/enter netns: %d\n", errno);
+		if (nsfd >= 0)
+			close(nsfd);
+		close(orig);
+		return -1;
+	}
+	// From here the calling thread and the sockets below hold the namespace.
+	close(nsfd);
+	if (flags & MPTCP_NETNS_ENDPOINTS)
+		mptcp_netns_add_endpoints();
+
+	ret = mptcp_netns_connect(nconns, flags, fds, &nfds);
+	if (setns(orig, CLONE_NEWNET) < 0)
+		fail("syz_mptcp_netns_cycle: setns back to the original netns failed");
+	close(orig);
+	for (int i = 0; i < nfds; i++) {
+		if (flags & MPTCP_NETNS_ABORT) {
+			struct linger lg;
+			lg.l_onoff = 1;
+			lg.l_linger = 0;
+			setsockopt(fds[i], SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+		}
+		close(fds[i]);
+	}
+	debug("syz_mptcp_netns_cycle: %d conns, flags 0x%x, %d fds: %ld\n", nconns, flags, nfds, ret);
+	return ret;
 }
 #endif
 
