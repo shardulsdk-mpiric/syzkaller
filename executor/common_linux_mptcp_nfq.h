@@ -777,6 +777,11 @@ static inline bool syz_nfq_stall_take(uint16 q, uint32 id, const uint8* pkt, int
 	if (slot < 0)
 		return false;
 	struct syz_nfq_stall* st = &syz_nfq_stalls[slot];
+	// Overflow: with SYZ_NFQ_HELD_MAX packets already held (all stalls together),
+	// a further one is dropped, not held and not accepted out of order. So the
+	// worker never holds more than SYZ_NFQ_HELD_MAX queue entries (well under the
+	// kernel's default queue length of 1024, beyond which fail-open accepts), and
+	// TCP retransmits what was dropped, as after a full bottleneck queue.
 	if (st->mode == SYZ_NFQ_STALL_DROP || syz_nfq_held_n >= SYZ_NFQ_HELD_MAX) {
 		syz_nfq_send_verdict(syz_nfq_fd, q, id, NF_DROP, NULL, 0);
 		return true;
@@ -975,9 +980,30 @@ static inline void syz_nfq_cleanup(void)
 // The subsystem layer sets syz_nfq_hook before calling syz_nfq_setup().
 static int syz_nfq_setup_locked(void);
 static int syz_nfq_setup_lock;
+// Where and why the last setup attempt failed (written under the setup lock).
+static const char* syz_nfq_fail_step;
+static int syz_nfq_fail_errno;
+static int syz_nfq_setup_failures;
 
 // Idempotent and safe to call from several threads at once (a mutated join and a
-// stall can both be the first user).
+// stall can both be the first user): the fast path is an acquire load of
+// syz_nfq_setup_done, which is release-stored only after the rule is installed and
+// the worker started; everything else runs under the setup lock, which re-checks
+// it, so exactly one thread installs and a failed attempt leaves the state clean
+// for the next caller to retry.
+//
+// A failure is never silent, so a broken mutation environment cannot pass for a
+// working one:
+//  - The kernel lacks the support the layer needs (no nfnetlink, or neither the
+//    nft queue expression nor the xtables NFQUEUE target): SYZFAIL. syz-manager
+//    disables every call that reaches here on such a kernel (pkg/vminfo,
+//    linuxSyzMptcpNfqueueSupported), so this means the check and the kernel
+//    disagree, an environment error that has to stop the run, not a program
+//    result.
+//  - Anything else (EPERM, ENOBUFS, an nft batch aborted by a concurrent change,
+//    ...) can be transient and specific to one program, so it must not kill the
+//    executor: a numbered message on stderr, which reaches the VM log the manager
+//    keeps, and the calling op returns -1.
 static inline int syz_nfq_setup(void)
 {
 	if (__atomic_load_n(&syz_nfq_setup_done, __ATOMIC_ACQUIRE))
@@ -985,7 +1011,17 @@ static inline int syz_nfq_setup(void)
 	while (__atomic_exchange_n(&syz_nfq_setup_lock, 1, __ATOMIC_ACQUIRE))
 		usleep(50);
 	int ret = syz_nfq_setup_locked();
+	const char* step = syz_nfq_fail_step;
+	int err = syz_nfq_fail_errno;
+	int failures = ret < 0 ? ++syz_nfq_setup_failures : 0;
 	__atomic_store_n(&syz_nfq_setup_lock, 0, __ATOMIC_RELEASE);
+	if (ret < 0) {
+		if ((err == EPROTONOSUPPORT && strcmp(step, "socket") == 0) ||
+		    (err == ENOENT && strcmp(step, "rule") == 0))
+			failmsg("MPTCP NFQUEUE layer: the kernel lacks NFQUEUE support", "step=%s errno=%d", step, err);
+		fprintf(stderr, "syz_nfq_setup: %s failed: errno=%d (failure %d in this process)\n", step, err, failures);
+		errno = err;
+	}
 	return ret;
 }
 
@@ -995,9 +1031,12 @@ static int syz_nfq_setup_locked(void)
 
 	if (syz_nfq_setup_done)
 		return 0;
+	syz_nfq_fail_step = "socket";
 	syz_nfq_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
-	if (syz_nfq_fd < 0)
+	if (syz_nfq_fd < 0) {
+		syz_nfq_fail_errno = errno;
 		return -1;
+	}
 	// Ask the kernel to drop silently rather than raise ENOBUFS (which would
 	// otherwise surface as a recv error) on rcvbuf overrun, and grow the
 	// receive buffer so a burst of held packets is less likely to overrun it.
@@ -1010,12 +1049,15 @@ static int syz_nfq_setup_locked(void)
 	}
 	memset(&sa, 0, sizeof(sa));
 	sa.nl_family = AF_NETLINK;
+	syz_nfq_fail_step = "bind";
 	if (bind(syz_nfq_fd, (struct sockaddr*)&sa, sizeof(sa)) < 0)
 		goto fail;
 	(void)syz_nfq_config_cmd(syz_nfq_fd, 0, NFQNL_CFG_CMD_PF_UNBIND, AF_INET);
 	(void)syz_nfq_config_cmd(syz_nfq_fd, 0, NFQNL_CFG_CMD_PF_BIND, AF_INET);
+	syz_nfq_fail_step = "queue bind";
 	if (syz_nfq_config_cmd(syz_nfq_fd, NFQ_QUEUE_NUM, NFQNL_CFG_CMD_BIND, AF_UNSPEC) < 0)
 		goto fail;
+	syz_nfq_fail_step = "queue params";
 	if (syz_nfq_config_params(syz_nfq_fd, NFQ_QUEUE_NUM, NFQNL_COPY_PACKET, 0xffff) < 0)
 		goto fail;
 	// Fail-open: if the queue can't be served, accept rather than drop. Best
@@ -1034,18 +1076,24 @@ static int syz_nfq_setup_locked(void)
 	// died/exited abnormally) matching packets bypass the queue instead of
 	// being dropped (blackholing lo TCP). Raw nftables netlink on this same
 	// socket: no iptables/nft binary needed (a csource reproducer has none).
-	if (syz_nfq_install_rule(syz_nfq_fd) < 0) {
-		debug("syz_nfq_setup: nft rule install failed errno=%d (CAP_NET_ADMIN? CONFIG_NF_TABLES?)\n", errno);
+	syz_nfq_fail_step = "rule";
+	if (syz_nfq_install_rule(syz_nfq_fd) < 0)
 		goto fail;
-	}
 	syz_nfq_rule_installed = 1;
 	atexit(syz_nfq_cleanup);
-	if (pthread_create(&syz_nfq_worker_thread, NULL, syz_nfq_worker_loop, NULL) != 0)
-		goto fail;
+	syz_nfq_fail_step = "worker";
+	{
+		int perr = pthread_create(&syz_nfq_worker_thread, NULL, syz_nfq_worker_loop, NULL);
+		if (perr != 0) {
+			errno = perr;
+			goto fail;
+		}
+	}
 	syz_nfq_worker_started = 1;
 	__atomic_store_n(&syz_nfq_setup_done, 1, __ATOMIC_RELEASE);
 	return 0;
 fail:
+	syz_nfq_fail_errno = errno;
 	syz_nfq_cleanup();
 	return -1;
 }
