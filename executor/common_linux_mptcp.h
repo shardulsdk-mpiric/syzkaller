@@ -394,6 +394,23 @@ struct syz_mptcp_info_short {
 static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_stall || __NR_syz_mptcp_subflow_fail
+// Wire operations (the NFQUEUE layer) do not reach a two-netns pair yet: the rule
+// matches loopback egress, and a two-netns pair's segments leave by veth-c
+// (client-egress ops follow in a later step, THMAC_FLIP, the server's SYN-ACK, after
+// that). An op that needs one says so, never silently: a numbered line on stderr
+// (not debug(), which C reproducers and default runs strip), which reaches the VM
+// log, so a coverage read or a reproducer does not take the op as applied.
+static int mptcp_two_netns_no_wire_ops;
+static void mptcp_two_netns_no_wire_op(const char* call, long pair_slot, const char* what, long value)
+{
+	int n = __atomic_add_fetch(&mptcp_two_netns_no_wire_ops, 1, __ATOMIC_RELAXED);
+	fprintf(stderr, "%s: pair %ld is two-netns, %s %ld not applied: no wire ops over veth yet "
+			"(drop %d in this process)\n",
+		call, pair_slot, what, value, n);
+}
+#endif
+
 // Which of the five pseudo-syscalls in this file end up compiled in
 // determines which of the shared pool/netlink/setup helpers below are
 // reachable. pkg/csource's per-pseudo-syscall smoke test
@@ -2720,14 +2737,11 @@ static long syz_mptcp_join_subflow(volatile long a0, volatile long a1, volatile 
 		addr_id = 1;
 	remote_addr_be = pair->server_addr_be;
 
-	// Wire mutation does not reach a two-netns pair yet: the NFQUEUE rule matches
-	// loopback egress, and a two-netns pair's segments leave by veth-c. The client-
-	// egress ops follow in a later step, and THMAC_FLIP (server SYN-ACK, egress of
-	// the peer netns) after that. Until then the join runs unmutated, rather than
-	// arming an engine that never sees a packet; a coverage read of the mutation
-	// paths must not count two-netns joins.
+	// Wire mutation does not reach a two-netns pair yet (see
+	// mptcp_two_netns_no_wire_op). The join still runs, unmutated, so the program
+	// keeps its subflow and the join/PM paths; the dropped mutation is reported.
 	if (pair->two_netns && mut_op != MPTCP_MUT_NONE) {
-		debug("syz_mptcp_join_subflow: pair=%ld two netns, mut_op %d not applied\n", pair_slot, mut_op);
+		mptcp_two_netns_no_wire_op("syz_mptcp_join_subflow", pair_slot, "mut_op", mut_op);
 		mut_op = MPTCP_MUT_NONE;
 	}
 
@@ -4068,10 +4082,10 @@ static long syz_mptcp_subflow_stall(volatile long a0, volatile long a1, volatile
 		debug("syz_mptcp_subflow_stall: subflow %ld: pair gone\n", sub_slot);
 		return -1;
 	}
-	// The NFQUEUE layer does not reach a two-netns pair yet (its rule matches
-	// loopback egress); see syz_mptcp_join_subflow.
+	// The stall is the NFQUEUE layer, which does not reach a two-netns pair yet (see
+	// mptcp_two_netns_no_wire_op): nothing is done, and that is reported.
 	if (pair->two_netns) {
-		debug("syz_mptcp_subflow_stall: subflow %ld: pair is two-netns, no stall over veth yet\n", sub_slot);
+		mptcp_two_netns_no_wire_op("syz_mptcp_subflow_stall", sub->pair_slot, "stall mode", mode);
 		return -1;
 	}
 	if (mode < MPTCP_STALL_DELAY || mode > MPTCP_STALL_DROP)
@@ -4224,10 +4238,11 @@ static long syz_mptcp_subflow_fail(volatile long a0, volatile long a1)
 		debug("syz_mptcp_subflow_fail: pair %ld client runs the userspace PM\n", slot);
 		return -1;
 	}
-	// The drop goes through the NFQUEUE layer, which does not reach a two-netns
-	// pair yet (its rule matches loopback egress); see syz_mptcp_join_subflow.
+	// The path failure is a drop in the NFQUEUE layer, which does not reach a
+	// two-netns pair yet (see mptcp_two_netns_no_wire_op): nothing is done, and that
+	// is reported.
 	if (pair->two_netns) {
-		debug("syz_mptcp_subflow_fail: pair %ld is two-netns, no drop over veth yet\n", slot);
+		mptcp_two_netns_no_wire_op("syz_mptcp_subflow_fail", slot, "drop of subflow", which);
 		return -1;
 	}
 	int fd = pair->client_fd;

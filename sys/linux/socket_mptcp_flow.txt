@@ -35,8 +35,9 @@
 # commands go out from the peer netns); the in-kernel PM ops choose the netns
 # structurally ($client / $server variants). Not yet on a two-netns pair: wire
 # operations through the NFQUEUE layer (join_subflow's mut_op is not applied,
-# subflow_stall and subflow_fail fail), and listener_close_race (self-contained,
-# always single-netns).
+# subflow_stall and subflow_fail do nothing and fail; each prints a numbered "not
+# applied" line on stderr), and listener_close_race (self-contained, always
+# single-netns).
 
 # Invalid default (0xff..ff -> -1 as the executor's long slot index, which its
 # `slot < 0` guard rejects): a defaulted/orphaned handle must NOT alias live
@@ -95,8 +96,9 @@ syz_mptcp_pair_close(pair mptcp_pair)
 # harness-authored HMAC that crossed subflow_hmac_valid -- reaching the
 # subflow_syn_recv_sock ref-transfer region. Same-length rewrite. Like SELFVERIFY it
 # needs MPTCP_INIT_CAPTURE_KEYS (else it DROPs the ACK, fail-loud -> no accept).
-# On a two-netns pair mut_op is not applied yet (the join runs unmutated): the
-# engine hooks loopback egress, and THMAC_FLIP needs the server netns's egress.
+# On a two-netns pair mut_op is not applied yet (the join runs unmutated and prints a
+# numbered "not applied" line on stderr): the engine hooks loopback egress, and
+# THMAC_FLIP needs the server netns's egress.
 # Harness-only constants (see .const + #define).
 define MPTCP_MUT_NONE	0
 define MPTCP_MUT_HMAC_FLIP	1
