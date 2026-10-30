@@ -1,7 +1,7 @@
 From 8993335a5d58d724e0cde9be228ccdc485dea531 Mon Sep 17 00:00:00 2001
-From: x <x@y>
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 30 Oct 2026 09:56:36 +0530
-Subject: [PATCH 7/8] mptcp: extend the kcov section over the whole passive
+Subject: [PATCH 7/9] mptcp: extend the kcov section over the whole passive
  accept path
 
 subflow_syn_recv_sock() is the receive-softirq entry for every passive

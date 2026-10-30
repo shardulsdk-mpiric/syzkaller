@@ -1,5 +1,5 @@
 From 5f5211a7c0387c987d0849e7e4393033dcd4eb63 Mon Sep 17 00:00:00 2001
-From: x <x@y>
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
 Date: Fri, 30 Oct 2026 11:01:04 +0530
 Subject: [PATCH 9/9] mptcp: cover the port-join announced-listener check on
  the SYN path
