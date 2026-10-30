@@ -5,11 +5,11 @@
 # keeps carrying data on the other subflow. The endpoint is flushed at the end, so
 # a repeated run (C reproducer repeat mode) can add it again.
 
-syz_mptcp_pm_set_limits(0x2, 0x0, 0x1)
+syz_mptcp_pm_set_limits(0x2, 0x0, 0x1, 0x0)
 r0 = syz_mptcp_pm_add_endpoint$subflow(0x0, 0x2, 0x0, 0x0)
 r1 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x3, &AUTO=<r2=>0x0, 0x0)
 syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
 syz_mptcp_subflow_fail(r2, 0x1)
 syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
 syz_mptcp_pair_close(r1)
-syz_mptcp_pm_flush_endpoints()
+syz_mptcp_pm_flush_endpoints(0x0)

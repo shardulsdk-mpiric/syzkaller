@@ -83,11 +83,38 @@ Multiple `syz_mptcp_join_subflow` calls can run on one pair (each yields a disti
 `mptcp_subflow`), so multi-subflow programs are expressible; the kernel's concurrent
 subflow cap is raised via `sendmsg$MPTCP_PM_CMD_SET_LIMITS`.
 
+### Two-netns pairs
+
+By default both ends of a pair share the executor's network namespace (loopback),
+so they share one in-kernel PM endpoint table and one set of `net.mptcp` sysctls.
+`pair_init` flag `MPTCP_INIT_PEER_NETNS` instead puts the server end in a peer netns
+joined to the executor's netns by a veth pair (`veth-c` 10.0.0.1 ↔ `veth-s`
+10.0.0.2), so each end has its own PM state, as two hosts do. RM_ADDR and ADD_ADDR
+then reach a peer with its own PM.
+
+- The peer netns is built once per executor proc (on first use, by a helper thread
+  outside the program's coverage) and, with `net_reset`, kept by the loop process
+  and swept back to its baseline before each program that touched it.
+- In-kernel PM configuration chooses the netns structurally:
+  `syz_mptcp_pm_*$client_*` (veth-c, executor netns) and `$server_*` (veth-s, peer
+  netns), plus `$server` variants of `set_limits`, `flush_endpoints`, `get_limits`
+  and the kernel-table dump. The add's last argument carries the side (512 client,
+  1024 server, ORed with 1 for a port), and the endpoint handle is that side bit
+  ORed with the per-table handle. The bare variants keep the loopback endpoints of
+  single-netns pairs.
+- Userspace-PM ops on a two-netns pair's server end (announce, remove, set_flags,
+  get, dump) are issued from the peer netns, and announce the end's veth aliases.
+- Not yet on a two-netns pair: wire operations through the NFQUEUE layer
+  (`join_subflow`'s `mut_op` is not applied; `subflow_stall` and `subflow_fail`
+  fail), and `listener_close_race`, which stays single-netns.
+- IPv4 only.
+
 ## Kernel requirements
 
 Build the target kernel with (see `dashboard/config/linux/` for base configs):
 
 - `CONFIG_MPTCP=y`, `CONFIG_MPTCP_IPV6=y`
+- `CONFIG_VETH=y` for two-netns pairs (`MPTCP_INIT_PEER_NETNS`)
 - `CONFIG_KASAN=y`, `CONFIG_KCOV=y`, `CONFIG_KCOV_ENABLE_COMPARISONS=y`
 - `CONFIG_NF_TABLES=y`, `CONFIG_NFT_QUEUE=y`, `CONFIG_NETFILTER_NETLINK_QUEUE=y`
   **built-in** — the mutation layer (and `subflow_stall`/`subflow_fail`) installs its

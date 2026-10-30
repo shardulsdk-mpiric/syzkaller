@@ -1,0 +1,32 @@
+# Two-netns pair with both ends on the userspace PM: the server end's event listener
+# and genl commands live in the peer netns. A MP_JOIN subflow from the client's veth
+# alias reaches the server over the veth and is marked backup; each end announces
+# an address (the server's with its own listener, created in the peer netns) and
+# reads its list back; the announcements and the subflow's address are removed (the
+# kernel then closes that subflow, so it is not destroyed again); a raw MP_JOIN SYN
+# is injected cross-veth; the server end is disconnected and closed.
+# A second two-netns pair mixes the PMs (kernel-PM server, userspace client) and
+# takes a join too.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x40, 0x0, &AUTO=<r10=>0x0, &AUTO=<r11=>0x0)
+r1 = syz_mptcp_join_subflow(r10, 0x1, 0x0, 0x0)
+syz_mptcp_subflow_info(r1)
+syz_mptcp_pm_set_flags$subflow(r1, 0x2, 0x1)
+syz_mptcp_pm_set_flags$server(r11, 0x1, 0x1)
+r5 = syz_mptcp_pm_announce$server_port(r11, 0x1, 0x2, 0x1)
+r6 = syz_mptcp_pm_announce$client(r10, 0x0, 0x3, 0x0)
+syz_mptcp_pm_get_endpoint$announced(r5, 0x1)
+syz_mptcp_pm_dump_endpoints$userspace_server(r11, 0x2)
+syz_mptcp_pm_dump_endpoints$userspace_client(r10, 0x1)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pm_remove$announced(r5, 0x0)
+syz_mptcp_pm_remove$announced(r6, 0x0)
+syz_mptcp_pm_remove$subflow(r1, 0x1)
+syz_mptcp_inject_join_syn(r0)
+syz_mptcp_disconnect(r0)
+syz_mptcp_close_server(r0)
+syz_mptcp_pair_close(r0)
+r2 = syz_mptcp_pair_init$server_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x40, 0x2, &AUTO=<r12=>0x0, 0x0)
+r3 = syz_mptcp_join_subflow(r12, 0x2, 0x1, 0x0)
+syz_mptcp_subflow_destroy(r3)
+syz_mptcp_pair_close(r2)

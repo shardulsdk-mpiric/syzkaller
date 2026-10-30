@@ -1,0 +1,20 @@
+# Two-netns RM_ADDR: the client netns announces a signal endpoint to a kernel-PM
+# server in the peer netns, which has its own PM state, then removes it: the client
+# sends RM_ADDR and the server end processes it (mptcp_pm_rm_addr_received). The
+# server's own endpoints (one kernel-assigned id, one with a port) are removed too,
+# so RM_ADDR also flows the other way; then each end withdraws id 0.
+
+syz_mptcp_pm_set_limits(0x2, 0x2, 0x0, 0x0)
+syz_mptcp_pm_set_limits$server(0x2, 0x2, 0x0, 0x1)
+r0 = syz_mptcp_pm_add_endpoint$client_signal(0x1, 0x1, 0x0, 0x200)
+r1 = syz_mptcp_pm_add_endpoint$server_signal_port(0x1, 0x1, 0x0, 0x401)
+r4 = syz_mptcp_pm_add_endpoint$server_auto_signal(0x10, 0x1, 0x0, 0x400)
+r2 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x50, 0x3, &AUTO=<r3=>0x0, 0x0)
+syz_mptcp_drive_traffic(r2, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pm_del_endpoint$client(r0)
+syz_mptcp_pm_del_endpoint$server(r1)
+syz_mptcp_pm_del_endpoint$server(r4)
+syz_mptcp_drive_traffic(r2, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pm_del_endpoint$id0_client(0x300)
+syz_mptcp_pm_del_endpoint$id0_server(0x500)
+syz_mptcp_pair_close(r2)

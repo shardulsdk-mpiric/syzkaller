@@ -4,12 +4,12 @@
 # data, then remove one endpoint and flush the rest. The executor's netns reset
 # restores the endpoints and limits after the program.
 
-syz_mptcp_pm_set_limits(0x2, 0x2, 0x0)
+syz_mptcp_pm_set_limits(0x2, 0x2, 0x0, 0x0)
 r0 = syz_mptcp_pm_add_endpoint$subflow(0x0, 0x2, 0x0, 0x0)
 r1 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x10, 0x3, 0x0, 0x0)
 r2 = syz_mptcp_pm_add_endpoint$signal(0x1, 0x1, 0x0, 0x0)
 syz_mptcp_pm_set_endpoint_flags$subflow(r0, 0x4)
 syz_mptcp_drive_traffic(r1, &AUTO="4142434445464748", 0x8)
 syz_mptcp_pm_del_endpoint(r2)
-syz_mptcp_pm_flush_endpoints()
+syz_mptcp_pm_flush_endpoints(0x0)
 syz_mptcp_pair_close(r1)

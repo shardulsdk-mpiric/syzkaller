@@ -26,6 +26,17 @@
 # v0 scope (still, for this second increment): NORMAL mode only, no
 # mutation, no nonce/HMAC capture, no kernel-side instrumentation --
 # those land as a later increment. Runs on any stock CONFIG_MPTCP kernel.
+#
+# Two-netns pairs (MPTCP_INIT_PEER_NETNS): the client end stays in the executor's
+# netns, the server end lives in a per-proc peer netns joined to it by a veth pair
+# (10.0.0.1 <-> 10.0.0.2), so each end has its own in-kernel PM endpoint table and
+# net.mptcp sysctls, as two hosts do: RM_ADDR and ADD_ADDR reach a peer with its own
+# PM state. The ops that take a pair or an end work on either kind (a server end's
+# commands go out from the peer netns); the in-kernel PM ops choose the netns
+# structurally ($client / $server variants). Not yet on a two-netns pair: wire
+# operations through the NFQUEUE layer (join_subflow's mut_op is not applied,
+# subflow_stall and subflow_fail fail), and listener_close_race (self-contained,
+# always single-netns).
 
 # Invalid default (0xff..ff -> -1 as the executor's long slot index, which its
 # `slot < 0` guard rejects): a defaulted/orphaned handle must NOT alias live
@@ -61,10 +72,10 @@ define MPTCP_PAIR_PM_KERNEL	3
 # Both ends userspace PM. The bare name keeps this behaviour for existing programs.
 # A kernel-PM client end is returned as mptcp_client_kernel; a kernel-PM server end
 # gets no handle (const 0, a NULL pointer).
-syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_USERSPACE], client ptr[out, mptcp_client_userspace], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$server_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_SERVER_KERNEL], client ptr[out, mptcp_client_userspace], server const[0]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_CLIENT_KERNEL], client ptr[out, mptcp_client_kernel], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client ptr[out, mptcp_client_kernel], server const[0]) mptcp_pair (remote_cover)
+syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_USERSPACE], client ptr[out, mptcp_client_userspace], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover, timeout[2000])
+syz_mptcp_pair_init$server_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_SERVER_KERNEL], client ptr[out, mptcp_client_userspace], server const[0]) mptcp_pair (remote_cover, timeout[2000])
+syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_CLIENT_KERNEL], client ptr[out, mptcp_client_kernel], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover, timeout[2000])
+syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client ptr[out, mptcp_client_kernel], server const[0]) mptcp_pair (remote_cover, timeout[2000])
 syz_mptcp_pair_close(pair mptcp_pair)
 
 # addr_id: local address id announced to the kernel for this subflow
@@ -84,6 +95,8 @@ syz_mptcp_pair_close(pair mptcp_pair)
 # harness-authored HMAC that crossed subflow_hmac_valid -- reaching the
 # subflow_syn_recv_sock ref-transfer region. Same-length rewrite. Like SELFVERIFY it
 # needs MPTCP_INIT_CAPTURE_KEYS (else it DROPs the ACK, fail-loud -> no accept).
+# On a two-netns pair mut_op is not applied yet (the join runs unmutated): the
+# engine hooks loopback egress, and THMAC_FLIP needs the server netns's egress.
 # Harness-only constants (see .const + #define).
 define MPTCP_MUT_NONE	0
 define MPTCP_MUT_HMAC_FLIP	1
@@ -195,7 +208,11 @@ define MPTCP_INIT_LISTEN_ANY	16
 # MPTCP_INIT_DENY_JOIN_ID0: allow_join_initial_addr_port=0 while the pair is created,
 # so the handshake carries the MP_CAPABLE C flag.
 define MPTCP_INIT_DENY_JOIN_ID0	32
-mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS, MPTCP_INIT_CHECKSUM, MPTCP_INIT_LISTEN_ANY, MPTCP_INIT_DENY_JOIN_ID0
+# MPTCP_INIT_PEER_NETNS: put the server end in the peer netns, over the veth (see the
+# top of this file). The other flags apply to both ends' netns; LISTEN_ANY binds the
+# server's listener to 0.0.0.0 in the peer netns.
+define MPTCP_INIT_PEER_NETNS	64
+mptcp_pair_init_flags = MPTCP_INIT_RWND_CLAMP, MPTCP_INIT_CAPTURE_KEYS, MPTCP_INIT_NO_TIMESTAMPS, MPTCP_INIT_CHECKSUM, MPTCP_INIT_LISTEN_ANY, MPTCP_INIT_DENY_JOIN_ID0, MPTCP_INIT_PEER_NETNS
 
 # syz_mptcp_drive_traffic(): push data client->server on an established pair.
 # On a pair created with MPTCP_INIT_RWND_CLAMP the executor bursts then drains
@@ -213,15 +230,38 @@ syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len
 # dump for later commands). The kernel hands out ids upwards from the highest one it
 # has seen, so an auto endpoint added before the fixed ones takes their low ids and
 # their adds fail with EBUSY, as they would for ip-mptcp(8) users. The executor's
-# per-program netns reset flushes endpoints and restores the limits. Both ends of a
-# pair share the netns, so they share the endpoint table.
+# per-program netns reset flushes endpoints and restores the limits, in both netns.
+# Both ends of a single-netns pair share the netns, so they share the endpoint table.
 #
-# Endpoints are resources so that removing or changing one is only generated for an
-# endpoint that was added, and changing to fullmesh only for a non-signal one (the
-# kernel rejects fullmesh on a signal endpoint).
+# Two-netns pairs: the $client_* / $server_* variants put the endpoint in the client
+# end's netns (on veth-c) or in the server end's (on veth-s, the peer netns), each
+# with its own table. The side is the add's last argument (where the bare variants
+# say whether a signal endpoint gets a port; 1 still means a port), and the endpoint
+# handle the add returns is that side bit ORed over the per-table handle above (fixed
+# 0-7, initial 8, auto 16-23, id-0 256): 512 for $client, 1024 for $server, so
+# $client fixed handles are 512-519, $server auto ones 1040-1047, and so on. The
+# address blocks are the end's own: $client 10.0.2.(idx+1) fixed, 10.0.4.(idx-15)
+# auto, 10.0.0.1 initial; $server 10.0.3.(idx+1), 10.0.5.(idx-15), 10.0.0.2. $client
+# fixed and initial ids are offset by 32 (that table shares the executor's netns,
+# and so its id space, with the loopback table). $client/$server ops build the peer
+# netns and veth themselves when no two-netns pair did yet, so endpoints can exist
+# before any pair, as on a real host. That first build (a netns, a veth pair, its
+# addresses) takes ~150 ms on a KASAN kernel, more with several procs building at
+# once. It happens once per executor proc, hence the timeout on the calls that can
+# trigger it.
+#
+# Endpoints are resources, one family per side, so that removing or changing one is
+# only generated for an endpoint that was added there, and changing to fullmesh only
+# for a non-signal one (the kernel rejects fullmesh on a signal endpoint).
 resource mptcp_pm_endpoint[intptr]: 0xffffffffffffffff
 resource mptcp_pm_endpoint_subflow[mptcp_pm_endpoint]
 resource mptcp_pm_endpoint_signal[mptcp_pm_endpoint]
+resource mptcp_pm_endpoint_client[intptr]: 0xffffffffffffffff
+resource mptcp_pm_endpoint_client_subflow[mptcp_pm_endpoint_client]
+resource mptcp_pm_endpoint_client_signal[mptcp_pm_endpoint_client]
+resource mptcp_pm_endpoint_server[intptr]: 0xffffffffffffffff
+resource mptcp_pm_endpoint_server_subflow[mptcp_pm_endpoint_server]
+resource mptcp_pm_endpoint_server_signal[mptcp_pm_endpoint_server]
 
 # Harness constants (see .const): MPTCP_PM_ADDR_FLAG_* values, plus the combined
 # endpoint kinds the kernel accepts (signal+fullmesh and a port on anything but a
@@ -235,6 +275,18 @@ define MPTCP_PM_ENDPOINT_SUBFLOW_FULLMESH	10
 define MPTCP_PM_ENDPOINT_LAMINAR	32
 define MPTCP_PM_ENDPOINT_INITIAL	8
 define MPTCP_PM_ENDPOINT_ID0	256
+# Side of an endpoint (the add's last argument, ORed with 1 for "with a port").
+define MPTCP_PM_ENDPOINT_CLIENT	512
+define MPTCP_PM_ENDPOINT_CLIENT_PORT	513
+define MPTCP_PM_ENDPOINT_SERVER	1024
+define MPTCP_PM_ENDPOINT_SERVER_PORT	1025
+define MPTCP_PM_ENDPOINT_CLIENT_ID0	768
+define MPTCP_PM_ENDPOINT_SERVER_ID0	1280
+# netns of the netns-wide ops (set_limits, flush_endpoints, get_limits): the
+# executor's netns (loopback endpoints and two-netns client ends), or the server
+# end's netns of a two-netns pair.
+define MPTCP_PM_NETNS_SELF	0
+define MPTCP_PM_NETNS_SERVER	1
 mptcp_pm_endpoint_subflow_kinds = MPTCP_PM_ENDPOINT_SUBFLOW, MPTCP_PM_ENDPOINT_SUBFLOW_FULLMESH
 mptcp_pm_endpoint_signal_kinds = MPTCP_PM_ENDPOINT_SIGNAL, MPTCP_PM_ENDPOINT_SIGNAL_SUBFLOW
 mptcp_pm_endpoint_mods = MPTCP_PM_ENDPOINT_BACKUP, MPTCP_PM_ENDPOINT_LAMINAR
@@ -244,7 +296,8 @@ mptcp_pm_endpoint_backup_flag = MPTCP_PM_ENDPOINT_BACKUP
 # subflows: extra subflows per msk; add_addr_accepted: ADD_ADDRs acted on;
 # subflow_retries: retries of a subflow closed after an error (kernels without that
 # limit ignore it).
-syz_mptcp_pm_set_limits(subflows int32[0:8], add_addr_accepted int32[0:8], subflow_retries int32[0:8])
+syz_mptcp_pm_set_limits(subflows int32[0:8], add_addr_accepted int32[0:8], subflow_retries int32[0:8], netns const[MPTCP_PM_NETNS_SELF])
+syz_mptcp_pm_set_limits$server(subflows int32[0:8], add_addr_accepted int32[0:8], subflow_retries int32[0:8], netns const[MPTCP_PM_NETNS_SERVER]) (timeout[2000])
 syz_mptcp_pm_add_endpoint$subflow(idx int8[0:7], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_subflow
 syz_mptcp_pm_add_endpoint$signal(idx int8[0:7], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
 # A signal-only endpoint with a port: the kernel opens its own listener on it.
@@ -253,13 +306,37 @@ syz_mptcp_pm_add_endpoint$initial_subflow(idx const[MPTCP_PM_ENDPOINT_INITIAL], 
 syz_mptcp_pm_add_endpoint$initial_signal(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
 syz_mptcp_pm_add_endpoint$auto_subflow(idx int8[16:23], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_subflow
 syz_mptcp_pm_add_endpoint$auto_signal(idx int8[16:23], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
+syz_mptcp_pm_add_endpoint$client_subflow(idx int8[0:7], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT]) mptcp_pm_endpoint_client_subflow (timeout[2000])
+syz_mptcp_pm_add_endpoint$client_signal(idx int8[0:7], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT]) mptcp_pm_endpoint_client_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$client_signal_port(idx int8[0:7], kind const[MPTCP_PM_ENDPOINT_SIGNAL], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT_PORT]) mptcp_pm_endpoint_client_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$client_initial_subflow(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT]) mptcp_pm_endpoint_client_subflow (timeout[2000])
+syz_mptcp_pm_add_endpoint$client_initial_signal(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT]) mptcp_pm_endpoint_client_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$client_auto_subflow(idx int8[16:23], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT]) mptcp_pm_endpoint_client_subflow (timeout[2000])
+syz_mptcp_pm_add_endpoint$client_auto_signal(idx int8[16:23], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_CLIENT]) mptcp_pm_endpoint_client_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_subflow(idx int8[0:7], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER]) mptcp_pm_endpoint_server_subflow (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_signal(idx int8[0:7], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER]) mptcp_pm_endpoint_server_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_signal_port(idx int8[0:7], kind const[MPTCP_PM_ENDPOINT_SIGNAL], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER_PORT]) mptcp_pm_endpoint_server_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_initial_subflow(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER]) mptcp_pm_endpoint_server_subflow (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_initial_signal(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER]) mptcp_pm_endpoint_server_signal (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_auto_subflow(idx int8[16:23], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER]) mptcp_pm_endpoint_server_subflow (timeout[2000])
+syz_mptcp_pm_add_endpoint$server_auto_signal(idx int8[16:23], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], side const[MPTCP_PM_ENDPOINT_SERVER]) mptcp_pm_endpoint_server_signal (timeout[2000])
 syz_mptcp_pm_del_endpoint(ep mptcp_pm_endpoint)
 # Withdraw the initial subflow's address (id 0) from every in-kernel-PM msk using
 # 127.0.0.1: ip mptcp endpoint delete id 0 127.0.0.1.
 syz_mptcp_pm_del_endpoint$id0(ep const[MPTCP_PM_ENDPOINT_ID0])
+syz_mptcp_pm_del_endpoint$client(ep mptcp_pm_endpoint_client) (timeout[2000])
+syz_mptcp_pm_del_endpoint$server(ep mptcp_pm_endpoint_server) (timeout[2000])
+# The same id-0 withdrawal in a two-netns end's netns, for its own address.
+syz_mptcp_pm_del_endpoint$id0_client(ep const[MPTCP_PM_ENDPOINT_CLIENT_ID0]) (timeout[2000])
+syz_mptcp_pm_del_endpoint$id0_server(ep const[MPTCP_PM_ENDPOINT_SERVER_ID0]) (timeout[2000])
 syz_mptcp_pm_set_endpoint_flags$subflow(ep mptcp_pm_endpoint_subflow, flags flags[mptcp_pm_endpoint_change_flags])
 syz_mptcp_pm_set_endpoint_flags$signal(ep mptcp_pm_endpoint_signal, flags flags[mptcp_pm_endpoint_backup_flag])
-syz_mptcp_pm_flush_endpoints()
+syz_mptcp_pm_set_endpoint_flags$client_subflow(ep mptcp_pm_endpoint_client_subflow, flags flags[mptcp_pm_endpoint_change_flags]) (timeout[2000])
+syz_mptcp_pm_set_endpoint_flags$client_signal(ep mptcp_pm_endpoint_client_signal, flags flags[mptcp_pm_endpoint_backup_flag]) (timeout[2000])
+syz_mptcp_pm_set_endpoint_flags$server_subflow(ep mptcp_pm_endpoint_server_subflow, flags flags[mptcp_pm_endpoint_change_flags]) (timeout[2000])
+syz_mptcp_pm_set_endpoint_flags$server_signal(ep mptcp_pm_endpoint_server_signal, flags flags[mptcp_pm_endpoint_backup_flag]) (timeout[2000])
+syz_mptcp_pm_flush_endpoints(netns const[MPTCP_PM_NETNS_SELF])
+syz_mptcp_pm_flush_endpoints$server(netns const[MPTCP_PM_NETNS_SERVER]) (timeout[2000])
 
 # Reads (ip mptcp endpoint show [id N], ip mptcp limits show): GET of one in-kernel
 # endpoint or one userspace announcement, a dump of the in-kernel table or of one
@@ -269,19 +346,26 @@ define MPTCP_PM_GET_ANNOUNCED	1
 define MPTCP_PM_DUMP_KERNEL	0
 define MPTCP_PM_DUMP_CLIENT	1
 define MPTCP_PM_DUMP_SERVER	2
+define MPTCP_PM_DUMP_KERNEL_SERVER	3
 syz_mptcp_pm_get_endpoint(ep mptcp_pm_endpoint, kind const[MPTCP_PM_GET_KERNEL])
+syz_mptcp_pm_get_endpoint$client(ep mptcp_pm_endpoint_client, kind const[MPTCP_PM_GET_KERNEL]) (timeout[2000])
+syz_mptcp_pm_get_endpoint$server(ep mptcp_pm_endpoint_server, kind const[MPTCP_PM_GET_KERNEL]) (timeout[2000])
 syz_mptcp_pm_get_endpoint$announced(ann mptcp_pm_announced, kind const[MPTCP_PM_GET_ANNOUNCED])
 syz_mptcp_pm_dump_endpoints(end const[0], kind const[MPTCP_PM_DUMP_KERNEL])
 syz_mptcp_pm_dump_endpoints$userspace_client(end mptcp_client_userspace, kind const[MPTCP_PM_DUMP_CLIENT])
 syz_mptcp_pm_dump_endpoints$userspace_server(end mptcp_server_userspace, kind const[MPTCP_PM_DUMP_SERVER])
-syz_mptcp_pm_get_limits()
+syz_mptcp_pm_dump_endpoints$server_kernel(end const[0], kind const[MPTCP_PM_DUMP_KERNEL_SERVER]) (timeout[2000])
+syz_mptcp_pm_get_limits(netns const[MPTCP_PM_NETNS_SELF])
+syz_mptcp_pm_get_limits$server(netns const[MPTCP_PM_NETNS_SERVER]) (timeout[2000])
 
 # Userspace path-manager signalling (what a daemon such as mptcpd does for one
 # connection, ip-mptcp(8) "endpoint add/delete ... token", "endpoint change"): the
 # commands act on one msk, named by its token, so they take that end's handle.
 #
 # announce: ADD_ADDR for address idx with id 240+idx (clear of join_subflow's ids in
-# practice). The server end announces 127.0.2.(idx+1), the client end 127.0.3.(idx+1).
+# practice). The server end announces 127.0.2.(idx+1), the client end 127.0.3.(idx+1);
+# on a two-netns pair the end's veth alias instead (server 10.0.7.(idx+1), client
+# 10.0.6.(idx+1)), and a server end's commands and listener are made in the peer netns.
 # A kernel-PM peer that accepts it (see syz_mptcp_pm_set_limits) opens a subflow to
 # it; that needs a server listener on 0.0.0.0 (MPTCP_INIT_LISTEN_ANY) or, with
 # $server_port, the listener the call opens on the announced address and port, as a
