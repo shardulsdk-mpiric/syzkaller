@@ -91,6 +91,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_genetlink_get_family_id":     linuxSyzGenetlinkGetFamilyIDSupported,
 	"syz_mptcp_pair_init":             linuxSyzMptcpSupported,
 	"syz_mptcp_pair_close":            linuxSyzMptcpSupported,
+	"syz_mptcp_pair_fd":               linuxSyzMptcpSupported,
 	"syz_mptcp_join_subflow":          linuxSyzMptcpNfqueueSupported,
 	"syz_mptcp_subflow_destroy":       linuxSyzMptcpSupported,
 	"syz_mptcp_subflow_info":          linuxSyzMptcpSupported,

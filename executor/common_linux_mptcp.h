@@ -384,7 +384,7 @@ struct syz_mptcp_info_short {
 
 // Every call except the in-kernel PM configuration ops and the self-contained
 // listener_close_race works on a pair.
-#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close ||                      \
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_pair_close || __NR_syz_mptcp_pair_fd || \
     __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||                              \
     __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||                              \
     __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server || __NR_syz_mptcp_disconnect || \
@@ -2497,6 +2497,54 @@ static long syz_mptcp_pair_close(volatile long a0)
 	syz_mptcp_pair_pool[slot].keys_valid = false;
 	__atomic_store_n(&syz_mptcp_pair_pool[slot].in_use, false, __ATOMIC_RELEASE);
 	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pair_fd
+// Side argument of syz_mptcp_pair_fd (harness constants; mirrored in .txt + .const).
+#define MPTCP_PAIR_FD_CLIENT 0
+#define MPTCP_PAIR_FD_SERVER 1
+
+// Hands one end's socket of an established pair to the generic socket calls, as a
+// dup(): the sock_mptcp resource it returns is a second fd on the same open file.
+// The pair keeps ownership of its own fds (pair_close still closes them; this one
+// has its own lifetime), and the dup cannot keep the socket alive beyond the
+// program: the executor closes the program's fds at program end, pair_close
+// closes the pair's, and the kernel socket goes when the last of them does.
+// A pool slot reused by a later pair_init is harness bookkeeping only, with no
+// tie to the previous occupant's socket, so no generation check is needed here:
+// the handle names a slot, and a dup taken from whatever pair holds the slot now
+// is a valid socket of that pair.
+//
+// Non-consuming. -1 when the slot is not in use or that end is closed: a server
+// end after close_server (server_fd == -1), or a slot pair_init has claimed but
+// not yet filled (its fds still 0 from the previous close, and 0 is never one of
+// the pair's sockets). Works for a two-netns pair's server end too: an fd is
+// usable from any netns.
+static long syz_mptcp_pair_fd(volatile long a0, volatile long a1)
+{
+	long slot = a0;
+	long side = a1;
+
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("syz_mptcp_pair_fd: slot %ld out of range\n", slot);
+		return -1;
+	}
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("syz_mptcp_pair_fd: slot %ld not in use\n", slot);
+		return -1;
+	}
+	int fd = side == MPTCP_PAIR_FD_SERVER ? pair->server_fd : pair->client_fd;
+	if (fd <= 0) {
+		debug("syz_mptcp_pair_fd: slot %ld %s end closed or not ready\n", slot,
+		      side == MPTCP_PAIR_FD_SERVER ? "server" : "client");
+		return -1;
+	}
+	int dup_fd = dup(fd);
+	debug("syz_mptcp_pair_fd: slot %ld %s fd %d -> %d\n", slot,
+	      side == MPTCP_PAIR_FD_SERVER ? "server" : "client", fd, dup_fd);
+	return dup_fd;
 }
 #endif
 

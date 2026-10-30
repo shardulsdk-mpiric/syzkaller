@@ -79,6 +79,28 @@ syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr 
 syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client ptr[out, mptcp_client_kernel], server const[0]) mptcp_pair (remote_cover, timeout[2000])
 syz_mptcp_pair_close(pair mptcp_pair)
 
+# syz_mptcp_pair_fd: a dup() of one end's socket of an established pair, typed as
+# sock_mptcp (socket_inet_tcp.txt), so the generic socket calls that take one --
+# poll, epoll_ctl, splice, recvmsg with MSG_PEEK, shutdown, setsockopt, ioctl
+# SIOCINQ, sendto, getsockopt$inet_mptcp_info, ... -- can be generated against a
+# connected msk. Those calls otherwise only ever see sockets from socket$inet_mptcp,
+# which are rarely connected. The handle is mptcp_pair: every pair_init variant
+# returns it, and the PM-typed handles (mptcp_client_userspace, ...) are the same
+# slot, typed only to gate PM commands; an end's socket exists whichever PM it runs.
+#
+# Lifetime: the dup is a second reference to the end's open file, with its own fd.
+# Closing it does not close the pair's own fd, and pair_close still closes the
+# pair's fds, so the pair keeps ownership of its ends. The socket itself lives until
+# every reference is gone: the executor closes the program's fds at program end,
+# so a dup never outlives the program, and a slot reused by a later pair_init is
+# harness-side bookkeeping that the kernel socket of the old pair is not tied to.
+# Returns -1 when the slot is not in use or that end is closed (close_server). An
+# fd is usable from any netns, so a two-netns pair's server end works as well.
+define MPTCP_PAIR_FD_CLIENT	0
+define MPTCP_PAIR_FD_SERVER	1
+syz_mptcp_pair_fd$client(pair mptcp_pair, side const[MPTCP_PAIR_FD_CLIENT]) sock_mptcp
+syz_mptcp_pair_fd$server(pair mptcp_pair, side const[MPTCP_PAIR_FD_SERVER]) sock_mptcp
+
 # addr_id: local address id announced to the kernel for this subflow
 # (id 0 is reserved/invalid on the wire -- the executor coerces it to 1).
 # backup: sets MPTCP_PM_ADDR_FLAG_BACKUP on the new subflow when 1.
