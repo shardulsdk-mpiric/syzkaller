@@ -196,8 +196,15 @@ syz_mptcp_drive_traffic(pair mptcp_pair, data ptr[in, array[int8]], data_len len
 # In-kernel path-manager configuration (netns-wide, like ip-mptcp(8)): endpoints and
 # limits that the in-kernel PM acts on for every kernel-PM msk, both for pairs created
 # afterwards and for live ones. Endpoint idx uses id idx+1 and address 127.0.1.(idx+1)
-# on lo. The executor's per-program netns reset flushes endpoints and restores the
-# limits. Both ends of a pair share the netns, so they share the endpoint table.
+# on lo; the $initial variants use idx 8, id 9, on 127.0.0.1, the address of every
+# pair's initial subflow (an endpoint on a host's primary address); the $auto
+# variants use idx 16-23 on 127.0.4.(idx-15) and let the kernel choose the id, as
+# ip mptcp endpoint add without "id" does (the executor reads the id back from a
+# dump for later commands). The kernel hands out ids upwards from the highest one it
+# has seen, so an auto endpoint added before the fixed ones takes their low ids and
+# their adds fail with EBUSY, as they would for ip-mptcp(8) users. The executor's
+# per-program netns reset flushes endpoints and restores the limits. Both ends of a
+# pair share the netns, so they share the endpoint table.
 #
 # Endpoints are resources so that removing or changing one is only generated for an
 # endpoint that was added, and changing to fullmesh only for a non-signal one (the
@@ -216,6 +223,8 @@ define MPTCP_PM_ENDPOINT_BACKUP	4
 define MPTCP_PM_ENDPOINT_FULLMESH	8
 define MPTCP_PM_ENDPOINT_SUBFLOW_FULLMESH	10
 define MPTCP_PM_ENDPOINT_LAMINAR	32
+define MPTCP_PM_ENDPOINT_INITIAL	8
+define MPTCP_PM_ENDPOINT_ID0	256
 mptcp_pm_endpoint_subflow_kinds = MPTCP_PM_ENDPOINT_SUBFLOW, MPTCP_PM_ENDPOINT_SUBFLOW_FULLMESH
 mptcp_pm_endpoint_signal_kinds = MPTCP_PM_ENDPOINT_SIGNAL, MPTCP_PM_ENDPOINT_SIGNAL_SUBFLOW
 mptcp_pm_endpoint_mods = MPTCP_PM_ENDPOINT_BACKUP, MPTCP_PM_ENDPOINT_LAMINAR
@@ -230,10 +239,32 @@ syz_mptcp_pm_add_endpoint$subflow(idx int8[0:7], kind flags[mptcp_pm_endpoint_su
 syz_mptcp_pm_add_endpoint$signal(idx int8[0:7], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
 # A signal-only endpoint with a port: the kernel opens its own listener on it.
 syz_mptcp_pm_add_endpoint$signal_port(idx int8[0:7], kind const[MPTCP_PM_ENDPOINT_SIGNAL], mods flags[mptcp_pm_endpoint_mods], port const[1]) mptcp_pm_endpoint_signal
+syz_mptcp_pm_add_endpoint$initial_subflow(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_subflow
+syz_mptcp_pm_add_endpoint$initial_signal(idx const[MPTCP_PM_ENDPOINT_INITIAL], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
+syz_mptcp_pm_add_endpoint$auto_subflow(idx int8[16:23], kind flags[mptcp_pm_endpoint_subflow_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_subflow
+syz_mptcp_pm_add_endpoint$auto_signal(idx int8[16:23], kind flags[mptcp_pm_endpoint_signal_kinds], mods flags[mptcp_pm_endpoint_mods], port const[0]) mptcp_pm_endpoint_signal
 syz_mptcp_pm_del_endpoint(ep mptcp_pm_endpoint)
+# Withdraw the initial subflow's address (id 0) from every in-kernel-PM msk using
+# 127.0.0.1: ip mptcp endpoint delete id 0 127.0.0.1.
+syz_mptcp_pm_del_endpoint$id0(ep const[MPTCP_PM_ENDPOINT_ID0])
 syz_mptcp_pm_set_endpoint_flags$subflow(ep mptcp_pm_endpoint_subflow, flags flags[mptcp_pm_endpoint_change_flags])
 syz_mptcp_pm_set_endpoint_flags$signal(ep mptcp_pm_endpoint_signal, flags flags[mptcp_pm_endpoint_backup_flag])
 syz_mptcp_pm_flush_endpoints()
+
+# Reads (ip mptcp endpoint show [id N], ip mptcp limits show): GET of one in-kernel
+# endpoint or one userspace announcement, a dump of the in-kernel table or of one
+# userspace-PM end's address list, and the limits.
+define MPTCP_PM_GET_KERNEL	0
+define MPTCP_PM_GET_ANNOUNCED	1
+define MPTCP_PM_DUMP_KERNEL	0
+define MPTCP_PM_DUMP_CLIENT	1
+define MPTCP_PM_DUMP_SERVER	2
+syz_mptcp_pm_get_endpoint(ep mptcp_pm_endpoint, kind const[MPTCP_PM_GET_KERNEL])
+syz_mptcp_pm_get_endpoint$announced(ann mptcp_pm_announced, kind const[MPTCP_PM_GET_ANNOUNCED])
+syz_mptcp_pm_dump_endpoints(end const[0], kind const[MPTCP_PM_DUMP_KERNEL])
+syz_mptcp_pm_dump_endpoints$userspace_client(end mptcp_client_userspace, kind const[MPTCP_PM_DUMP_CLIENT])
+syz_mptcp_pm_dump_endpoints$userspace_server(end mptcp_server_userspace, kind const[MPTCP_PM_DUMP_SERVER])
+syz_mptcp_pm_get_limits()
 
 # Userspace path-manager signalling (what a daemon such as mptcpd does for one
 # connection, ip-mptcp(8) "endpoint add/delete ... token", "endpoint change"): the

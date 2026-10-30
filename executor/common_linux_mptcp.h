@@ -375,7 +375,7 @@ struct syz_mptcp_info_short {
     __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||                              \
     __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server || __NR_syz_mptcp_disconnect || \
     __NR_syz_mptcp_drive_traffic || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove ||      \
-    __NR_syz_mptcp_pm_set_flags
+    __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints
 static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 #endif
 
@@ -395,10 +395,12 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 // doesn't) are needed by exactly this pair.
 #define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || __NR_syz_mptcp_subflow_info)
 // Userspace PM signalling on one msk (announce / remove / set_flags).
-#define MPTCP_NEED_PM_USERSPACE (SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags)
+#define MPTCP_NEED_PM_USERSPACE (SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints)
 // In-kernel PM configuration: the endpoint commands share one message builder.
-#define MPTCP_NEED_PM_ENDPOINT (SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags)
-#define MPTCP_NEED_PM_CONFIG (MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_flush_endpoints)
+#define MPTCP_NEED_PM_ENDPOINT (SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags || __NR_syz_mptcp_pm_get_endpoint)
+// GET / DUMP replies, also used to learn a kernel-assigned endpoint id.
+#define MPTCP_NEED_PM_QUERY (SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_get_endpoint || __NR_syz_mptcp_pm_dump_endpoints || __NR_syz_mptcp_pm_get_limits)
+#define MPTCP_NEED_PM_CONFIG (MPTCP_NEED_PM_ENDPOINT || MPTCP_NEED_PM_QUERY || __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_flush_endpoints)
 #define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
 #define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
 // The calls that apply netns settings for one pair (see mptcp_netns_save):
@@ -980,8 +982,10 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 // after an error. Configuration applies to every kernel-PM msk in the netns,
 // both before a pair is created (acted on when it is established) and while it
 // is live (the kernel walks existing msks). These ops only build valid commands:
-// endpoint i always uses id i+1 and address 127.0.1.(i+1) on lo (clear of the
-// 127.0.0.2+ range join_subflow uses), and the descriptions only offer flag
+// endpoint i < 8 uses id i+1 and address 127.0.1.(i+1) on lo (clear of the
+// 127.0.0.2+ range join_subflow uses); endpoint 8 uses id 9 and 127.0.0.1, the
+// address every pair's initial subflow uses, which is how a host configures an
+// endpoint on its primary address. The descriptions only offer flag
 // combinations the kernel accepts. The executor's per-program netns reset
 // flushes endpoints and restores the limits, so nothing outlives the program.
 //
@@ -992,65 +996,229 @@ static int mptcp_pm_subflow_destroy(uint32 token, uint8 addr_id,
 
 #if MPTCP_NEED_PM_ENDPOINT
 #define MPTCP_PM_ENDPOINT_MAX 8
+#define MPTCP_PM_ENDPOINT_INITIAL 8
+// Endpoints added without an id (the kernel assigns one): handles 16..23, address
+// 127.0.4.(h-15). The add learns the assigned id from a dump.
+#define MPTCP_PM_ENDPOINT_AUTO 16
+// Not an endpoint: DEL_ADDR with id 0 and the initial address, which the kernel
+// treats as "withdraw the initial subflow's address" on every msk using it.
+#define MPTCP_PM_ENDPOINT_ID0 256
 // Port of a signal endpoint created with a port: the kernel opens its own
 // listener there (mptcp_pm_nl_create_listen_socket). Per netns, so per proc.
 #define MPTCP_PM_ENDPOINT_PORT_BASE 26100
 
-// Builds and sends an endpoint command for endpoint idx. ADD_ADDR carries the
-// full address; DEL_ADDR and SET_FLAGS look the endpoint up by id.
-static int mptcp_pm_endpoint_cmd(int cmd, long idx, uint32 flags, uint16 port_h)
+static uint8 mptcp_pm_auto_ids[MPTCP_PM_ENDPOINT_MAX]; // learnt ids, 0 = not known
+
+// Maps an endpoint handle to the id and address its commands carry. id 0 with an
+// auto handle means the id is not known (the add failed or was not made).
+static bool mptcp_pm_endpoint_resolve(long h, uint8* id, uint32* addr_be)
 {
-	struct mptcp_nlmsg m;
+	if (h >= 0 && h < MPTCP_PM_ENDPOINT_MAX) {
+		*id = (uint8)(h + 1);
+		*addr_be = htonl(0x7f000101 + (uint32)h);
+	} else if (h == MPTCP_PM_ENDPOINT_INITIAL) {
+		*id = MPTCP_PM_ENDPOINT_INITIAL + 1;
+		*addr_be = htonl(0x7f000001);
+	} else if (h >= MPTCP_PM_ENDPOINT_AUTO && h < MPTCP_PM_ENDPOINT_AUTO + MPTCP_PM_ENDPOINT_MAX) {
+		*id = mptcp_pm_auto_ids[h - MPTCP_PM_ENDPOINT_AUTO];
+		*addr_be = htonl(0x7f000401 + (uint32)(h - MPTCP_PM_ENDPOINT_AUTO));
+	} else if (h == MPTCP_PM_ENDPOINT_ID0) {
+		*id = 0;
+		*addr_be = htonl(0x7f000001);
+	} else {
+		return false;
+	}
+	return true;
+}
+
+static void mptcp_pm_endpoint_build(struct mptcp_nlmsg* m, int cmd, uint8 id, uint32 addr_be, bool with_addr,
+				    uint32 flags, uint16 port_h)
+{
 	struct genlmsghdr genlhdr;
 	struct nlattr* nest = NULL;
-	uint8 id = (uint8)(idx + 1);
 
 	memset(&genlhdr, 0, sizeof(genlhdr));
 	genlhdr.cmd = cmd;
 	genlhdr.version = MPTCP_PM_VER;
-	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
-	mptcp_nlmsg_nest_begin(&m, &nest, MPTCP_PM_ATTR_ADDR | NLA_F_NESTED);
-	mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ID, &id, sizeof(id));
-	if (cmd == MPTCP_PM_CMD_ADD_ADDR) {
+	mptcp_nlmsg_init(m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	mptcp_nlmsg_nest_begin(m, &nest, MPTCP_PM_ATTR_ADDR | NLA_F_NESTED);
+	// An add without an id lets the kernel assign one; id 0 is otherwise only sent
+	// for the id-0 removal, which also carries the address.
+	if (id || cmd != MPTCP_PM_CMD_ADD_ADDR)
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_ID, &id, sizeof(id));
+	if (with_addr) {
 		uint16 fam = AF_INET;
-		uint32 addr_be = htonl(0x7f000100 + id);
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam, sizeof(fam));
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_ADDR4, &addr_be, sizeof(addr_be));
+	}
+	if (cmd == MPTCP_PM_CMD_ADD_ADDR) {
 		uint32 ifindex = if_nametoindex("lo");
-		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam, sizeof(fam));
-		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_ADDR4, &addr_be, sizeof(addr_be));
-		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_IF_IDX, &ifindex, sizeof(ifindex));
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_IF_IDX, &ifindex, sizeof(ifindex));
 		if (port_h)
-			mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
+			mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
 	}
 	// SET_FLAGS replaces the backup/fullmesh bits, so it always sends FLAGS (0 clears them).
 	if (flags || cmd == MPTCP_PM_CMD_SET_FLAGS)
-		mptcp_nlmsg_attr(&m, MPTCP_PM_ADDR_ATTR_FLAGS, &flags, sizeof(flags));
-	mptcp_nlmsg_nest_end(&m, nest);
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_FLAGS, &flags, sizeof(flags));
+	mptcp_nlmsg_nest_end(m, nest);
+}
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags
+// Builds and sends an endpoint command for endpoint handle h. ADD_ADDR carries the
+// full address; DEL_ADDR and SET_FLAGS look the endpoint up by id.
+static int mptcp_pm_endpoint_cmd(int cmd, long h, uint32 flags, uint16 port_h)
+{
+	struct mptcp_nlmsg m;
+	uint8 id;
+	uint32 addr_be;
+
+	if (!mptcp_pm_endpoint_resolve(h, &id, &addr_be))
+		return -1;
+	if (!id && h != MPTCP_PM_ENDPOINT_ID0 && cmd != MPTCP_PM_CMD_ADD_ADDR) {
+		debug("mptcp_pm_endpoint_cmd: endpoint %ld has no known id\n", h);
+		errno = ENOENT;
+		return -1;
+	}
+	mptcp_pm_endpoint_build(&m, cmd, id, addr_be, cmd == MPTCP_PM_CMD_ADD_ADDR || h == MPTCP_PM_ENDPOINT_ID0,
+				flags, port_h);
 	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock);
 }
+#endif
 #endif // MPTCP_NEED_PM_ENDPOINT
+
+#if MPTCP_NEED_PM_QUERY
+// Sends a GET or DUMP request and reads every reply to it up to the ACK or the
+// DONE, so nothing is left queued for the next command on the shared socket. For
+// each address in the replies, calls cb (when given) with its id and IPv4 address.
+// Returns 0, or -1 with errno.
+static int mptcp_nlmsg_query(struct mptcp_nlmsg* m, bool dump, void (*cb)(void* ctx, uint8 id, uint32 addr_be),
+			     void* ctx)
+{
+	struct nlmsghdr* hdr = (struct nlmsghdr*)m->buf;
+	struct sockaddr_nl sa;
+	static char buf[16384];
+	int ret = -1, err = EINVAL;
+
+	if (m->overflow) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	uint32 seq = __atomic_add_fetch(&mptcp_nlmsg_seq_ctr, 1, __ATOMIC_RELAXED);
+	hdr->nlmsg_len = m->pos - m->buf;
+	hdr->nlmsg_seq = seq;
+	// A dump ends with DONE and gets no ACK.
+	if (dump)
+		hdr->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	mptcp_spin_lock(&mptcp_nlmsg_lock);
+	if (sendto(mptcp_pm_genl_sock, m->buf, hdr->nlmsg_len, 0, (struct sockaddr*)&sa, sizeof(sa)) !=
+	    (ssize_t)hdr->nlmsg_len) {
+		err = errno;
+		goto out;
+	}
+	for (int i = 0; i < 64; i++) {
+		ssize_t n = recv(mptcp_pm_genl_sock, buf, sizeof(buf), 0);
+		if (n < (ssize_t)sizeof(struct nlmsghdr)) {
+			err = n < 0 ? errno : EINVAL;
+			goto out;
+		}
+		int left = (int)n;
+		for (struct nlmsghdr* h = (struct nlmsghdr*)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+			if (h->nlmsg_seq != seq)
+				continue;
+			if (h->nlmsg_type == NLMSG_DONE) {
+				ret = 0;
+				goto out;
+			}
+			if (h->nlmsg_type == NLMSG_ERROR) {
+				int e = ((struct nlmsgerr*)NLMSG_DATA(h))->error;
+				if (e)
+					err = -e;
+				else
+					ret = 0;
+				goto out;
+			}
+			// genlmsghdr, then attributes; pick MPTCP_PM_ATTR_ADDR nests.
+			int alen = (int)h->nlmsg_len - NLMSG_LENGTH(GENL_HDRLEN);
+			struct nlattr* a = (struct nlattr*)((char*)NLMSG_DATA(h) + GENL_HDRLEN);
+			for (; alen >= (int)sizeof(*a) && a->nla_len >= sizeof(*a) && a->nla_len <= alen;
+			     alen -= NLA_ALIGN(a->nla_len), a = (struct nlattr*)((char*)a + NLA_ALIGN(a->nla_len))) {
+				if ((a->nla_type & NLA_TYPE_MASK) != MPTCP_PM_ATTR_ADDR || !cb)
+					continue;
+				uint8 id = 0;
+				uint32 addr_be = 0;
+				int ilen = a->nla_len - NLA_HDRLEN;
+				struct nlattr* b = (struct nlattr*)((char*)a + NLA_HDRLEN);
+				for (; ilen >= (int)sizeof(*b) && b->nla_len >= sizeof(*b) && b->nla_len <= ilen;
+				     ilen -= NLA_ALIGN(b->nla_len), b = (struct nlattr*)((char*)b + NLA_ALIGN(b->nla_len))) {
+					if (b->nla_type == MPTCP_PM_ADDR_ATTR_ID && b->nla_len >= NLA_HDRLEN + 1)
+						id = *(uint8*)((char*)b + NLA_HDRLEN);
+					else if (b->nla_type == MPTCP_PM_ADDR_ATTR_ADDR4 && b->nla_len >= NLA_HDRLEN + 4)
+						memcpy(&addr_be, (char*)b + NLA_HDRLEN, 4);
+				}
+				cb(ctx, id, addr_be);
+			}
+		}
+	}
+out:
+	mptcp_spin_unlock(&mptcp_nlmsg_lock);
+	if (ret)
+		errno = err;
+	return ret;
+}
+#endif // MPTCP_NEED_PM_QUERY
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint
 // Adds endpoint idx and returns it as the endpoint handle. kind is one of the
 // flag combinations the kernel accepts (signal, subflow, signal+subflow,
 // subflow+fullmesh); mods adds backup and/or laminar. with_port only applies to
 // a signal-only endpoint, the one kind the kernel lets carry a port.
+struct mptcp_pm_auto_ctx {
+	uint32 addr_be;
+	uint8 id;
+};
+
+static void mptcp_pm_auto_match(void* ctx, uint8 id, uint32 addr_be)
+{
+	struct mptcp_pm_auto_ctx* c = (struct mptcp_pm_auto_ctx*)ctx;
+	if (addr_be == c->addr_be)
+		c->id = id;
+}
+
 static long syz_mptcp_pm_add_endpoint(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
-	long idx = a0;
+	long h = a0;
 	uint32 flags = (uint32)a1 | (uint32)a2;
 	bool signal_only = (flags & (MPTCP_PM_ADDR_FLAG_SIGNAL | MPTCP_PM_ADDR_FLAG_SUBFLOW)) == MPTCP_PM_ADDR_FLAG_SIGNAL;
-	uint16 port_h = (a3 && signal_only) ? MPTCP_PM_ENDPOINT_PORT_BASE + idx : 0;
+	uint16 port_h = (a3 && signal_only && h < MPTCP_PM_ENDPOINT_MAX) ? MPTCP_PM_ENDPOINT_PORT_BASE + h : 0;
+	bool is_auto = h >= MPTCP_PM_ENDPOINT_AUTO && h < MPTCP_PM_ENDPOINT_AUTO + MPTCP_PM_ENDPOINT_MAX;
+	uint8 id;
+	uint32 addr_be;
 
-	if (idx < 0 || idx >= MPTCP_PM_ENDPOINT_MAX)
+	if (h == MPTCP_PM_ENDPOINT_ID0 || !mptcp_pm_endpoint_resolve(h, &id, &addr_be))
 		return -1;
 	if (mptcp_pm_ensure_netlink() < 0)
 		return -1;
-	if (mptcp_pm_endpoint_cmd(MPTCP_PM_CMD_ADD_ADDR, idx, flags, port_h) < 0) {
-		debug("syz_mptcp_pm_add_endpoint: idx %ld flags 0x%x port %d: %d\n", idx, flags, port_h, errno);
+	if (is_auto)
+		mptcp_pm_auto_ids[h - MPTCP_PM_ENDPOINT_AUTO] = 0;
+	if (mptcp_pm_endpoint_cmd(MPTCP_PM_CMD_ADD_ADDR, h, flags, port_h) < 0) {
+		debug("syz_mptcp_pm_add_endpoint: endpoint %ld flags 0x%x port %d: %d\n", h, flags, port_h, errno);
 		return -1;
 	}
-	debug("syz_mptcp_pm_add_endpoint: idx %ld flags 0x%x port %d\n", idx, flags, port_h);
-	return idx;
+	if (is_auto) {
+		// The add's ACK doesn't carry the id the kernel chose: find it in a dump.
+		struct mptcp_pm_auto_ctx ctx = {addr_be, 0};
+		struct mptcp_nlmsg m;
+		mptcp_pm_endpoint_build(&m, MPTCP_PM_CMD_GET_ADDR, 0, 0, false, 0, 0);
+		if (mptcp_nlmsg_query(&m, true, mptcp_pm_auto_match, &ctx) < 0 || !ctx.id) {
+			debug("syz_mptcp_pm_add_endpoint: endpoint %ld added, id not found\n", h);
+			return -1;
+		}
+		mptcp_pm_auto_ids[h - MPTCP_PM_ENDPOINT_AUTO] = ctx.id;
+	}
+	debug("syz_mptcp_pm_add_endpoint: endpoint %ld flags 0x%x port %d\n", h, flags, port_h);
+	return h;
 }
 #endif
 
@@ -1061,8 +1229,6 @@ static long syz_mptcp_pm_del_endpoint(volatile long a0)
 {
 	long idx = a0;
 
-	if (idx < 0 || idx >= MPTCP_PM_ENDPOINT_MAX)
-		return -1;
 	if (mptcp_pm_ensure_netlink() < 0)
 		return -1;
 	if (mptcp_pm_endpoint_cmd(MPTCP_PM_CMD_DEL_ADDR, idx, 0, 0) < 0) {
@@ -1081,7 +1247,7 @@ static long syz_mptcp_pm_set_endpoint_flags(volatile long a0, volatile long a1)
 	long idx = a0;
 	uint32 flags = (uint32)a1 & (MPTCP_PM_ADDR_FLAG_BACKUP | MPTCP_PM_ADDR_FLAG_FULLMESH);
 
-	if (idx < 0 || idx >= MPTCP_PM_ENDPOINT_MAX)
+	if (idx == MPTCP_PM_ENDPOINT_ID0)
 		return -1;
 	if (mptcp_pm_ensure_netlink() < 0)
 		return -1;
@@ -2730,7 +2896,7 @@ static void mptcp_pm_nlmsg_addr4(struct mptcp_nlmsg* m, int typ, int id, uint32 
 }
 #endif
 
-#if MPTCP_NEED_PM_USERSPACE
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags
 static void mptcp_pm_nlmsg_start(struct mptcp_nlmsg* m, int cmd, uint32 token)
 {
 	struct genlmsghdr genlhdr;
@@ -2744,7 +2910,7 @@ static void mptcp_pm_nlmsg_start(struct mptcp_nlmsg* m, int cmd, uint32 token)
 
 #endif // MPTCP_NEED_PM_USERSPACE
 
-#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_get_endpoint
 // Announcements, so a removal names one that was made. A port announcement also
 // owns the listener opened on the announced address and port. Per program (the
 // executor forks per program); an announcement whose pair was closed or reused
@@ -2768,6 +2934,7 @@ static bool mptcp_announce_stale(const struct syz_mptcp_announce_slot* a)
 	return !__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE) || pair->generation != a->pair_generation;
 }
 
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove
 static void mptcp_announce_release(struct syz_mptcp_announce_slot* a)
 {
 	if (a->listen_fd > 0)
@@ -2775,6 +2942,7 @@ static void mptcp_announce_release(struct syz_mptcp_announce_slot* a)
 	a->listen_fd = 0;
 	__atomic_store_n(&a->in_use, false, __ATOMIC_RELEASE);
 }
+#endif
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce
@@ -2994,6 +3162,91 @@ static long syz_mptcp_pm_set_flags(volatile long a0, volatile long a1, volatile 
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR, -1, loc.sin_addr.s_addr, ntohs(loc.sin_port), flags);
 	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR_REMOTE, -1, rem.sin_addr.s_addr, ntohs(rem.sin_port), 0);
 	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0 ? -1 : 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_get_endpoint
+#define MPTCP_PM_GET_KERNEL 0
+#define MPTCP_PM_GET_ANNOUNCED 1
+
+// syz_mptcp_pm_get_endpoint(handle, kind): GET_ADDR of an in-kernel PM endpoint
+// by id (ip mptcp endpoint show id N), or of a userspace announcement by token
+// and id.
+static long syz_mptcp_pm_get_endpoint(volatile long a0, volatile long a1)
+{
+	long h = a0;
+	struct mptcp_nlmsg m;
+	uint8 id;
+	uint32 addr_be;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	if (a1 == MPTCP_PM_GET_ANNOUNCED) {
+		if (h < 0 || h >= MPTCP_ANNOUNCE_POOL_SIZE ||
+		    !__atomic_load_n(&syz_mptcp_announce_pool[h].in_use, __ATOMIC_ACQUIRE) ||
+		    mptcp_announce_stale(&syz_mptcp_announce_pool[h])) {
+			debug("syz_mptcp_pm_get_endpoint: announcement %ld not live\n", h);
+			return -1;
+		}
+		struct syz_mptcp_announce_slot* a = &syz_mptcp_announce_pool[h];
+		int fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_get_endpoint", a->pair_slot, a->server);
+		uint32 token = fd < 0 ? 0 : mptcp_pm_fd_token(fd);
+		if (!token)
+			return -1;
+		mptcp_pm_endpoint_build(&m, MPTCP_PM_CMD_GET_ADDR, a->id, 0, false, 0, 0);
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+	} else {
+		if (h == MPTCP_PM_ENDPOINT_ID0 || !mptcp_pm_endpoint_resolve(h, &id, &addr_be) || !id)
+			return -1;
+		mptcp_pm_endpoint_build(&m, MPTCP_PM_CMD_GET_ADDR, id, 0, false, 0, 0);
+	}
+	return mptcp_nlmsg_query(&m, false, NULL, NULL);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_dump_endpoints
+#define MPTCP_PM_DUMP_KERNEL 0
+#define MPTCP_PM_DUMP_CLIENT 1
+#define MPTCP_PM_DUMP_SERVER 2
+
+// syz_mptcp_pm_dump_endpoints(handle, kind): dump the in-kernel PM endpoint table
+// (ip mptcp endpoint show), or one userspace-PM end's address list (by token).
+static long syz_mptcp_pm_dump_endpoints(volatile long a0, volatile long a1)
+{
+	struct mptcp_nlmsg m;
+	struct genlmsghdr genlhdr;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = MPTCP_PM_CMD_GET_ADDR;
+	genlhdr.version = MPTCP_PM_VER;
+	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	if (a1 != MPTCP_PM_DUMP_KERNEL) {
+		int fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_dump_endpoints", a0, a1 == MPTCP_PM_DUMP_SERVER);
+		uint32 token = fd < 0 ? 0 : mptcp_pm_fd_token(fd);
+		if (!token)
+			return -1;
+		mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+	}
+	return mptcp_nlmsg_query(&m, true, NULL, NULL);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_get_limits
+// syz_mptcp_pm_get_limits(): GET_LIMITS (ip mptcp limits show).
+static long syz_mptcp_pm_get_limits(void)
+{
+	struct mptcp_nlmsg m;
+	struct genlmsghdr genlhdr;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = MPTCP_PM_CMD_GET_LIMITS;
+	genlhdr.version = MPTCP_PM_VER;
+	mptcp_nlmsg_init(&m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	return mptcp_nlmsg_query(&m, false, NULL, NULL);
 }
 #endif
 
