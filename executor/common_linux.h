@@ -4295,8 +4295,9 @@ static void reset_net_sysctls(const struct net_reset_state* st)
 		if (fd == -1)
 			continue;
 		int len = strlen(st->sysctl_values[i]);
-		if (write(fd, st->sysctl_values[i], len) != len)
+		if (write(fd, st->sysctl_values[i], len) != len) {
 			debug("failed to reset %s: %d\n", net_sysctls[i], errno);
+		}
 		close(fd);
 	}
 }
@@ -4359,15 +4360,17 @@ static void reset_mptcp_pm(const struct net_reset_state* st)
 	if (sock == -1)
 		return;
 	net_mptcp_pm_init(&nlmsg, family, NET_MPTCP_PM_CMD_FLUSH_ADDRS);
-	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0)
+	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0) {
 		debug("reset_mptcp_pm: flush failed: %d\n", errno);
+	}
 	net_mptcp_pm_init(&nlmsg, family, NET_MPTCP_PM_CMD_SET_LIMITS);
 	for (int type = 0; type < NET_MPTCP_PM_LIMITS_ATTR_MAX; type++) {
 		if (st->mptcp_limits_present[type])
 			netlink_attr(&nlmsg, type, &st->mptcp_limits[type], sizeof(st->mptcp_limits[type]));
 	}
-	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0)
+	if (netlink_send_ext(&nlmsg, sock, 0, NULL, false) < 0) {
 		debug("reset_mptcp_pm: set limits failed: %d\n", errno);
+	}
 	close(sock);
 }
 
