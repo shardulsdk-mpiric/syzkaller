@@ -1,0 +1,18 @@
+# Userspace path-manager signalling on a userspace/userspace pair, from both ends:
+# each end announces an address, the client marks its initial subflow backup and
+# the server clears it, the client joins a subflow and marks it backup, then the
+# announcements, the joined subflow's address and the client's id 0 are removed.
+
+r0 = syz_mptcp_pair_init(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x0, 0x0, &AUTO=<r1=>0x0, &AUTO=<r2=>0x0)
+r3 = syz_mptcp_pm_announce$server(r2, 0x1, 0x0, 0x0)
+r4 = syz_mptcp_pm_announce$client(r1, 0x0, 0x1, 0x0)
+syz_mptcp_pm_set_flags$client(r1, 0x0, 0x1)
+syz_mptcp_pm_set_flags$server(r2, 0x1, 0x0)
+r5 = syz_mptcp_join_subflow(r1, 0x1, 0x0, 0x0)
+syz_mptcp_pm_set_flags$subflow(r5, 0x2, 0x1)
+syz_mptcp_drive_traffic(r0, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pm_remove$announced(r3, 0x0)
+syz_mptcp_pm_remove$announced(r4, 0x0)
+syz_mptcp_pm_remove$subflow(r5, 0x1)
+syz_mptcp_pm_remove$id0_client(r1, 0x2)
+syz_mptcp_pair_close(r0)

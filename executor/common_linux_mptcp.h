@@ -374,7 +374,8 @@ struct syz_mptcp_info_short {
     __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy ||                              \
     __NR_syz_mptcp_subflow_info || __NR_syz_mptcp_inject_join_syn ||                              \
     __NR_syz_mptcp_join_close_race || __NR_syz_mptcp_close_server || __NR_syz_mptcp_disconnect || \
-    __NR_syz_mptcp_drive_traffic
+    __NR_syz_mptcp_drive_traffic || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove ||      \
+    __NR_syz_mptcp_pm_set_flags
 static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 #endif
 
@@ -393,18 +394,21 @@ static struct syz_mptcp_pair_slot syz_mptcp_pair_pool[MPTCP_PAIR_POOL_SIZE];
 // SUBFLOW_CREATE/DESTROY payloads nest attributes; GETFAMILY's request
 // doesn't) are needed by exactly this pair.
 #define MPTCP_NEED_SUBFLOW_CALL (SYZ_EXECUTOR || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || __NR_syz_mptcp_subflow_info)
+// Userspace PM signalling on one msk (announce / remove / set_flags).
+#define MPTCP_NEED_PM_USERSPACE (SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags)
 // In-kernel PM configuration: the endpoint commands share one message builder.
 #define MPTCP_NEED_PM_ENDPOINT (SYZ_EXECUTOR || __NR_syz_mptcp_pm_add_endpoint || __NR_syz_mptcp_pm_del_endpoint || __NR_syz_mptcp_pm_set_endpoint_flags)
 #define MPTCP_NEED_PM_CONFIG (MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_set_limits || __NR_syz_mptcp_pm_flush_endpoints)
-#define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || MPTCP_NEED_PM_CONFIG)
-#define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || MPTCP_NEED_PM_CONFIG)
+#define MPTCP_NEED_NLMSG (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_subflow_destroy || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
+#define MPTCP_NEED_PM_SETUP (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || MPTCP_NEED_PM_CONFIG || MPTCP_NEED_PM_USERSPACE)
 // The calls that apply netns settings for one pair (see mptcp_netns_save):
 // pair_init at creation, join for the subflow SYN, disconnect for the msk reset.
 // Only pair_init and disconnect switch the path manager.
 #define MPTCP_NEED_NETNS_SETTINGS (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_join_subflow || __NR_syz_mptcp_disconnect)
 #define MPTCP_NEED_PM_SWITCH (SYZ_EXECUTOR || __NR_syz_mptcp_pair_init || __NR_syz_mptcp_disconnect)
 
-#if MPTCP_NEED_SUBFLOW_CALL
+// remove and set_flags also act on a joined subflow.
+#if MPTCP_NEED_SUBFLOW_CALL || __NR_syz_mptcp_pm_remove || __NR_syz_mptcp_pm_set_flags
 static struct syz_mptcp_subflow_slot syz_mptcp_subflow_pool[MPTCP_SUBFLOW_POOL_SIZE];
 #endif
 
@@ -526,7 +530,7 @@ static void mptcp_nlmsg_attr(struct mptcp_nlmsg* m, int typ, const void* data, i
 // Only SUBFLOW_CREATE/DESTROY and the endpoint commands nest attributes
 // (GETFAMILY's request doesn't) -- see MPTCP_NEED_SUBFLOW_CALL and
 // MPTCP_NEED_PM_ENDPOINT.
-#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT
+#if MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_set_flags
 static void mptcp_nlmsg_nest_begin(struct mptcp_nlmsg* m, struct nlattr** nest_out, int typ)
 {
 	struct nlattr* attr = (struct nlattr*)m->pos;
@@ -547,7 +551,7 @@ static void mptcp_nlmsg_nest_end(struct mptcp_nlmsg* m, struct nlattr* nest)
 		return;
 	nest->nla_len = m->pos - (char*)nest;
 }
-#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT
+#endif // MPTCP_NEED_SUBFLOW_CALL || MPTCP_NEED_PM_ENDPOINT || announce || set_flags
 
 // Sends m and waits for one reply datagram. Returns the number of bytes
 // received (>=0) on success -- for a bare NLM_F_ACK request (our
@@ -1197,7 +1201,7 @@ static int mptcp_parse_mpcapable(const uint8* pkt, int len, uint64* sndr, uint64
 }
 
 static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile long a2, volatile long a3,
-				volatile long a4)
+				volatile long a4, volatile long a5)
 {
 	// server_addr / client_addr: not yet consulted, see file comment.
 	(void)a0;
@@ -1206,12 +1210,15 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	// MPTCP_PAIR_PM_*: which ends run the in-kernel path manager.
 	bool client_kernel_pm = ((unsigned long)a3 & MPTCP_PAIR_PM_CLIENT_KERNEL) != 0;
 	bool server_kernel_pm = ((unsigned long)a3 & MPTCP_PAIR_PM_SERVER_KERNEL) != 0;
-	// Typed handle for a userspace-PM client end (same value as the returned
-	// pair), NULL for the variants with a kernel-PM client. Invalid until the
-	// pair is established, so a failed call can't leave it aliasing slot 0.
+	// Typed handles for the userspace-PM ends (same value as the returned pair),
+	// NULL for an end that runs the in-kernel PM. Invalid until the pair is
+	// established, so a failed call can't leave them aliasing slot 0.
 	long* client_out = (long*)a4;
+	long* server_out = (long*)a5;
 	if (client_out)
 		*client_out = -1;
+	if (server_out)
+		*server_out = -1;
 
 	struct sockaddr_in srv_addr;
 	socklen_t alen = sizeof(srv_addr);
@@ -1495,6 +1502,8 @@ static long syz_mptcp_pair_init(volatile long a0, volatile long a1, volatile lon
 	syz_mptcp_pair_pool[slot].no_timestamps = (init_flags & MPTCP_INIT_NO_TIMESTAMPS) != 0;
 	if (client_out)
 		*client_out = slot;
+	if (server_out)
+		*server_out = slot;
 	debug("syz_mptcp_pair_init: pair %d established, port %d, token %u gen %u, pm client=%s server=%s\n",
 	      slot, ntohs(srv_addr.sin_port), syz_mptcp_pair_pool[slot].token,
 	      syz_mptcp_pair_pool[slot].generation,
@@ -2647,6 +2656,344 @@ static long syz_mptcp_drive_traffic(volatile long a0, volatile long a1, volatile
 	}
 	debug("syz_mptcp_drive_traffic: pair=%ld clamped=%d sent=%zd\n", slot, pair->rwnd_clamped, sent);
 	return sent < 0 ? 0 : (long)sent;
+}
+#endif
+
+// ---------- Userspace path-manager signalling ----------
+//
+// What a userspace PM daemon (mptcpd) does for one connection: announce an
+// address (ADD_ADDR), withdraw one (RM_ADDR), and mark a subflow backup or not
+// (MP_PRIO). Each command names one msk by its token, so the ops take the
+// userspace-PM end they act on, and only build commands the kernel accepts for
+// it. The token is read from the end's socket on every call: disconnect gives an
+// msk a new one.
+
+#if MPTCP_NEED_PM_USERSPACE
+// Resolves a userspace-PM end of a live pair to its socket. Returns -1 (with a
+// debug line) for a stale handle, a kernel-PM end, or a closed server end; the
+// descriptions only hand these ops userspace ends, so these are guards.
+static int mptcp_pm_userspace_end_fd(const char* who, long slot, bool server)
+{
+	if (slot < 0 || slot >= MPTCP_PAIR_POOL_SIZE) {
+		debug("%s: pair slot %ld out of range\n", who, slot);
+		return -1;
+	}
+	struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[slot];
+	if (!__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE)) {
+		debug("%s: pair slot %ld not in use\n", who, slot);
+		return -1;
+	}
+	if (server ? pair->server_kernel_pm : pair->client_kernel_pm) {
+		debug("%s: pair slot %ld %s end runs the in-kernel PM\n", who, slot, server ? "server" : "client");
+		return -1;
+	}
+	int fd = server ? pair->server_fd : pair->client_fd;
+	if (fd <= 0) {
+		debug("%s: pair slot %ld %s end closed\n", who, slot, server ? "server" : "client");
+		return -1;
+	}
+	return fd;
+}
+
+// The msk token of an MPTCP socket, 0 if it has none (fallen back, closed).
+static uint32 mptcp_pm_fd_token(int fd)
+{
+	struct syz_mptcp_info_short info;
+	socklen_t ilen = sizeof(info);
+
+	memset(&info, 0, sizeof(info));
+	if (getsockopt(fd, SOL_MPTCP, MPTCP_INFO, &info, &ilen) < 0)
+		return 0;
+	return info.mptcpi_token;
+}
+
+#endif // MPTCP_NEED_PM_USERSPACE
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_set_flags
+static void mptcp_pm_nlmsg_addr4(struct mptcp_nlmsg* m, int typ, int id, uint32 addr_be, uint16 port_h,
+				 uint32 flags)
+{
+	struct nlattr* nest = NULL;
+	uint16 fam_v = AF_INET;
+	uint8 id_v = (uint8)id;
+
+	mptcp_nlmsg_nest_begin(m, &nest, typ | NLA_F_NESTED);
+	mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_FAMILY, &fam_v, sizeof(fam_v));
+	if (id >= 0)
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_ID, &id_v, sizeof(id_v));
+	mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_ADDR4, &addr_be, sizeof(addr_be));
+	if (port_h)
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_PORT, &port_h, sizeof(port_h));
+	if (flags)
+		mptcp_nlmsg_attr(m, MPTCP_PM_ADDR_ATTR_FLAGS, &flags, sizeof(flags));
+	mptcp_nlmsg_nest_end(m, nest);
+}
+#endif
+
+#if MPTCP_NEED_PM_USERSPACE
+static void mptcp_pm_nlmsg_start(struct mptcp_nlmsg* m, int cmd, uint32 token)
+{
+	struct genlmsghdr genlhdr;
+
+	memset(&genlhdr, 0, sizeof(genlhdr));
+	genlhdr.cmd = cmd;
+	genlhdr.version = MPTCP_PM_VER;
+	mptcp_nlmsg_init(m, mptcp_pm_family_id, &genlhdr, sizeof(genlhdr));
+	mptcp_nlmsg_attr(m, MPTCP_PM_ATTR_TOKEN, &token, sizeof(token));
+}
+
+#endif // MPTCP_NEED_PM_USERSPACE
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce || __NR_syz_mptcp_pm_remove
+// Announcements, so a removal names one that was made. A port announcement also
+// owns the listener opened on the announced address and port. Per program (the
+// executor forks per program); an announcement whose pair was closed or reused
+// is stale and its slot is reclaimed by the next announce.
+#define MPTCP_ANNOUNCE_POOL_SIZE 32
+#define MPTCP_ANNOUNCE_ID_BASE 240
+#define MPTCP_ANNOUNCE_PORT_BASE 26200
+struct syz_mptcp_announce_slot {
+	bool in_use;
+	int pair_slot;
+	uint32 pair_generation;
+	bool server;
+	uint8 id;
+	int listen_fd;
+};
+static struct syz_mptcp_announce_slot syz_mptcp_announce_pool[MPTCP_ANNOUNCE_POOL_SIZE];
+
+static bool mptcp_announce_stale(const struct syz_mptcp_announce_slot* a)
+{
+	const struct syz_mptcp_pair_slot* pair = &syz_mptcp_pair_pool[a->pair_slot];
+	return !__atomic_load_n(&pair->in_use, __ATOMIC_ACQUIRE) || pair->generation != a->pair_generation;
+}
+
+static void mptcp_announce_release(struct syz_mptcp_announce_slot* a)
+{
+	if (a->listen_fd > 0)
+		close(a->listen_fd);
+	a->listen_fd = 0;
+	__atomic_store_n(&a->in_use, false, __ATOMIC_RELEASE);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_announce
+#define MPTCP_PM_END_CLIENT 0
+#define MPTCP_PM_END_SERVER 1
+
+// syz_mptcp_pm_announce(end, side, idx, port): ADD_ADDR of address idx (id
+// 240+idx) from the given end: 127.0.2.(idx+1) from the server, 127.0.3.(idx+1)
+// from the client. With port, first opens an MPTCP listener on that address and a
+// per-announcement port, the way a daemon that announces a port does, so a peer's
+// subflow to it reaches the kernel's announced-listener check. Returns the
+// announcement.
+static long syz_mptcp_pm_announce(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+{
+	long slot = a0;
+	bool server = a1 == MPTCP_PM_END_SERVER;
+	int idx = (int)(a2 & 7);
+	bool with_port = a3 != 0;
+	struct sockaddr_in sa;
+	struct mptcp_nlmsg m;
+	int one = 1;
+
+	int fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_announce", slot, server);
+	if (fd < 0)
+		return -1;
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	uint32 token = mptcp_pm_fd_token(fd);
+	if (!token) {
+		debug("syz_mptcp_pm_announce: no msk token\n");
+		return -1;
+	}
+
+	int ann = -1;
+	for (int i = 0; i < MPTCP_ANNOUNCE_POOL_SIZE; i++) {
+		struct syz_mptcp_announce_slot* a = &syz_mptcp_announce_pool[i];
+		bool expected = false;
+		if (__atomic_load_n(&a->in_use, __ATOMIC_ACQUIRE) && mptcp_announce_stale(a))
+			mptcp_announce_release(a);
+		if (ann < 0 && __atomic_compare_exchange_n(&a->in_use, &expected, true, false,
+							   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			ann = i;
+	}
+	if (ann < 0) {
+		debug("syz_mptcp_pm_announce: announcement pool exhausted\n");
+		return -1;
+	}
+	struct syz_mptcp_announce_slot* a = &syz_mptcp_announce_pool[ann];
+	a->pair_slot = slot;
+	a->pair_generation = syz_mptcp_pair_pool[slot].generation;
+	a->server = server;
+	a->id = MPTCP_ANNOUNCE_ID_BASE + idx;
+	a->listen_fd = 0;
+
+	uint32 addr_be = htonl((server ? 0x7f000201 : 0x7f000301) + idx);
+	uint16 port_h = 0;
+	if (with_port) {
+		port_h = MPTCP_ANNOUNCE_PORT_BASE + ann;
+		int lfd = socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
+		memset(&sa, 0, sizeof(sa));
+		sa.sin_family = AF_INET;
+		sa.sin_addr.s_addr = addr_be;
+		sa.sin_port = htons(port_h);
+		if (lfd < 0 || setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0 ||
+		    bind(lfd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || listen(lfd, 8) < 0) {
+			debug("syz_mptcp_pm_announce: listener on port %d: %d\n", port_h, errno);
+			if (lfd >= 0)
+				close(lfd);
+			mptcp_announce_release(a);
+			return -1;
+		}
+		a->listen_fd = lfd;
+	}
+
+	mptcp_pm_nlmsg_start(&m, MPTCP_PM_CMD_ANNOUNCE, token);
+	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR, a->id, addr_be, port_h, MPTCP_PM_ADDR_FLAG_SIGNAL);
+	if (mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0) {
+		int err = errno;
+		debug("syz_mptcp_pm_announce: ANNOUNCE: %d\n", err);
+		mptcp_announce_release(a);
+		errno = err;
+		return -1;
+	}
+	debug("syz_mptcp_pm_announce: pair %ld %s announced id %d port %d\n", slot,
+	      server ? "server" : "client", a->id, port_h);
+	return ann;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_remove
+#define MPTCP_PM_REMOVE_ANNOUNCED 0
+#define MPTCP_PM_REMOVE_SUBFLOW 1
+#define MPTCP_PM_REMOVE_ID0_CLIENT 2
+#define MPTCP_PM_REMOVE_ID0_SERVER 3
+
+// REMOVE of local id `id` on the msk behind fd.
+static long mptcp_pm_remove_id(const char* who, int fd, uint8 id)
+{
+	struct mptcp_nlmsg m;
+	uint32 token = mptcp_pm_fd_token(fd);
+
+	if (!token) {
+		debug("%s: no msk token\n", who);
+		return -1;
+	}
+	mptcp_pm_nlmsg_start(&m, MPTCP_PM_CMD_REMOVE, token);
+	mptcp_nlmsg_attr(&m, MPTCP_PM_ATTR_LOC_ID, &id, sizeof(id));
+	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0 ? -1 : 0;
+}
+
+// syz_mptcp_pm_remove(handle, kind): REMOVE of an announcement, of a joined
+// subflow's local address id (on the client msk), or of id 0 on either end.
+static long syz_mptcp_pm_remove(volatile long a0, volatile long a1)
+{
+	long h = a0;
+	int fd;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	switch ((int)a1) {
+	case MPTCP_PM_REMOVE_ANNOUNCED: {
+		if (h < 0 || h >= MPTCP_ANNOUNCE_POOL_SIZE ||
+		    !__atomic_load_n(&syz_mptcp_announce_pool[h].in_use, __ATOMIC_ACQUIRE)) {
+			debug("syz_mptcp_pm_remove: announcement %ld not in use\n", h);
+			return -1;
+		}
+		struct syz_mptcp_announce_slot* a = &syz_mptcp_announce_pool[h];
+		if (mptcp_announce_stale(a)) {
+			debug("syz_mptcp_pm_remove: announcement %ld outlived its pair\n", h);
+			mptcp_announce_release(a);
+			return -1;
+		}
+		fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_remove", a->pair_slot, a->server);
+		long r = fd < 0 ? -1 : mptcp_pm_remove_id("syz_mptcp_pm_remove", fd, a->id);
+		int err = errno;
+		mptcp_announce_release(a);
+		errno = err;
+		return r;
+	}
+	case MPTCP_PM_REMOVE_SUBFLOW: {
+		if (h < 0 || h >= MPTCP_SUBFLOW_POOL_SIZE ||
+		    !__atomic_load_n(&syz_mptcp_subflow_pool[h].in_use, __ATOMIC_ACQUIRE)) {
+			debug("syz_mptcp_pm_remove: subflow %ld not in use\n", h);
+			return -1;
+		}
+		struct syz_mptcp_subflow_slot* sub = &syz_mptcp_subflow_pool[h];
+		if (syz_mptcp_pair_pool[sub->pair_slot].generation != sub->pair_generation) {
+			debug("syz_mptcp_pm_remove: subflow %ld outlived its pair\n", h);
+			return -1;
+		}
+		fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_remove", sub->pair_slot, false);
+		return fd < 0 ? -1 : mptcp_pm_remove_id("syz_mptcp_pm_remove", fd, sub->addr_id);
+	}
+	case MPTCP_PM_REMOVE_ID0_CLIENT:
+	case MPTCP_PM_REMOVE_ID0_SERVER:
+		fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_remove", h, a1 == MPTCP_PM_REMOVE_ID0_SERVER);
+		return fd < 0 ? -1 : mptcp_pm_remove_id("syz_mptcp_pm_remove", fd, 0);
+	}
+	return -1;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_mptcp_pm_set_flags
+#define MPTCP_PM_PRIO_CLIENT 0
+#define MPTCP_PM_PRIO_SERVER 1
+#define MPTCP_PM_PRIO_SUBFLOW 2
+
+// syz_mptcp_pm_set_flags(handle, kind, backup): SET_FLAGS with a token, which the
+// kernel turns into an MP_PRIO on the one subflow matching the exact local and
+// remote address: the initial subflow seen from either end, or a joined subflow
+// from the client end.
+static long syz_mptcp_pm_set_flags(volatile long a0, volatile long a1, volatile long a2)
+{
+	long h = a0;
+	uint32 flags = a2 ? MPTCP_PM_ADDR_FLAG_BACKUP : 0;
+	struct sockaddr_in loc, rem;
+	struct mptcp_nlmsg m;
+	int fd;
+
+	if (mptcp_pm_ensure_netlink() < 0)
+		return -1;
+	memset(&loc, 0, sizeof(loc));
+	memset(&rem, 0, sizeof(rem));
+	if (a1 == MPTCP_PM_PRIO_SUBFLOW) {
+		if (h < 0 || h >= MPTCP_SUBFLOW_POOL_SIZE ||
+		    !__atomic_load_n(&syz_mptcp_subflow_pool[h].in_use, __ATOMIC_ACQUIRE)) {
+			debug("syz_mptcp_pm_set_flags: subflow %ld not in use\n", h);
+			return -1;
+		}
+		struct syz_mptcp_subflow_slot* sub = &syz_mptcp_subflow_pool[h];
+		if (syz_mptcp_pair_pool[sub->pair_slot].generation != sub->pair_generation) {
+			debug("syz_mptcp_pm_set_flags: subflow %ld outlived its pair\n", h);
+			return -1;
+		}
+		fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_set_flags", sub->pair_slot, false);
+		loc.sin_addr.s_addr = sub->local_addr_be;
+		loc.sin_port = htons(sub->local_port_h);
+		rem.sin_addr.s_addr = htonl(0x7f000001);
+		rem.sin_port = htons(sub->remote_port_h);
+	} else {
+		socklen_t len = sizeof(loc);
+		fd = mptcp_pm_userspace_end_fd("syz_mptcp_pm_set_flags", h, a1 == MPTCP_PM_PRIO_SERVER);
+		if (fd >= 0 && getsockname(fd, (struct sockaddr*)&loc, &len) < 0)
+			fd = -1;
+		len = sizeof(rem);
+		if (fd >= 0 && getpeername(fd, (struct sockaddr*)&rem, &len) < 0)
+			fd = -1;
+	}
+	if (fd < 0)
+		return -1;
+	uint32 token = mptcp_pm_fd_token(fd);
+	if (!token) {
+		debug("syz_mptcp_pm_set_flags: no msk token\n");
+		return -1;
+	}
+	mptcp_pm_nlmsg_start(&m, MPTCP_PM_CMD_SET_FLAGS, token);
+	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR, -1, loc.sin_addr.s_addr, ntohs(loc.sin_port), flags);
+	mptcp_pm_nlmsg_addr4(&m, MPTCP_PM_ATTR_ADDR_REMOTE, -1, rem.sin_addr.s_addr, ntohs(rem.sin_port), 0);
+	return mptcp_nlmsg_send(&m, mptcp_pm_genl_sock) < 0 ? -1 : 0;
 }
 #endif
 

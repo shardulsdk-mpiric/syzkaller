@@ -41,12 +41,12 @@ resource mptcp_subflow[intptr]: 0xffffffffffffffff
 # creates the pair and restores the netns setting afterwards, so nothing outlives
 # the call.
 #
-# A pair whose client end runs the userspace PM also returns that end as a typed
-# handle (same value as mptcp_pair, the pool slot). Ops that need a userspace
-# client take it, so they are not generated against a kernel-PM client they cannot
-# act on. PM-agnostic ops keep taking mptcp_pair. Handles for the other end/PM
-# combinations are added together with the ops that consume them.
+# Each end that runs the userspace PM is also returned as a typed handle (same
+# value as mptcp_pair, the pool slot). Ops that need a userspace PM on a given end
+# take that end's handle, so they are not generated against a kernel-PM end they
+# cannot act on. PM-agnostic ops keep taking mptcp_pair.
 resource mptcp_client_userspace[intptr]: 0xffffffffffffffff
+resource mptcp_server_userspace[intptr]: 0xffffffffffffffff
 
 # Harness constants for the pm argument (see .const + executor #define): bit 0
 # selects the in-kernel PM for the client end, bit 1 for the server end.
@@ -56,11 +56,11 @@ define MPTCP_PAIR_PM_SERVER_KERNEL	2
 define MPTCP_PAIR_PM_KERNEL	3
 
 # Both ends userspace PM. The bare name keeps this behaviour for existing programs.
-# Variants with a kernel-PM client pass no client handle (const 0, a NULL pointer).
-syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_USERSPACE], client ptr[out, mptcp_client_userspace]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$server_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_SERVER_KERNEL], client ptr[out, mptcp_client_userspace]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_CLIENT_KERNEL], client const[0]) mptcp_pair (remote_cover)
-syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client const[0]) mptcp_pair (remote_cover)
+# An end that runs the in-kernel PM gets no handle (const 0, a NULL pointer).
+syz_mptcp_pair_init(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_USERSPACE], client ptr[out, mptcp_client_userspace], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
+syz_mptcp_pair_init$server_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_SERVER_KERNEL], client ptr[out, mptcp_client_userspace], server const[0]) mptcp_pair (remote_cover)
+syz_mptcp_pair_init$client_kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_CLIENT_KERNEL], client const[0], server ptr[out, mptcp_server_userspace]) mptcp_pair (remote_cover)
+syz_mptcp_pair_init$kernel(server_addr ptr[in, sockaddr_in], client_addr ptr[in, sockaddr_in], flags flags[mptcp_pair_init_flags], pm const[MPTCP_PAIR_PM_KERNEL], client const[0], server const[0]) mptcp_pair (remote_cover)
 syz_mptcp_pair_close(pair mptcp_pair)
 
 # addr_id: local address id announced to the kernel for this subflow
@@ -234,3 +234,43 @@ syz_mptcp_pm_del_endpoint(ep mptcp_pm_endpoint)
 syz_mptcp_pm_set_endpoint_flags$subflow(ep mptcp_pm_endpoint_subflow, flags flags[mptcp_pm_endpoint_change_flags])
 syz_mptcp_pm_set_endpoint_flags$signal(ep mptcp_pm_endpoint_signal, flags flags[mptcp_pm_endpoint_backup_flag])
 syz_mptcp_pm_flush_endpoints()
+
+# Userspace path-manager signalling (what a daemon such as mptcpd does for one
+# connection, ip-mptcp(8) "endpoint add/delete ... token", "endpoint change"): the
+# commands act on one msk, named by its token, so they take that end's handle.
+#
+# announce: ADD_ADDR for address idx with id 240+idx (clear of join_subflow's ids in
+# practice). The server end announces 127.0.2.(idx+1), the client end 127.0.3.(idx+1).
+# A kernel-PM peer that accepts it (see syz_mptcp_pm_set_limits) opens a subflow to
+# it; that needs a server listener on 0.0.0.0 (MPTCP_INIT_LISTEN_ANY) or, with
+# $server_port, the listener the call opens on the announced address and port, as a
+# daemon does. Announcements are resources so a removal is only generated for one
+# that was made.
+resource mptcp_pm_announced[intptr]: 0xffffffffffffffff
+define MPTCP_PM_END_CLIENT	0
+define MPTCP_PM_END_SERVER	1
+syz_mptcp_pm_announce$client(end mptcp_client_userspace, side const[MPTCP_PM_END_CLIENT], idx int8[0:7], port const[0]) mptcp_pm_announced
+syz_mptcp_pm_announce$server(end mptcp_server_userspace, side const[MPTCP_PM_END_SERVER], idx int8[0:7], port const[0]) mptcp_pm_announced
+syz_mptcp_pm_announce$server_port(end mptcp_server_userspace, side const[MPTCP_PM_END_SERVER], idx int8[0:7], port const[1]) mptcp_pm_announced
+
+# remove: RM_ADDR for an announced address, for a joined subflow's local address
+# (the kernel closes the subflows using it), or for id 0, the initial subflow's
+# address (the kernel's dedicated id-0 path).
+define MPTCP_PM_REMOVE_ANNOUNCED	0
+define MPTCP_PM_REMOVE_SUBFLOW	1
+define MPTCP_PM_REMOVE_ID0_CLIENT	2
+define MPTCP_PM_REMOVE_ID0_SERVER	3
+syz_mptcp_pm_remove$announced(ann mptcp_pm_announced, kind const[MPTCP_PM_REMOVE_ANNOUNCED])
+syz_mptcp_pm_remove$subflow(sub mptcp_subflow, kind const[MPTCP_PM_REMOVE_SUBFLOW])
+syz_mptcp_pm_remove$id0_client(end mptcp_client_userspace, kind const[MPTCP_PM_REMOVE_ID0_CLIENT])
+syz_mptcp_pm_remove$id0_server(end mptcp_server_userspace, kind const[MPTCP_PM_REMOVE_ID0_SERVER])
+
+# set_flags: mark one subflow backup or not (MP_PRIO to the peer), named by its exact
+# local and remote address: the initial subflow from either end, or a joined subflow
+# from the client end.
+define MPTCP_PM_PRIO_CLIENT	0
+define MPTCP_PM_PRIO_SERVER	1
+define MPTCP_PM_PRIO_SUBFLOW	2
+syz_mptcp_pm_set_flags$client(end mptcp_client_userspace, kind const[MPTCP_PM_PRIO_CLIENT], backup int8[0:1])
+syz_mptcp_pm_set_flags$server(end mptcp_server_userspace, kind const[MPTCP_PM_PRIO_SERVER], backup int8[0:1])
+syz_mptcp_pm_set_flags$subflow(sub mptcp_subflow, kind const[MPTCP_PM_PRIO_SUBFLOW], backup int8[0:1])

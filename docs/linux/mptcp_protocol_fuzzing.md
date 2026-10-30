@@ -39,9 +39,9 @@ All produce/consume real syzkaller resources (`mptcp_pair`, `mptcp_subflow`,
 
 | pseudo-syscall | what it does |
 |---|---|
-| `syz_mptcp_pair_init(server, client, flags)` → `mptcp_pair` | establish an MP_CAPABLE pair on loopback; `flags`: `RWND_CLAMP` (pin rcvbuf small), `CAPTURE_KEYS` (sniff the MP_CAPABLE keys off the wire for later HMAC math) |
+| `syz_mptcp_pair_init[$server_kernel\|$client_kernel\|$kernel](server, client, flags, pm, client_end, server_end)` → `mptcp_pair` | establish an MP_CAPABLE pair on loopback, each end on the path manager the variant names (bare name: both userspace). Each userspace-PM end is also returned as a typed handle (`mptcp_client_userspace`, `mptcp_server_userspace`). The PM, checksum and timestamps settings are applied only while the pair is created and restored afterwards. `flags`: `RWND_CLAMP` (pin rcvbuf small), `CAPTURE_KEYS` (sniff the MP_CAPABLE keys off the wire for later HMAC math), `NO_TIMESTAMPS`, `CHECKSUM`, `LISTEN_ANY` (listener on 0.0.0.0, for subflows to announced addresses), `DENY_JOIN_ID0` |
 | `syz_mptcp_pair_close(pair)` | tear the pair down (consuming) |
-| `syz_mptcp_join_subflow(pair, addr_id, backup, mut_op)` → `mptcp_subflow` | drive a real MP_JOIN handshake for a new subflow; `mut_op` optionally corrupts the join's HMAC/nonce via the mutation layer |
+| `syz_mptcp_join_subflow(client_end, addr_id, backup, mut_op)` → `mptcp_subflow` | drive a real MP_JOIN handshake for a new subflow; `mut_op` optionally corrupts the join's HMAC/nonce via the mutation layer |
 | `syz_mptcp_subflow_destroy(subflow)` | remove a subflow via the PM |
 | `syz_mptcp_subflow_info(subflow)` | read subflow state back |
 | `syz_mptcp_inject_join_syn(pair)` | inject one raw MP_JOIN SYN carrying the pair's token (drives the incoming-join softirq path cheaply) |
@@ -49,6 +49,23 @@ All produce/consume real syzkaller resources (`mptcp_pair`, `mptcp_subflow`,
 | `syz_mptcp_close_server(pair)` | SO_LINGER-close the accepted server msk |
 | `syz_mptcp_disconnect(pair)` | `connect(AF_UNSPEC)` disconnect of the accepted msk |
 | `syz_mptcp_drive_traffic(pair, data, len)` | push data client→server; on an RWND_CLAMP pair it leaves data on the send head to exercise the softirq deferred-push path |
+
+In-kernel path manager (netns-wide, like `ip mptcp endpoint` / `ip mptcp limits`; the
+per-program netns reset flushes endpoints and restores the limits):
+
+| pseudo-syscall | what it does |
+|---|---|
+| `syz_mptcp_pm_set_limits(subflows, add_addr_accepted, subflow_retries)` | in-kernel PM limits |
+| `syz_mptcp_pm_add_endpoint$subflow\|$signal\|$signal_port(idx, kind, mods, port)` → endpoint | add endpoint idx (id idx+1, 127.0.1.(idx+1) on lo) of a kind the kernel accepts |
+| `syz_mptcp_pm_del_endpoint(ep)`, `syz_mptcp_pm_set_endpoint_flags$subflow\|$signal(ep, flags)`, `syz_mptcp_pm_flush_endpoints()` | remove, toggle backup/fullmesh, remove all |
+
+Userspace path manager, on one msk (what a daemon such as mptcpd does):
+
+| pseudo-syscall | what it does |
+|---|---|
+| `syz_mptcp_pm_announce$client\|$server\|$server_port(end, side, idx, port)` → `mptcp_pm_announced` | ADD_ADDR of 127.0.2.(idx+1) from the server or 127.0.3.(idx+1) from the client (id 240+idx); `$server_port` also opens a listener on the announced address and port, as a daemon does |
+| `syz_mptcp_pm_remove$announced\|$subflow\|$id0_client\|$id0_server(handle, kind)` | RM_ADDR of an announcement, of a joined subflow's address, or of id 0 |
+| `syz_mptcp_pm_set_flags$client\|$server\|$subflow(handle, kind, backup)` | MP_PRIO on the initial subflow from either end, or on a joined subflow |
 
 Plus the upstream MPTCP path-manager netlink commands (`sendmsg$MPTCP_PM_CMD_*`), now
 usable end-to-end via the `mptcp_token` resource.
