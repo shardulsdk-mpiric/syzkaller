@@ -1567,6 +1567,8 @@ static int mptcp_pm_side_begin(int netns, bool need_veth, int* entered)
 #define MPTCP_PM_ENDPOINT_SIDES (MPTCP_PM_ENDPOINT_CLIENT | MPTCP_PM_ENDPOINT_SERVER)
 // Kernel ids of the $client table start here: it shares this netns, and so the
 // kernel's id space, with the loopback table (ids 1-9 and kernel-assigned ones).
+// It is the same kernel table: a bare flush also removes $client endpoints, and
+// $client fixed ids (33+) raise next_id, so later bare $auto ids land above them.
 #define MPTCP_PM_CLIENT_ID_OFFSET 32
 // Port of a signal endpoint created with a port: the kernel opens its own
 // listener there (mptcp_pm_nl_create_listen_socket). Per netns, so per proc.
