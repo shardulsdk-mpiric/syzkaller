@@ -122,7 +122,13 @@ mptcp_mut_ops = MPTCP_MUT_NONE, MPTCP_MUT_HMAC_FLIP, MPTCP_MUT_HMAC_ZERO, MPTCP_
 # The join is a userspace-PM command (SUBFLOW_CREATE) issued on the client msk, so it
 # takes a userspace client end. mptcp_subflow is produced only here, so the ops that
 # consume it inherit that guarantee.
+#
+# A mut_op other than NONE needs the executor's NFQUEUE layer, which needs kernel
+# support (the nft queue expression, or the xtables NFQUEUE target with
+# nft_compat); syz-manager disables this call on a kernel without it. The $plain
+# variant never mutates and stays enabled there.
 syz_mptcp_join_subflow(client mptcp_client_userspace, addr_id int8, backup int8[0:1], mut_op flags[mptcp_mut_ops]) mptcp_subflow (remote_cover)
+syz_mptcp_join_subflow$plain(client mptcp_client_userspace, addr_id int8, backup int8[0:1], mut_op const[MPTCP_MUT_NONE]) mptcp_subflow (remote_cover)
 syz_mptcp_subflow_destroy(subflow mptcp_subflow)
 
 # Non-consuming op: takes a live mptcp_subflow WITHOUT destroying it (queries the
@@ -321,6 +327,7 @@ syz_mptcp_pm_set_flags$subflow(sub mptcp_subflow, kind const[MPTCP_PM_PRIO_SUBFL
 # subflows run at full speed and go idle between pushes: the state the scheduler
 # and the reinjection logic react to. Done in the NFQUEUE layer, scoped to the
 # subflow's addresses and ports, so other pairs of the process are not affected.
+# Like the mutating join, it needs NFQUEUE kernel support (see join_subflow).
 define MPTCP_STALL_TARGET_SUBFLOW	0
 define MPTCP_STALL_TARGET_INITIAL	1
 define MPTCP_STALL_DELAY	0
@@ -338,7 +345,8 @@ syz_mptcp_subflow_stall(subflow mptcp_subflow, target flags[mptcp_stall_targets]
 # 1s keepalive on the msk while the subflow's packets are dropped, about 2s). The
 # in-kernel PM can then re-create it (see the subflow_retries limit of
 # syz_mptcp_pm_set_limits) while another subflow can still send. Only generated
-# for a kernel-PM client end, the only PM that acts on it.
+# for a kernel-PM client end, the only PM that acts on it. The drop needs NFQUEUE
+# kernel support (see join_subflow).
 syz_mptcp_subflow_fail(client mptcp_client_kernel, which int8[0:7]) (timeout[4000], prog_timeout[5000], remote_cover)
 
 # syz_mptcp_set_sysctl: write one net.mptcp sysctl with a valid value while the rest

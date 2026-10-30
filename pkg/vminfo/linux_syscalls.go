@@ -91,7 +91,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_genetlink_get_family_id":     linuxSyzGenetlinkGetFamilyIDSupported,
 	"syz_mptcp_pair_init":             linuxSyzMptcpSupported,
 	"syz_mptcp_pair_close":            linuxSyzMptcpSupported,
-	"syz_mptcp_join_subflow":          linuxSyzMptcpSupported,
+	"syz_mptcp_join_subflow":          linuxSyzMptcpNfqueueSupported,
 	"syz_mptcp_subflow_destroy":       linuxSyzMptcpSupported,
 	"syz_mptcp_subflow_info":          linuxSyzMptcpSupported,
 	"syz_mptcp_inject_join_syn":       linuxSyzMptcpSupported,
@@ -111,8 +111,8 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_mptcp_pm_get_endpoint":       linuxSyzMptcpSupported,
 	"syz_mptcp_pm_dump_endpoints":     linuxSyzMptcpSupported,
 	"syz_mptcp_pm_get_limits":         linuxSyzMptcpSupported,
-	"syz_mptcp_subflow_stall":         linuxSyzMptcpSupported,
-	"syz_mptcp_subflow_fail":          linuxSyzMptcpSupported,
+	"syz_mptcp_subflow_stall":         linuxSyzMptcpNfqueueSupported,
+	"syz_mptcp_subflow_fail":          linuxSyzMptcpNfqueueSupported,
 	"syz_mptcp_set_sysctl":            linuxSyzMptcpSupported,
 	"syz_mptcp_netns_cycle":           linuxSyzMptcpSupported,
 	"syz_quic_conn_init":              linuxSyzQuicSupported,
@@ -365,6 +365,72 @@ func linuxSyzMptcpSupported(ctx *checkContext, call *prog.Syscall) string {
 	// rejects with EPROTONOSUPPORT when it is built without CONFIG_MPTCP.
 	return ctx.callSucceeds(fmt.Sprintf("socket(0x%x, 0x%x, 0x%x)",
 		ctx.val("AF_INET"), ctx.val("SOCK_STREAM"), ctx.val("IPPROTO_MPTCP")))
+}
+
+// linuxSyzMptcpNfqueueSupported gates the MPTCP calls that need the executor's
+// NFQUEUE layer (common_linux_mptcp_nfq.h): the mutating join, subflow_stall and
+// subflow_fail. The layer diverts loopback TCP to a userspace queue with an
+// nftables rule that ends either in the nft "queue" expression
+// (CONFIG_NFT_QUEUE) or, when that is missing, in the xtables NFQUEUE target
+// through nft_compat (CONFIG_NFT_COMPAT + CONFIG_NETFILTER_XT_TARGET_NFQUEUE),
+// and reads the queue over nfnetlink_queue (CONFIG_NETFILTER_NETLINK_QUEUE).
+// Without them the rule cannot be installed and the calls could only fail, so
+// they are disabled here rather than run. syz_mptcp_join_subflow$plain never
+// mutates and keeps the plain MPTCP gate.
+func linuxSyzMptcpNfqueueSupported(ctx *checkContext, call *prog.Syscall) string {
+	if reason := linuxSyzMptcpSupported(ctx, call); reason != "" {
+		return reason
+	}
+	if call.Name == "syz_mptcp_join_subflow$plain" {
+		return ""
+	}
+	kallsyms, err := ctx.readFile("/proc/kallsyms")
+	if err != nil {
+		return fmt.Sprintf("can't read /proc/kallsyms to check NFQUEUE support: %v", err)
+	}
+	return linuxMptcpNfqueueReason(kallsyms)
+}
+
+// linuxMptcpNfqueueReason decides NFQUEUE support from the kernel's symbols: one
+// function that only each needed piece of code defines (built in, or a loaded
+// module). Returns "" when the layer can work, else why not.
+func linuxMptcpNfqueueReason(kallsyms []byte) string {
+	have := kallsymsFind(kallsyms, "nf_tables_newrule", "nfqnl_enqueue_packet",
+		"nft_queue_eval", "nft_target_eval_xt", "nfqueue_tg_v3")
+	if !have["nf_tables_newrule"] {
+		return "NFQUEUE layer: nftables is not enabled (CONFIG_NF_TABLES)"
+	}
+	if !have["nfqnl_enqueue_packet"] {
+		return "NFQUEUE layer: nfnetlink_queue is not enabled (CONFIG_NETFILTER_NETLINK_QUEUE)"
+	}
+	if have["nft_queue_eval"] || (have["nft_target_eval_xt"] && have["nfqueue_tg_v3"]) {
+		return ""
+	}
+	return "NFQUEUE layer: no nft queue expression (CONFIG_NFT_QUEUE) and no xtables NFQUEUE " +
+		"target with nft_compat (CONFIG_NFT_COMPAT, CONFIG_NETFILTER_XT_TARGET_NFQUEUE)"
+}
+
+// kallsymsFind reports which of syms /proc/kallsyms lists, also as a
+// compiler-renamed local (sym.cold, sym.isra.0, sym.llvm.123, ...).
+func kallsymsFind(kallsyms []byte, syms ...string) map[string]bool {
+	found := make(map[string]bool)
+	for _, line := range bytes.Split(kallsyms, []byte("\n")) {
+		// "<addr> <type> <name>[\t[module]]"
+		fields := bytes.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		name := string(fields[2])
+		if i := strings.IndexByte(name, '.'); i > 0 {
+			name = name[:i]
+		}
+		for _, sym := range syms {
+			if name == sym {
+				found[sym] = true
+			}
+		}
+	}
+	return found
 }
 
 func linuxSyzQuicSupported(ctx *checkContext, call *prog.Syscall) string {

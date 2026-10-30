@@ -37,6 +37,11 @@ func TestLinuxSyscalls(t *testing.T) {
 			Exists: true,
 			Data:   []byte(strings.Join(filesystems, "\nnodev\t")),
 		},
+		{
+			Name:   "/proc/kallsyms",
+			Exists: true,
+			Data:   []byte(kallsymsNfqueueNft),
+		},
 	}
 	stop := make(chan struct{})
 	go createSuccessfulResults(checker, stop)
@@ -478,5 +483,84 @@ func TestLinuxCapabilities(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Equal(t, tc.want, linux{}.capabilities(tc.files))
 		})
+	}
+}
+
+// Kernel symbol tables for the MPTCP NFQUEUE gate: with the nft queue
+// expression, with only the xtables NFQUEUE target through nft_compat (the audit2
+// kernels), and with neither.
+const (
+	kallsymsNfqueueBase = "ffffffff84e40000 t nf_tables_newrule\n" +
+		"ffffffff84dff860 t nfqnl_enqueue_packet\n"
+	kallsymsNfqueueNft    = kallsymsNfqueueBase + "ffffffff84e50000 t nft_queue_eval\n"
+	kallsymsNfqueueCompat = kallsymsNfqueueBase + "ffffffff84f41be0 t nft_target_eval_xt\n" +
+		"ffffffff84f82df0 t nfqueue_tg_v3\n"
+	kallsymsNfqueueNone = kallsymsNfqueueBase + "ffffffff84f41be0 t nft_target_eval_xt\n"
+)
+
+func TestLinuxMptcpNfqueueGate(t *testing.T) {
+	gated := map[string]bool{
+		"syz_mptcp_join_subflow":  true,
+		"syz_mptcp_subflow_stall": true,
+		"syz_mptcp_subflow_fail":  true,
+	}
+	for _, test := range []struct {
+		name     string
+		kallsyms string
+		disabled bool
+	}{
+		{"nft queue", kallsymsNfqueueNft, false},
+		{"xtables target", kallsymsNfqueueCompat, false},
+		// A loaded module and a compiler-renamed local still count.
+		{"module", kallsymsNfqueueBase + "ffffffffc0a00000 t nft_queue_eval.cold\t[nft_queue]\n", false},
+		{"none", kallsymsNfqueueNone, true},
+		{"no kallsyms", "", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig(t, targets.Linux, targets.AMD64)
+			checker := New(cfg)
+			files := []*flatrpc.FileInfo{
+				{Name: "/proc/version", Exists: true, Data: []byte("Linux version 6.8.0-dirty")},
+				{Name: "/proc/filesystems", Exists: true, Data: []byte("nodev\tsysfs\next4\n")},
+			}
+			if test.kallsyms != "" {
+				files = append(files, &flatrpc.FileInfo{Name: "/proc/kallsyms", Exists: true,
+					Data: []byte(test.kallsyms)})
+			}
+			stop := make(chan struct{})
+			go createSuccessfulResults(checker, stop)
+			enabled, disabled, _, err := checker.Run(context.Background(), files, allFeatures())
+			close(stop)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := 0
+			for _, id := range cfg.Syscalls {
+				call := cfg.Target.Syscalls[id]
+				if !strings.HasPrefix(call.Name, "syz_mptcp_") {
+					continue
+				}
+				seen++
+				wantDisabled := test.disabled && gated[call.Name]
+				if wantDisabled == enabled[call] {
+					t.Errorf("%v: enabled=%v, want %v (reason %q)", call.Name, enabled[call],
+						!wantDisabled, disabled[call])
+				}
+				if wantDisabled && !strings.Contains(disabled[call], "NFQUEUE") {
+					t.Errorf("%v: disabled for %q, want an NFQUEUE reason", call.Name, disabled[call])
+				}
+			}
+			// The non-mutating join stays enabled and the gate saw the MPTCP calls.
+			plain := cfg.Target.SyscallMap["syz_mptcp_join_subflow$plain"]
+			if plain == nil || !enabled[plain] {
+				t.Errorf("syz_mptcp_join_subflow$plain is not enabled")
+			}
+			if seen < 10 {
+				t.Fatalf("only %v syz_mptcp_ calls in the config", seen)
+			}
+		})
+	}
+	if reason := linuxMptcpNfqueueReason([]byte(kallsymsNfqueueNone)); !strings.Contains(reason, "CONFIG_NFT_QUEUE") {
+		t.Errorf("unexpected reason %q", reason)
 	}
 }

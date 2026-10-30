@@ -3579,6 +3579,13 @@ static long syz_mptcp_set_sysctl(volatile long a0, volatile long a1)
 	}
 	snprintf(path, sizeof(path), "/proc/sys/net/mptcp/%s", k->name);
 
+	// mptcp_netns_lock only orders this write against the ops that save and
+	// restore netns sysctls (pair_init, disconnect; join_subflow holds it just
+	// around SUBFLOW_CREATE to re-apply the pair's timestamps setting). It must
+	// never be taken around traffic: not in drive_traffic, subflow_stall or any
+	// other op that drives it. This op exists to race a sysctl write against the
+	// kernel reading the value on those hot paths, and serializing them would
+	// silently remove the data race it is meant to find.
 	mptcp_spin_lock(&mptcp_netns_lock);
 	// Read first: the handler's read side runs too, and the log shows the change.
 	if (!mptcp_sysctl_read(path, prev, sizeof(prev)))
