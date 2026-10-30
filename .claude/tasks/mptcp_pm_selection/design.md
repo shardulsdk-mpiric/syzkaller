@@ -355,6 +355,20 @@ differential configs that enable whatever carrier is chosen.
       MPJoinPortSynRx 1 (the announced-listener check ran and passed), RmAddr 3.
   - **Open:** `mptcp_pm_announced_has_ssk` runs (MIB) but sits in the SYN path,
     so kcov can't see it; that's the keystone question again.
+- 2026-10-30, correction (found by syzkaller-ef): CONFIG_NFT_QUEUE is off on
+  every audit2 kernel, so all `MPTCP_MUT_*` wire mutations have been silent
+  no-ops there. Step 1's planned effect in §4 ("every mutation family now also
+  reaches in-kernel PM handlers") was never exercised on these kernels, and no
+  coverage on them should be attributed to forged ADD_ADDR / RM_ADDR / MP_PRIO /
+  MP_FAIL / FASTCLOSE. The kcov-dark finding for the received-option handlers
+  rests on the MIB measurement above, not on the mutations. Fixes are a kernel
+  config change and syzkaller-ef's xtables fallback (3fae637b1, branch
+  `mptcp-reach-scenarios`, in brf-a1 review).
+- 2026-10-30: step 3 pushed to `protocol-flow-harness` (Shardul's go, after
+  brf-a1's approval). syzkaller-ef's scenario-ops branch rebases onto it and
+  carries the merged pair_init block: `$client_kernel` and `$kernel` take
+  `client ptr[out, mptcp_client_kernel]` (consumed by `syz_mptcp_subflow_fail`),
+  and the server argument stays as step 3 has it.
 - 2026-10-30, op-design gaps from the gap list (branch `mptcp-pm-gaps`, from
   `d82fa4b06`):
   - **Endpoint on the pair's own address:** `add_endpoint$initial_subflow/
