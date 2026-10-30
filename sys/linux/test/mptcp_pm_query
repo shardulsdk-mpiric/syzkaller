@@ -5,12 +5,12 @@
 # userspace pair, announce from the server and read the announcement and both ends'
 # address lists back.
 
-syz_mptcp_pm_set_limits(0x2, 0x2, 0x0)
+syz_mptcp_pm_set_limits(0x2, 0x2, 0x0, 0x0)
 r1 = syz_mptcp_pm_add_endpoint$subflow(0x0, 0x2, 0x0, 0x0)
 r0 = syz_mptcp_pm_add_endpoint$auto_subflow(0x10, 0x2, 0x0, 0x0)
 syz_mptcp_pm_get_endpoint(r0, 0x0)
 syz_mptcp_pm_get_endpoint(r1, 0x0)
-syz_mptcp_pm_get_limits()
+syz_mptcp_pm_get_limits(0x0)
 syz_mptcp_pm_dump_endpoints(0x0, 0x0)
 syz_mptcp_pm_set_endpoint_flags$subflow(r0, 0x4)
 syz_mptcp_pm_del_endpoint(r0)
@@ -20,4 +20,4 @@ syz_mptcp_pm_get_endpoint$announced(r5, 0x1)
 syz_mptcp_pm_dump_endpoints$userspace_server(r4, 0x2)
 syz_mptcp_pm_dump_endpoints$userspace_client(r3, 0x1)
 syz_mptcp_pair_close(r2)
-syz_mptcp_pm_flush_endpoints()
+syz_mptcp_pm_flush_endpoints(0x0)

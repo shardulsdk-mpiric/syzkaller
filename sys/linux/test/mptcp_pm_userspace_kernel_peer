@@ -4,7 +4,7 @@
 # address through the wildcard listener, and to the announced port through the
 # listener the announce call opens. Then the server withdraws both and its id 0.
 
-syz_mptcp_pm_set_limits(0x2, 0x2, 0x0)
+syz_mptcp_pm_set_limits(0x2, 0x2, 0x0, 0x0)
 r0 = syz_mptcp_pair_init$client_kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x10, 0x1, 0x0, &AUTO=<r1=>0x0)
 r2 = syz_mptcp_pm_announce$server(r1, 0x1, 0x0, 0x0)
 r3 = syz_mptcp_pm_announce$server_port(r1, 0x1, 0x1, 0x1)

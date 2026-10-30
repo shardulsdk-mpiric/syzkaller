@@ -1,0 +1,25 @@
+# Two-netns pair (MPTCP_INIT_PEER_NETNS), both ends on the in-kernel PM, with
+# endpoints on each side: the client netns gets a subflow endpoint and the server
+# netns a signal endpoint and its own limits, so each end acts on its own table as
+# two hosts do. The server announces its endpoint to the client, the client opens a
+# subflow from its endpoint to the server (wildcard listener), data flows, both
+# tables and the server's limits are read back, the server end is disconnected (its
+# settings are written in the peer netns) and the pair goes away. The executor's
+# reset restores both netns afterwards.
+
+syz_mptcp_pm_set_limits(0x2, 0x2, 0x0, 0x0)
+syz_mptcp_pm_set_limits$server(0x2, 0x2, 0x0, 0x1)
+r0 = syz_mptcp_pm_add_endpoint$client_subflow(0x0, 0x2, 0x0, 0x200)
+r1 = syz_mptcp_pm_add_endpoint$server_signal(0x0, 0x1, 0x0, 0x400)
+r2 = syz_mptcp_pair_init$kernel(&AUTO={0x2, 0x0, @loopback}, &AUTO={0x2, 0x0, @loopback}, 0x50, 0x3, &AUTO=<r3=>0x0, 0x0)
+syz_mptcp_pm_set_endpoint_flags$client_subflow(r0, 0x4)
+syz_mptcp_drive_traffic(r2, &AUTO="4142434445464748", 0x8)
+syz_mptcp_pm_set_endpoint_flags$server_signal(r1, 0x4)
+syz_mptcp_pm_get_endpoint$client(r0, 0x0)
+syz_mptcp_pm_get_endpoint$server(r1, 0x0)
+syz_mptcp_pm_dump_endpoints$server_kernel(0x0, 0x3)
+syz_mptcp_pm_get_limits$server(0x1)
+syz_mptcp_disconnect(r2)
+syz_mptcp_pair_close(r2)
+syz_mptcp_pm_flush_endpoints$server(0x1)
+syz_mptcp_pm_flush_endpoints(0x0)

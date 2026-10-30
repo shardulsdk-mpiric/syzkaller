@@ -4374,6 +4374,132 @@ static void reset_mptcp_pm(const struct net_reset_state* st)
 	close(sock);
 }
 
+#if MPTCP_PEER_HANDOFF
+// The MPTCP two-netns peer netns (common_linux_mptcp.h) outlives a program only
+// through this loop process: a program builds it in its forked child, so the child
+// passes the ns/net fd here (SCM_RIGHTS over mptcp_peer_chan), together with the
+// peer netns's reset baseline taken right after creation, before the program wrote
+// anything there. Later programs inherit the fd and the setup latch through fork.
+// A program that is about to change peer-netns state sends a "dirty" message; the
+// reset before the next program then sweeps the peer netns (sysctls, PM endpoints
+// and limits) back to the baseline. No message, no sweep. Datagrams stay queued
+// across a killed child, so a program killed mid-call is still swept.
+#define MPTCP_PEER_MSG_HANDOFF 1
+#define MPTCP_PEER_MSG_DIRTY 2
+
+struct mptcp_peer_msg {
+	int kind;
+	struct net_reset_state state;
+};
+
+static int mptcp_peer_chan[2] = {-1, -1}; // [0] loop process end, [1] programs' end
+static struct net_reset_state mptcp_peer_state;
+static bool mptcp_peer_dirty_sent; // per program (a child's copy)
+
+static void checkpoint_mptcp_peer(void)
+{
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv)) {
+		debug("checkpoint_mptcp_peer: socketpair: %d\n", errno);
+		return;
+	}
+	mptcp_peer_chan[0] = mptcp_fd_high(sv[0]);
+	mptcp_peer_chan[1] = mptcp_fd_high(sv[1]);
+}
+
+// Program side, called on the thread that just built the peer netns, while it is
+// still inside it.
+static void mptcp_peer_handoff(int peer_fd)
+{
+	struct mptcp_peer_msg msg;
+	struct msghdr mh;
+	struct iovec iov;
+	char cbuf[CMSG_SPACE(sizeof(int))];
+
+	if (mptcp_peer_chan[1] < 0)
+		return;
+	memset(&msg, 0, sizeof(msg));
+	msg.kind = MPTCP_PEER_MSG_HANDOFF;
+	checkpoint_net_sysctls(&msg.state);
+	checkpoint_mptcp_pm(&msg.state);
+	iov.iov_base = &msg;
+	iov.iov_len = sizeof(msg);
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = cbuf;
+	mh.msg_controllen = sizeof(cbuf);
+	struct cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SCM_RIGHTS;
+	cm->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &peer_fd, sizeof(int));
+	if (sendmsg(mptcp_peer_chan[1], &mh, MSG_DONTWAIT) < 0) {
+		debug("mptcp_peer_handoff: sendmsg: %d\n", errno);
+	}
+}
+
+// Program side.
+static void mptcp_peer_mark_dirty(void)
+{
+	int kind = MPTCP_PEER_MSG_DIRTY;
+	if (mptcp_peer_chan[1] < 0 || mptcp_peer_dirty_sent)
+		return;
+	mptcp_peer_dirty_sent = true;
+	if (send(mptcp_peer_chan[1], &kind, sizeof(kind), MSG_DONTWAIT) < 0) {
+		debug("mptcp_peer_mark_dirty: send: %d\n", errno);
+	}
+}
+
+// Loop-process side, before each program.
+static void reset_mptcp_peer(void)
+{
+	bool dirty = false;
+	if (mptcp_peer_chan[0] < 0)
+		return;
+	for (;;) {
+		struct mptcp_peer_msg msg;
+		struct msghdr mh;
+		struct iovec iov;
+		char cbuf[CMSG_SPACE(sizeof(int))];
+		memset(&msg, 0, sizeof(msg));
+		iov.iov_base = &msg;
+		iov.iov_len = sizeof(msg);
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+		mh.msg_control = cbuf;
+		mh.msg_controllen = sizeof(cbuf);
+		ssize_t n = recvmsg(mptcp_peer_chan[0], &mh, MSG_DONTWAIT);
+		if (n < (ssize_t)sizeof(int))
+			break;
+		int fd = -1;
+		struct cmsghdr* cm = CMSG_FIRSTHDR(&mh);
+		if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS)
+			memcpy(&fd, CMSG_DATA(cm), sizeof(int));
+		if (msg.kind == MPTCP_PEER_MSG_HANDOFF && n == (ssize_t)sizeof(msg) && fd >= 0 &&
+		    mptcp_peer_netns_fd < 0) {
+			mptcp_peer_netns_fd = mptcp_fd_high(fd);
+			mptcp_peer_state = msg.state;
+			mptcp_peer_setup_done = mptcp_peer_netns_fd >= 0;
+			debug("reset_mptcp_peer: peer netns fd %d\n", mptcp_peer_netns_fd);
+		} else if (fd >= 0) {
+			close(fd);
+		}
+		if (msg.kind == MPTCP_PEER_MSG_DIRTY)
+			dirty = true;
+	}
+	if (!dirty || mptcp_peer_netns_fd < 0)
+		return;
+	int saved = -1;
+	if (mptcp_netns_enter(mptcp_peer_netns_fd, &saved) < 0)
+		return;
+	reset_net_sysctls(&mptcp_peer_state);
+	reset_mptcp_pm(&mptcp_peer_state);
+	mptcp_netns_leave(saved);
+}
+#endif // MPTCP_PEER_HANDOFF
+
 static void checkpoint_net_namespace(void)
 {
 #if SYZ_EXECUTOR
@@ -4386,6 +4512,9 @@ static void checkpoint_net_namespace(void)
 	checkpoint_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
 	checkpoint_net_sysctls(&net_state);
 	checkpoint_mptcp_pm(&net_state);
+#if MPTCP_PEER_HANDOFF
+	checkpoint_mptcp_peer();
+#endif
 }
 
 static void reset_net_namespace(void)
@@ -4400,6 +4529,9 @@ static void reset_net_namespace(void)
 	reset_iptables(ipv6_tables, sizeof(ipv6_tables) / sizeof(ipv6_tables[0]), AF_INET6, SOL_IPV6);
 	reset_net_sysctls(&net_state);
 	reset_mptcp_pm(&net_state);
+#if MPTCP_PEER_HANDOFF
+	reset_mptcp_peer();
+#endif
 }
 #endif
 
