@@ -29,6 +29,7 @@ blocks the next one. Load a stage file only when you reach that stage.
 | 5 | Build | `stages/05-build.md` | base + each patched kernel built from one `.config`; keystone present on both |
 | 6 | Config | `stages/06-config.md` | enabled syscalls reach the code each picked series changes |
 | 7 | Machine | `stages/07-machine.md` | VM budget fits; binaries, kernels, image deployed; revs match |
+| 7b | Probe | `stages/07b-probe.md` | one-VM corpus replay: op-set calls succeed, counters move, no SYZFAIL |
 | 8 | Launch | `stages/08-launch.md` | canary shows programs executing before the long run |
 | 9 | Monitor | `stages/09-monitor.md` | health checked on a schedule; every crash triaged |
 | 10 | Re-trigger | `stages/10-retrigger.md` | corpus carried; new series versions re-run through 2-4 |
@@ -53,8 +54,10 @@ at the end.
 5. **Base = the maintainer's current export/next tip**, not a net-next merge
    base: that keeps already-merged work out of the diff so "patched-only"
    means "caused by the pending series".
-6. **Canary before every long run.** Watch qemu CPU and "executed programs" /
-   coverage in the log. Process counts and free RAM look fine during a boot loop.
+6. **Probe, then canary, before every long run.** The probe (stage 7b) shows
+   the op-set's calls succeeding and counters moving on one VM; the canary
+   watches qemu CPU and "executed programs" / coverage in the log. Process
+   counts and free RAM look fine during a boot loop.
 7. **Rev match.** syz-diffrepro, syz-manager and executor from one commit.
 8. **Every series a human reads about carries a lore link**
    (`https://lore.kernel.org/<list>/<message-id>/`), in chat tables and in
@@ -82,6 +85,11 @@ All take paths as arguments; run Python with `python3 -I`.
 - `scripts/staleness.py` — last on-list activity + concluded-elsewhere evidence.
 - `scripts/hwprobe.sh` — read-only capability probe of a fuzzing host
   (`ssh host 'bash -s' < hwprobe.sh`).
+- `scripts/health_probe.sh` (+ `health_probe_report.py`) — stage 7b: boots one
+  qemu VM (`-snapshot`) with the campaign kernel/image, replays a corpus sample
+  through `syz-execprog -debug`, writes `report.md` + `per_call.csv` (per-call
+  success/errno, harness output, dmesg diff, counter deltas). Runs on the
+  fuzzing host. The `.py` is the parser; it runs alone on a raw dir for tests.
 
 Related skill: `crash-reproducer` (stage 9, reproducing what a run caught).
 Engine reference: `tools/syz-diffrepro/README.md`, `.claude/knowledge/04_differential.md`.
