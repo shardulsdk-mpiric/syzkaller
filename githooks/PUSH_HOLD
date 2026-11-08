@@ -1,0 +1,14 @@
+Push hold in effect for this branch.
+
+At least one unresolved disclosure question concerns state already on this
+branch, and it has to be settled before the branch reaches a remote. The
+details are deliberately not in this file, because this file is tracked and
+public.
+
+Where to look, in order:
+  1. .git/embargo-blockers in this clone, if present.
+  2. The environment-root working notes outside this repository (untracked),
+     which carry the current list and each item's status.
+
+If you are a collaborator and did not put this here, do not clear it. Ask
+whoever maintains the fork.

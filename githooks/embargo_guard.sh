@@ -27,6 +27,11 @@ mode="${1:-}"
 PROTECTED_RE='^\.claude/(mptcp|maintainers|private)/|^\.claude/users/[^/]+/(tasks|notes)/|^\.claude/tasks/([^/]+/)?local/'
 # Reproducer / PoC / trigger filenames, anywhere in the tree.
 NAME_RE='(^|/)(repro|reproducer|poc|exploit|trigger)[^/]*\.(c|h|txt|sh|py|prog|syz)$'
+# Aggregated handover / evidence exports. These are the blind spot the two
+# patterns above do not cover: a numbered .md export or a dated archive carries
+# no reproducer-shaped name and sits outside the private .claude paths, yet it
+# collects embargoed finding descriptions and funding material in one place.
+EXPORT_RE='(^|/)(_handover_export|_evidence_export|_export)/|(^|/)[^/]*(handover|handoff|evidence_export)[^/]*\.(zip|tar|tgz|tar\.gz)$'
 # Content sentinel -- assembled so this script does not contain the literal.
 SENT='BRF-EMBARGO'; SENT="${SENT}-DO-NOT-PUSH"
 ZERO=0000000000000000000000000000000000000000
@@ -34,10 +39,49 @@ ZERO=0000000000000000000000000000000000000000
 violations=0
 flag() { printf '  \xe2\x9c\x97 %-60s (%s)\n' "$1" "$2" >&2; violations=1; }
 
+# Push holds. A push is the only moment when an unresolved disclosure question
+# stops being hypothetical, so that is where the question gets asked -- not in a
+# notes file someone has to remember to open. Two files, deliberately:
+#   githooks/PUSH_HOLD      tracked, travels to every clone, content-free.
+#   .git/embargo-blockers   local, never committed, carries the actual detail.
+# Either one present and non-empty blocks the push.
+TRACKED_HOLD="$(dirname "$0")/PUSH_HOLD"
+LOCAL_HOLD="$(git rev-parse --git-dir)/embargo-blockers"
+
+check_hold() {
+  local held=0 f
+  for f in "$TRACKED_HOLD" "$LOCAL_HOLD"; do
+    [ -s "$f" ] || continue
+    held=1
+    printf '\n--- hold: %s ---\n' "$f" >&2
+    sed 's/^/  /' "$f" >&2
+  done
+  [ "$held" -eq 0 ] && return 0
+  cat >&2 <<'HOLDEOF'
+
+==========================================================================
+  EMBARGO GUARD: push held.
+==========================================================================
+A hold file is in place, so something listed above has to be settled
+before this branch reaches a remote. The hold is not about the commits
+being pushed right now; it is about state already on the branch.
+
+To clear it:
+  tracked hold   git rm githooks/PUSH_HOLD && git commit
+  local hold     rm "$(git rev-parse --git-dir)/embargo-blockers"
+
+To override deliberately, for this push only:
+  git push --no-verify
+==========================================================================
+HOLDEOF
+  exit 1
+}
+
 check_path() {
   local f="$1"
   printf '%s' "$f" | grep -Eq "$PROTECTED_RE" && flag "$f" "private/embargoed path"
   printf '%s' "$f" | grep -Eq "$NAME_RE"      && flag "$f" "reproducer/PoC filename"
+  printf '%s' "$f" | grep -Eq "$EXPORT_RE"    && flag "$f" "aggregated handover/evidence export"
 }
 
 case "$mode" in
@@ -49,6 +93,7 @@ case "$mode" in
     done < <(git diff --cached --name-only --diff-filter=AM)
     ;;
   pre-push)
+    check_hold
     remote="${2:-origin}"
     while read -r _lref lsha _rref rsha; do
       [ "$lsha" = "$ZERO" ] && continue   # branch deletion

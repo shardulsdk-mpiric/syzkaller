@@ -26,6 +26,28 @@ clone until `core.hooksPath` is set), so each collaborator runs this once.
 | private/embargoed paths (`.claude/tasks`, `.claude/mptcp`, `.claude/maintainers`, `.claude/private`, `.claude/users/*/tasks\|notes`) | staged files | pushed commit range |
 | reproducer/PoC/trigger filenames (`repro*`, `poc*`, `exploit*`, `trigger*`) | staged files | pushed commit range |
 | content sentinel (catches a reproducer copied out into a tracked path) | staged blobs | blobs in pushed commits |
+| aggregated handover/evidence export (`_handover_export/`, dated handover archives) | staged paths | paths in pushed commits |
+
+## Push holds
+
+A push is the only moment when an unresolved disclosure question stops being
+hypothetical, so that is where the question gets asked, rather than in a notes
+file someone has to remember to open. `pre-push` refuses while either hold file
+is present and non-empty:
+
+| file | tracked? | carries |
+|---|---|---|
+| `githooks/PUSH_HOLD` | yes, travels to every clone | that a hold exists and where to look. No detail: it is public. |
+| `.git/embargo-blockers` | no, cannot be committed | the actual item list and each item's status. |
+
+The split is the point. The fact of a hold has to travel, because a fresh clone
+pushing the same branch carries the same hazard. The content must not travel,
+because naming an unreported finding in a tracked file is the leak it is meant
+to prevent.
+
+Clear the tracked hold with `git rm githooks/PUSH_HOLD` in its own commit, and
+the local one by deleting the file. `git push --no-verify` overrides both, for
+one push, deliberately.
 
 ## Limits (be honest about these)
 
