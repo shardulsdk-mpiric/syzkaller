@@ -37,3 +37,14 @@ gha-creds-*.json
 .claude/settings.local.json
 .claude/tasks/*/local/
 .claude/**/scratch/
+
+# Private working records under .claude/tasks/ -- findings, reproducer steps,
+# campaign logs -- must never reach the public fork. These were previously
+# protected ONLY by .git/info/exclude, which is per-clone and does not travel:
+# a fresh clone plus `git add -A` would have published them. Ignore everything
+# here and re-admit the files that are deliberately public.
+.claude/tasks/*
+!.claude/tasks/README.md
+!.claude/tasks/index.md
+!.claude/tasks/mptcp_pm_selection/
+.claude/tasks/mptcp_pm_selection/design_review_*
