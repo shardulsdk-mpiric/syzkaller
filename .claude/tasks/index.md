@@ -224,3 +224,38 @@ Each entry: `status` / `brief` (a path, or a pointer to the doc that covers it)
   project's CLA).
 - **goal:** route clean, non-protocol fixes to google/syzkaller via `origin`.
 - **keywords:** upstream, google/syzkaller, contribute, CLA, origin.
+
+### patch_line_reach
+- **status:** open (opened 2026-11-08). Next todo: overlay design (Shardul).
+- **brief:** `.claude/tasks/patch_line_reach/CLAUDE.md` (private); strategy in
+  the env-root task `ai_reach_pipeline`.
+- **goal:** measure reach at the level of a patch's *changed lines*, not
+  functions: mark the changed lines (git range: series vs export tip, or
+  export vs mainline) inside the manager's `/cover` view, and roll them up
+  into a per-series reach table written into the run record. Run it at fixed
+  intervals during a differential run, not only at the end. This is also
+  rungs 1-4 of the "why is this line unreached" ladder (built in? kcov-visible?
+  callers reached? which guarding branch never taken?).
+- **what upstream already has (checked 2026-11-08, all in this fork):**
+  `/cover` (expandable per-line covered/uncovered/both view, with the programs
+  that hit each line and a per-line `HitCount` = number of corpus programs, not
+  executions); `/funccover` (per-function CSV); `pkg/manager/diff/patch.go`
+  `PatchFocusAreas` (function-level, from symbol hashes); syz-cluster's
+  30-minute "patched code reached" abort check (function/area level, no line
+  report). No changed-line overlay or per-series line report exists.
+- **related upstream AI work (pkg/aflow, Gemini-only backend):**
+  `flow/seedgen` (Aug 2026) generates a seed to reach a target file:line:
+  a `reachability-analyzer` agent + generator in a `DoWhile` with a judge
+  and a mechanical "target PC hit?" check (`seedgen-verify-pc-and-loop`),
+  with source lines resolved to PCs (`811c14699`). `flow/fuzzing/patch_triage`
+  picks a series' FocusSymbols. The backend interface
+  (`pkg/aflow/backend/backend.go`: Provider/Client, model tiers
+  deep-reasoning / core / lightweight) is the plug point for a non-Gemini
+  provider (OpenAI-compatible local server, Anthropic).
+- **later:** values at uncovered changed branches via kcov comparison mode
+  (`KCOV_TRACE_CMP`, already collected for hints).
+- **keywords:** changed lines, line reach, patch coverage, overlay, /cover,
+  funccover, per-series reach, dormant, seedgen, aflow, reachability analyzer,
+  trace_cmp, comparison operands.
+- **owner:** Shardul (design); plumbing in the syzkaller-tree session.
+- **last touched:** 2026-11-08.
