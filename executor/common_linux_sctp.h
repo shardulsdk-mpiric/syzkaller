@@ -220,7 +220,7 @@ static struct syz_sctp_assoc_slot syz_sctp_assoc_pool[SCTP_ASSOC_POOL_SIZE];
 // Returns 1 and fills *chunk_type_out / *init_tag_out / *initial_tsn_out (host
 // order) on a hit, 0 otherwise.
 static int sctp_parse_init_hdr(const uint8* pkt, int len, uint8* chunk_type_out, uint32* init_tag_out,
-			       uint32* initial_tsn_out)
+			       uint32* initial_tsn_out, uint16* src_port_out, uint16* dst_port_out)
 {
 	if (len < (int)sizeof(struct iphdr))
 		return 0;
@@ -231,16 +231,25 @@ static int sctp_parse_init_hdr(const uint8* pkt, int len, uint8* chunk_type_out,
 	// common header (12) + chunk header (4) + sctp_inithdr (16).
 	if (ihl < (int)sizeof(struct iphdr) || len < ihl + 12 + 4 + 16)
 		return 0;
-	const uint8* chunk = pkt + ihl + 12;
+	// SCTP common header: source port (2) + dest port (2) + vtag (4) + checksum (4).
+	// The chunk (INIT / INIT-ACK) follows it. The ports let the caller match a
+	// captured packet to a specific association's 4-tuple.
+	const uint8* common = pkt + ihl;
+	const uint8* chunk = common + 12;
 	uint8 ctype = chunk[0];
 	if (ctype != SCTP_CID_INIT && ctype != SCTP_CID_INIT_ACK)
 		return 0;
+	uint16 sport_be = 0, dport_be = 0;
+	memcpy(&sport_be, common + 0, sizeof(sport_be));
+	memcpy(&dport_be, common + 2, sizeof(dport_be));
 	uint32 tag_be = 0, tsn_be = 0;
 	memcpy(&tag_be, chunk + 4, sizeof(tag_be));
 	memcpy(&tsn_be, chunk + 4 + 12, sizeof(tsn_be));
 	*chunk_type_out = ctype;
 	*init_tag_out = ntohl(tag_be);
 	*initial_tsn_out = ntohl(tsn_be);
+	*src_port_out = ntohs(sport_be);
+	*dst_port_out = ntohs(dport_be);
 	return 1;
 }
 
@@ -375,19 +384,37 @@ static long syz_sctp_pair_init(volatile long a0)
 		setsockopt(cap_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 		char cbuf[2048];
 		bool have_server = false, have_client = false;
+		// This association's 4-tuple ports, to match captured INIT/INIT-ACK
+		// against. Without this match, a concurrent pair_init on another thread
+		// sharing this proc's loopback netns (the default -threaded model runs
+		// async calls on separate threads) can have ITS handshake captured here
+		// and stamp the wrong vtag on this slot -- which would silently break the
+		// $captured inject path. Both ports are known by now: the server's from
+		// getsockname() after bind, the client's from getsockname() after connect
+		// (stored on the slot above). The loopback address is invariant
+		// (127.0.0.1 on both ends), so the port pair is the discriminator.
+		uint16 server_port_h = ntohs(srv_addr.sin_port);
+		uint16 client_port_h = syz_sctp_assoc_pool[slot].client_port_h;
 		for (int i = 0; i < 100 && !(have_server && have_client); i++) {
 			ssize_t cn = recv(cap_fd, cbuf, sizeof(cbuf), 0);
 			if (cn <= 0)
 				break;
 			uint8 ctype = 0;
 			uint32 tag = 0, tsn = 0;
-			if (!sctp_parse_init_hdr((const uint8*)cbuf, (int)cn, &ctype, &tag, &tsn))
+			uint16 sport = 0, dport = 0;
+			if (!sctp_parse_init_hdr((const uint8*)cbuf, (int)cn, &ctype, &tag, &tsn, &sport, &dport))
 				continue;
 			if (ctype == SCTP_CID_INIT_ACK) {
+				// INIT-ACK travels server -> client.
+				if (sport != server_port_h || dport != client_port_h)
+					continue;
 				syz_sctp_assoc_pool[slot].vtag_server = tag;
 				syz_sctp_assoc_pool[slot].init_tsn_server = tsn;
 				have_server = true;
 			} else if (ctype == SCTP_CID_INIT) {
+				// INIT travels client -> server.
+				if (sport != client_port_h || dport != server_port_h)
+					continue;
 				syz_sctp_assoc_pool[slot].vtag_client = tag;
 				syz_sctp_assoc_pool[slot].init_tsn_client = tsn;
 				have_client = true;
