@@ -32,6 +32,16 @@ NAME_RE='(^|/)(repro|reproducer|poc|exploit|trigger)[^/]*\.(c|h|txt|sh|py|prog|s
 # no reproducer-shaped name and sits outside the private .claude paths, yet it
 # collects embargoed finding descriptions and funding material in one place.
 EXPORT_RE='(^|/)(_handover_export|_evidence_export|_export)/|(^|/)[^/]*(handover|handoff|evidence_export)[^/]*\.(zip|tar|tgz|tar\.gz)$'
+# References to private findings. Finding numbers (and the brf-era
+# NNN_<slug> directory names) only mean something next to the private records
+# under .claude/private/ and .claude/tasks/; in a public commit message,
+# comment or doc they tell a reader that unreported findings exist and roughly
+# where. Checked in commit messages and in lines being added. Generated
+# descriptions, test data and filesystem-image tests are skipped, and so are
+# very long lines (compressed blobs), which keeps upstream syncs quiet.
+FINDREF_RE='[Ff]indings?[ _#-]*0[0-9]{2}\b|(^|[^/0-9])0[0-9]{2}(/0[0-9]{2})+\b|\b0[0-9]{2}[-_](class|adjacent|shaped)\b|\(0[0-9]{2}(, ?0[0-9]{2})+|[a-z]/0[0-9]{2}\b|\b0[0-9]{2}_[a-z][a-z0-9]*_[a-z0-9_]+'
+FINDREF_SKIP_RE='(^|/)testdata/|^sys/[^/]+/auto\.txt$|_test\.go$|^kernel_patches/|^sys/[^/]+/test/syz_mount_image_|^githooks/'
+
 # Content sentinel -- assembled so this script does not contain the literal.
 SENT='BRF-EMBARGO'; SENT="${SENT}-DO-NOT-PUSH"
 ZERO=0000000000000000000000000000000000000000
@@ -77,6 +87,32 @@ HOLDEOF
   exit 1
 }
 
+# Prints matching lines of a commit message read on stdin.
+check_msg() {
+  local where="$1" hit
+  hit=$(grep -v '^#' | grep -E "$FINDREF_RE" | head -3)
+  [ -n "$hit" ] && flag "$where" "private finding reference in message: $(printf '%s' "$hit" | head -1 | cut -c1-60)"
+}
+
+# Checks the lines a diff adds. Args: a git diff/show command producing -U0 output.
+check_added_lines() {
+  local where="$1"; shift
+  local f="" line
+  while IFS= read -r line; do
+    case "$line" in
+      "+++ b/"*) f="${line#+++ b/}" ;;
+      "+++ "*) f="" ;;
+      +*)
+        [ -z "$f" ] && continue
+        printf '%s' "$f" | grep -Eq "$FINDREF_SKIP_RE" && continue
+        [ "${#line}" -gt 400 ] && continue
+        printf '%s' "${line#+}" | grep -Eq "$FINDREF_RE" &&
+          flag "$f$where" "private finding reference: $(printf '%s' "${line#+}" | sed 's/^[[:space:]]*//' | cut -c1-50)"
+        ;;
+    esac
+  done < <("$@")
+}
+
 check_path() {
   local f="$1"
   printf '%s' "$f" | grep -Eq "$PROTECTED_RE" && flag "$f" "private/embargoed path"
@@ -91,6 +127,10 @@ case "$mode" in
       check_path "$f"
       git show ":$f" 2>/dev/null | grep -qF "$SENT" && flag "$f" "embargo sentinel in content"
     done < <(git diff --cached --name-only --diff-filter=AM)
+    check_added_lines "" git diff --cached -U0 --diff-filter=AM
+    ;;
+  commit-msg)
+    check_msg "commit message" < "${2:?commit-msg needs the message file}"
     ;;
   pre-push)
     check_hold
@@ -102,7 +142,14 @@ case "$mode" in
       else
         commits=$(git rev-list "$rsha..$lsha")
       fi
+      # Commits already on any remote (e.g. upstream syzkaller) are not ours
+      # to police for finding references.
+      ours=$(git rev-list "$lsha" --not --remotes)
       for c in $commits; do
+        if printf '%s\n' "$ours" | grep -qx "$c"; then
+          check_msg "message @ ${c:0:12}" < <(git log -1 --format=%B "$c")
+          check_added_lines " @ ${c:0:12}" git show -U0 --format= "$c"
+        fi
         while IFS= read -r f; do
           [ -z "$f" ] && continue
           check_path "$f"
@@ -126,9 +173,10 @@ if [ "$violations" -ne 0 ]; then
 ==========================================================================
   EMBARGO GUARD: blocked this ${mode}.
 ==========================================================================
-The file(s) above are vulnerability triggers/reproducers or private working
-memory that must NOT enter git history or reach a remote before the upstream
-fix is merged.
+The item(s) above are vulnerability triggers/reproducers, private working
+memory, or references to private findings, which must NOT enter git history or
+reach a remote (the fork is public). Reword a finding reference to say what the
+code does, without the finding number.
 
 If you are certain this is a false positive, bypass deliberately:
     git ${bypass} --no-verify

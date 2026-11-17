@@ -27,6 +27,7 @@ clone until `core.hooksPath` is set), so each collaborator runs this once.
 | reproducer/PoC/trigger filenames (`repro*`, `poc*`, `exploit*`, `trigger*`) | staged files | pushed commit range |
 | content sentinel (catches a reproducer copied out into a tracked path) | staged blobs | blobs in pushed commits |
 | aggregated handover/evidence export (`_handover_export/`, dated handover archives) | staged paths | paths in pushed commits |
+| private finding references ("finding 005", "005/006-shaped", `NNN_<slug>` names) | commit message (`commit-msg`) and added lines | messages and added lines of pushed commits not already on a remote |
 
 ## Push holds
 

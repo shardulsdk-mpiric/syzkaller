@@ -78,7 +78,14 @@ Everything not listed here is upstream syzkaller. Our additions:
 This fork is **public**. Keep it a clean engineering artifact.
 
 - No unpublished vulnerability details, reproducers for unfixed bugs, or crash
-  dumps in the tree. Bug-finding records live outside this repo.
+  dumps in the tree. Bug-finding records live in `.claude/private/`
+  (gitignored, see `.claude/README.md`), never in tracked files.
+- Never reference a private finding in anything public: no finding numbers
+  (in any form, including "NNN-shaped" or "NNN/MMM" labels), finding directory
+  names or embargoed issue IDs in commit messages, code comments, docs or test
+  names. Describe
+  what the code does instead ("a close/join teardown race"). The guard checks
+  for this, but write it that way from the start.
 - Commit as a consistent contributor identity; preserve Syzkaller + BRF
   attribution on every external artifact.
 - `githooks/` carries a pre-commit/pre-push guard; keep it active with

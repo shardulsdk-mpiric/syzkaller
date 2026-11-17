@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Embargo guard -- see embargo_guard.sh. Checks the commit message ($1).
+exec "$(dirname "$0")/embargo_guard.sh" commit-msg "$1"

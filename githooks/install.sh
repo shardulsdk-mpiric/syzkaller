@@ -6,7 +6,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
-chmod +x githooks/embargo_guard.sh githooks/pre-commit githooks/pre-push
+chmod +x githooks/embargo_guard.sh githooks/pre-commit githooks/pre-push githooks/commit-msg
 git config core.hooksPath githooks
 echo "Embargo guard active: core.hooksPath -> githooks/"
 echo "  pre-commit + pre-push will block embargoed reproducers/triggers."

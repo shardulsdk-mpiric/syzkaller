@@ -26,6 +26,22 @@ The detailed per-surface references live under `docs/` (e.g.
 3. When a request matches a task's keywords, mention it and **ask before
    loading** that task's brief.
 
+## Private area: `.claude/private/`
+
+Everything that must not be public lives under `.claude/private/`, which is
+gitignored (tracked rule in `../.gitignore`) and blocked by `githooks/`. Suggested layout:
+
+| path | what it is |
+|---|---|
+| `private/findings/<NNN>_<slug>/` | one directory per finding: report, reproducers, triage, disclosure status |
+| `private/findings/index.md` | the finding list and each finding's disclosure state |
+| `private/maintainers/` | drafts of and notes on maintainer correspondence |
+| `private/handovers/` | handover and evidence exports (funding, grant material) |
+
+Finding numbers are private identifiers. They may appear only under
+`.claude/private/` and in private task briefs, never in commit messages,
+comments, docs or test names.
+
 ## What is tracked
 
 Tracked (shared substrate): `../CLAUDE.md`, this `README.md`, `ONBOARDING.md`,
