@@ -79,7 +79,9 @@ define SCTP_VTAG_CAPTURED	0
 define SCTP_VTAG_ZERO	1
 define SCTP_VTAG_WRONG	2
 
-syz_sctp_pair_init(flags flags[sctp_init_flags]) sctp_assoc (remote_cover)
+# A full association setup (4-way handshake plus raw-socket tag capture) takes
+# 30 to 55 ms on a KASAN kernel, above the default 50 ms call timeout.
+syz_sctp_pair_init(flags flags[sctp_init_flags]) sctp_assoc (remote_cover, timeout[200])
 syz_sctp_pair_close(assoc sctp_assoc)
 syz_sctp_drive_traffic(assoc sctp_assoc, data ptr[in, array[int8]], data_len len[data]) (remote_cover)
 
