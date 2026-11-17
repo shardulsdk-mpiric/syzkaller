@@ -48,3 +48,11 @@ gha-creds-*.json
 !.claude/tasks/index.md
 !.claude/tasks/mptcp_pm_selection/
 .claude/tasks/mptcp_pm_selection/design_review_*
+
+# Handover / evidence exports. These aggregate embargoed finding descriptions
+# and funding material into one place, and neither the ignore rules above nor
+# githooks/embargo_guard.sh covers them: the guard matches reproducer-shaped
+# filenames, the private .claude paths and a content sentinel, and a numbered
+# .md export carries none of the three. Verified: staging the directory and
+# running githooks/pre-commit exits 0.
+_handover_export/
