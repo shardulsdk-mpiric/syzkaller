@@ -69,6 +69,11 @@ Everything not listed here is upstream syzkaller. Our additions:
 - **Adding a `syz_*` pseudo-syscall** also needs it registered in
   `pkg/vminfo/linux_syscalls.go`, or syz-manager panics when a config enables
   it. The full recipe is in `.claude/extension_overview.md`.
+- **Branches.** `protocol-flow-harness` is the integration branch and the
+  default for every fuzzing campaign: pinned builds come from it. New work
+  starts on a feature branch off it. Once the feature is tested, merge it back
+  into `protocol-flow-harness` before any campaign depends on it, so the branch
+  never lags behind what campaigns actually run.
 - **Upstreaming.** Clean, non-protocol fixes belong upstream at google/syzkaller
   (remote `origin`), under the project's CLA. Protocol-surface work stays on
   this fork's feature branches (remote `fork`).
